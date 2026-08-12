@@ -1,0 +1,430 @@
+# CFD Sandbox — Physics and Numerics Reference
+
+The authority on every formula, constant and tolerance in this build. Every session reads this before touching numerics.
+
+Items marked ✓ were independently recomputed by a separate verification pass — exact Riemann solver, Taylor–Maccoll ODE integration, symbolic identity checks, 18,000-sample Newton sweeps. Items marked ⚠ are corrections to an earlier draft; the wrong version is described so nobody reintroduces it.
+---
+
+## 0. Locked decisions
+
+| Decision | Value | Why |
+|---|---|---|
+| Grid | Uniform Cartesian axisymmetric (z, r), anisotropic (dz ≠ dr) | Body-fitted meshing is build step 10 in the long-term architecture; it is not a PoC item |
+| Geometry | Solid volume fraction, exact sub-cell area | Both the parametric nozzle and drawn strokes rasterize into one field, so one solver serves both |
+| Wall | Sharp threshold at fraction ≥ 0.5, reflecting wall flux | Bit-exact zero mass flux through the wall, zero timestep penalty, works on a one-cell-thick stroke |
+| Precision | `f32` in the hot loop, `f64` in every reduction | See §7 |
+| Units | Non-dimensional internally, SI at the `Snapshot` boundary | See §7 |
+| γ | 1.24 in the demo case, 1.4 hard-coded in the verification tests | See §6 |
+| Scheme | MUSCL(minmod) + HLLC + SSP-RK2, CFL 0.4 | |
+| Aperture weighting | OUT | See §3 |
+| Local timestepping | OUT | Deferred; the turbo control in §9 buys most of it for five lines |
+
+---
+
+## 1. Governing equations
+
+Conserved `U = (ρ, ρu, ρv, E)`, z axial, r radial, u axial velocity, v radial velocity, `E = p/(γ−1) + ½ρ(u²+v²)`.
+
+```
+∂U/∂t + ∂F/∂z + (1/r)∂(rG)/∂r = (0, 0, p/r, 0)
+
+F = (ρu, ρu²+p, ρuv, u(E+p))
+G = (ρv, ρuv, ρv²+p, v(E+p))
+```
+
+Cell centres at `r_j = (j+0.5)·dr`, faces at `r_{j±1/2} = (j+0.5±0.5)·dr`. Update:
+
+```
+dU_j/dt = −(F_{i+1/2} − F_{i−1/2})/dz
+          − [ (r_{j+1/2}·G_{j+1/2} − r_{j−1/2}·G_{j−1/2}) − p_j·dr ] / (dr·r_j)
+```
+
+**Write it exactly as bracketed above.** The pressure source is folded inside the same bracket as the radial flux difference. Algebraically this is identical to computing the flux difference and adding `+p_j/r_j` separately, but in `f32` the separate form leaves a residue of order `1e-7 × 40p × dt` per step at j = 0 (where `p/r = 2p/dr = 40p`), which accumulates into a faint axis artifact over a cold start. Inside one bracket the identical operands cancel bit-exactly.
+
+Three properties this form gives you:
+
+- The axis face at j = 0 has `r_{−1/2} = 0`, so it carries zero flux by construction. The axis is a wall because of the geometry, not because of a boundary condition.
+- Exactly well-balanced **for the quiescent uniform state**: for uniform p, `p(r_{j+1/2} − r_{j−1/2}) = p·dr` cancels the source exactly at every j including 0. This is precisely test T1. Do not claim well-balancing for anything stronger.
+- `r_j ≥ dr/2` always, so nothing divides by zero.
+
+Axis boundary: two mirror ghost rows, `(ρ, u, −v, p)`. Needed only to feed the MUSCL slope at j = 0.
+
+---
+
+## 2. Carbuncle control
+
+The Mach disk is a strong grid-aligned shock sitting on the axis, which is the textbook HLLC shock-instability trigger.
+
+```
+Ω(i,j) = min(p[i−2..i+2, j]) / max(p[i−2..i+2, j])
+if Ω < 0.7:  use HLL for the RADIAL fluxes of cells (i−1, i, i+1) at this row
+else:        use HLLC
+Axial fluxes always use HLLC — contact resolution is what keeps the plume boundary sharp.
+```
+
+⚠ Two corrections to the first draft: the sensor window is ±2 cells, not ±1 (a captured shock is 2–3 cells wide, so a ±1 window reads intermediate pressures on both sides and misses the shock's own cell), and the switch applies to three cells, not one (or the carbuncle nucleates at the shock foot).
+
+At γ = 1.24 the 0.7 threshold fires for shocks above about M 1.17. Carbuncle only afflicts M ≳ 2 (Ω < 0.23), so 0.7 is conservative. Keep it.
+
+---
+
+## 3. Immersed boundary — the exact update
+
+Rejected: diffuse BDIM body forcing. Not for the usual stiffness reason (BDIM is a convolution reconstruction, not Brinkman penalization, and its authors state there is no timestep penalty). It is rejected because the proposed recipe — project out normal velocity, keep p, rebuild ρE — changes momentum and energy outside the flux divergence, and **thrust is a momentum balance**. You cannot compute a defensible thrust from a non-conservative wall. It also needs walls ≥ 6 cells thick to stop mass leaking, which a user's 2-pixel stroke cannot satisfy.
+
+Also rejected: aperture weighting. The proposal gave only the axial closure; the radial one in the r-weighted form must satisfy `Σ_f r_f A_f n_f + r_w A_w n_w = 0` discretely or free-stream preservation fails in a way that looks exactly like a wall leak. Not a 30-minute job.
+
+```
+// once, on geometry change
+frac[c] : f32          // EXACT sub-cell solid area fraction — see §8 T0
+solid[c] : bool = frac[c] >= 0.5
+
+// per RK stage
+// 1. primitives, fluid cells only. Solid cells are never read.
+
+// 2. slopes, per primitive variable, minmod
+sz[c] = (solid[c−1] || solid[c+1]) ? 0 : minmod(W[c]−W[c−1], W[c+1]−W[c])
+sr[c] = (solid[c−nz] || solid[c+nz]) ? 0 : minmod(...)
+// A fluid cell touching a wall is piecewise-constant in the wall-normal direction.
+// That is the entire stencil degradation. Nothing else is needed, and it is what
+// makes step 3 unambiguous. Price: first order in a one-cell band at the wall.
+
+// 3. z-faces between c=(i,j) and d=(i+1,j)
+(solid[c], solid[d]):
+  (true , true ) -> F = 0
+  (false, false) -> qL = W[c] + 0.5*sz[c]; qR = W[d] − 0.5*sz[d]
+                    (qL,qR) = positivity_fallback(qL, qR, W[c], W[d])
+                    F = hllc(qL, qR)
+  (false, true ) -> F = wall_flux_z(W[c], +1)
+  (true , false) -> F = wall_flux_z(W[d], −1)
+
+fn wall_flux_z(W, sgn):
+    a  = sqrt(gamma * W.p / W.rho)
+    un = sgn * W.u                    // outward-from-fluid normal velocity
+    SL = −(abs(un) + a)               // Davis speed of the mirrored Riemann problem
+    ps = W.p + W.rho * un * (un − SL) // HLLC star pressure at S_M = 0
+    ps = max(ps, P_MIN)               // a receding wall can drive this negative
+    return [0.0, sgn*ps, 0.0, 0.0]    // mass, r-momentum, energy all EXACTLY zero
+
+// 4. r-faces identical, returning [0, 0, sgn*ps, 0], un = sgn*W.v, flux weighted by r_{j±1/2}
+```
+
+Do **not** implement this by calling `hllc()` with a mirrored state. The `S_M = 0` cancellation is exact in real arithmetic but depends on the compiler not reassociating `S_R = −S_L` under FMA contraction. Special-casing the wall face is three lines and gives bit-exact zero mass flux without trusting the optimizer.
+
+Sanity on the sign: for `u_n > 0` (flow into the wall) `ps = p + ρu_n(2u_n + a) > p`. For `u_n < 0` (receding) `ps = p − ρ|u_n|a`, the acoustic expansion. Correct both ways.
+
+### Cells that flip when the user edits geometry mid-run
+
+Both original passes omitted this and it will silently corrupt the conservation test.
+
+```
+// drained at the TOP of step(), never inside an RK stage.
+// rate-limited to one apply per 100 ms or on pointer-up (the fill is a multi-pass BFS).
+on GeometryChanged(new_frac):
+  for c:
+    vol = 2π·r_j·dr·dz
+    fluid -> solid: ledger.mass −= ρ[c]·vol; ledger.energy −= E[c]·vol; valid[c] = false
+    solid -> fluid: valid[c] = false; queue.push(c)
+  // BFS fill, at most 8 passes
+  for c in queue with >=1 valid fluid neighbour:
+    ρ[c] = mean(ρ over those neighbours); p[c] = mean(p over them)
+    u[c] = 0; v[c] = 0                   // START AT REST
+    ledger.mass += ρ[c]·vol; ledger.energy += E[c]·vol
+  remaining invalid cells -> ambient
+  recompute dt; reset the convergence monitor
+```
+
+`u = v = 0` in newly opened cells is not laziness. A cell opened next to a Mach-3 plume that inherits its neighbour's velocity fires a shock into the new cavity.
+
+The ledger is what separates "conservation drift" from "the user drew a hole." Test T2 asserts `|Δmass_total − ledger.mass| < tol`, not `|Δmass_total| < tol`. Without it every geometry edit is a false test failure.
+
+---
+
+## 4. Boundary conditions
+
+**Subsonic stagnation inlet** (verified term-for-term against NASA/TM-2011-217181). Given `p0`, `T0`, `a0² = γT0` non-dimensional, and interior neighbour state:
+
+```
+R⁻  = u_i − 2a_i/(γ−1)
+A   = (γ+1)/(γ−1)
+D   = (γ+1)a0²/(γ−1) − (γ−1)R⁻²/2
+D   = max(D, 0)                       // ⚠ goes negative under transient reverse flow;
+                                      //    without this clamp you NaN before the first frame
+a_b = (−R⁻ + sqrt(D)) / A             // larger root
+u_b = max(R⁻ + 2a_b/(γ−1), 0)
+v_b = 0                               // ⚠ the original spec never said; undefined tangential
+                                      //    velocity at an inlet is a classic garbage source
+p_b = p0·(a_b²/a0²)^(γ/(γ−1))
+ρ_b = γ·p_b / a_b²
+```
+
+**Downstream outflow.** Supersonic (`|u| ≥ a`): copy the interior cell. All four characteristics exit, so this is exact and non-reflecting. Subsonic: impose `p_a`, extrapolate entropy and R⁺.
+
+```
+ρ_b = ρ_i·(p_a/p_i)^(1/γ);  a_b = sqrt(γp_a/ρ_b)
+u_b = (u_i + 2a_i/(γ−1)) − 2a_b/(γ−1);  v_b = v_i;  p_b = p_a
+```
+
+**No sponge on the downstream boundary.** The core is supersonic there and a sponge would corrupt it.
+
+**Radial far-field.** Same construction with the radial normal; if flow is entering (`v_i < 0`) use the ambient reservoir. Plus a sponge.
+
+⚠ **The sponge coefficients in the first draft were 4–6× too weak and resolution-dependent.** `σ = 0.05·s²` applied per *step* over 16 cells gives `Σσ ≈ 0.90` for a wave crossing at the default grid — 41% one-way transmission and about 17% of the wave returning after reflecting off the far boundary. That is a visible standing pattern in the plume and it will be misdiagnosed as a solver bug. Being per-step also makes it 1.8× stronger on the measure grid. Use a dt-based form targeting `∫σ dt ≈ 4`:
+
+```
+U −= dt · σ_max · s² · (U − U_ambient),   s = (depth into sponge)/L_sponge
+L_sponge = 24 cells
+σ_max    = 12·a_ambient / L_sponge        // units of 1/time
+```
+
+That gives 1.8% one-way transmission and under 0.1% round-trip return. Add a diagnostic: warn if the plume (`p > 1.5 p_a`) reaches the sponge entry.
+
+---
+
+## 5. Initialization, floors, timestep
+
+**Quasi-1D isentropic init** in the nozzle interior, ambient elsewhere, blended over 4 cells at the exit plane. Roughly 3× fewer steps to steady than a cold start, and the app needs the quasi-1D solution anyway for the textbook-comparison overlay, so it is nearly free.
+
+⚠ The open-radius formula in the first draft was dimensionally wrong (`dz·Σ_j`) and unweighted. Correct:
+
+```
+r_w(i) = sqrt( 2·dr·Σ_j (1 − frac[i][j])·r_j )
+```
+
+Linear summing gives the wrong quasi-1D Mach number by the r-weighting and throws away part of the speedup.
+
+**Area–Mach inversion — NASA b4wind.** Verified: worst round-trip error 4.75e-13 over γ ∈ {1.2, 1.24, 1.4}, M ∈ [0.005, 15], both branches, with 8 fixed Newton iterations. The closed-form initial guess landed in (0, 1] on all 18,000 samples; no bracketing fallback needed.
+
+```
+P = 2/(γ+1);  Q = 1 − P
+subsonic:   p=P, q=Q, Rr=(A/At)^2
+supersonic: p=Q, q=P, Rr=(A/At)^(2Q/P)
+E = 1/q;  a = p^E;  r = (Rr − 1)/(2a)
+X0 = 1 / ((1+r) + sqrt(r(r+2)))
+Newton on  f(X) = (p+qX)^E − Rr·X,  f'(X) = (p+qX)^(E−1) − Rr
+M = sqrt(X) subsonic;  M = 1/sqrt(X) supersonic
+```
+
+⚠ **`f'(X) = 0` exactly at the root when `A/At = 1`, so Newton returns NaN.** The throat cell is set analytically, but the init sweeps *every* column and any column whose open radius lands within roundoff of the sonic area hits this. Guard on `|A/At − 1| < 1e-6 → M = 1`, not on exact equality.
+
+⚠ Assert the round-trip to **1e-11**, not 3e-13. The tighter figure holds only at γ = 1.4; at γ = 1.2 near sonic it reaches 2e-12.
+
+**Positivity.** ⚠ Two fixes to the first draft. (a) A face-level fallback must replace **both** reconstructed states with their cell averages — a one-sided fallback makes the flux multivalued and breaks conservation. (b) Face-level fallback does not stop the *cell average* going negative after the update, so add a cell-level pass:
+
+```
+face level: if either reconstructed state has ρ ≤ ρ_min or p ≤ p_min,
+            use cell averages on BOTH sides of that face
+cell level: after each RK stage, if ρ[c] ≤ ρ_min or p[c] ≤ p_min,
+            redo cell c with all four faces first-order;
+            if still bad, clamp and increment floor_counter
+```
+
+First-order HLLC/HLL with Davis speeds is provably positivity-preserving at CFL ≤ 0.5 and you run at 0.4, so the cell-level redo is sound. Without it the vacuum end of the altitude slider trips the floor counter, and the product rule says nothing displays when that counter is nonzero — you would ship an app that refuses to show numbers.
+
+**Floors** (non-dimensional, chamber-referenced): `ρ_min = 1e-8`, `p_min = max(1e-8·p0, 1e-4·p_a)`. ⚠ The absolute floor was raised from 1e-9 because at the 50 km ceiling `1e-4·p_a` sits at the old clamp and the plume core rides the floor. Altitude ceiling 40 km, or keep 50 km with the raised floor.
+
+**Timestep.** `w_max = max[(|u|+a)/dz + (|v|+a)/dr]`, `dt = 0.4/w_max`, recomputed every step. Fold the reduction into the same rayon pass that computes primitives — it is one extra streaming pass and effectively free. A nozzle startup swings the max wave speed by 5×, so a fixed dt either diverges during startup or wastes 5× at steady state.
+
+---
+
+## 6. Gas model
+
+**Demo case: γ = 1.24, R = 378 J/(kg·K) (Mw ≈ 22), p₀ = 5 MPa, T₀ = 3200 K, ε = 8, r_t = 50 mm.**
+
+γ = 1.4 is not acceptable for the demo. Verified sensitivity at ε = 8, holding everything else:
+
+| γ | M_exit | p_e | C_f (SL) | Isp_SL |
+|---|---|---|---|---|
+| 1.20 | 3.122 | 84.3 kPa | 1.551 | 268.2 s |
+| **1.24** | **3.224** | **76.2 kPa** | **1.531** | **261.7 s** |
+| 1.40 | 3.677 | 51.1 kPa | 1.468 | 240.3 s |
+
+Going from 1.24 to 1.4 moves exit Mach 14% and Isp 10.4%, and moves the ideal-expansion pressure ratio from 65.6 to 97.8 — a 49% shift in where the altitude slider's design point sits. The slider's whole purpose is finding that point. A label in the UI does not fix a mislabeled axis.
+
+The single-gas simplification (exhaust γ applied to the ambient air too) is fine here: the ambient is quiescent, the jet boundary is a pressure match, and pressure in still gas is γ-independent. The 6% ambient sound-speed error touches only the ambient CFL contribution. A species-transport mixture γ would change the flux fragment, the conserved-to-primitive fragment, the HLLC wave speeds and the field count, and brings the Abgrall interface-pressure-oscillation problem. Out.
+
+**Why p₀ = 5 MPa specifically.** At γ = 1.24, ε = 8, the perfect-expansion ambient is 76.2 kPa — about 2.3 km altitude. So the slider sweeps mildly over-expanded at sea level (p_e/p_a = 0.75), through the design point just above it, into under-expanded and free expansion above. Since the separation threshold is 0.40, **the entire slider range is inside the regime an inviscid solver can be trusted for.** That is worth preserving; it is why the demo is honest.
+
+**Verification tests use γ = 1.4 as a hard-coded literal**, because the exact references for Sod, θ-β-M and Taylor–Maccoll only exist there. Test T8 (nozzle vs isentropic) recomputes its reference from `case.gas.gamma`, so it works at any γ.
+
+Note the digitized Rao θ_n/θ_e table was produced at a specific γ (around 1.23–1.25). Label it in code with that γ or the divergence factor is quietly inconsistent.
+
+---
+
+## 7. Precision and units
+
+**`f32` in the hot loop.** Verified precision analysis: digits remaining when recovering `p = (γ−1)(E − ½ρ|u|²)` is `7.2 − log₁₀(1 + γ(γ−1)M²/2)`. At M = 12 (worst realistic plume) you keep 5.9 significant digits; even at M = 100 you keep 4.05. Precision is not the risk.
+
+⚠ Correct the reasoning, not the conclusion. The claim that f64 "halves" a bandwidth-bound kernel does not hold: at 22 Mcups × 2 stages × ~40 B/cell the kernel moves about 1.8 GB/s against ~68 GB/s of M1 bandwidth. It is latency and ALU bound on the sqrt, divides and branches in HLLC, not memory bound. The real f64 penalty is 1.2–1.5× from NEON lane count, and only where the code vectorizes, which branchy HLLC largely will not. f32 is still right — the hours of rewriting are worth more than 1.35× — but say why honestly.
+
+**Non-dimensional internally, chamber-referenced:** `L_ref = r_t`, `p_ref = p₀`, `ρ_ref = ρ₀ = p₀/(R T₀)`, `u_ref = sqrt(p₀/ρ₀)`, `T_ref = T₀`. So R = 1, `p = ρT`, and the chamber state is exactly (1, 0, 0, 1).
+
+⚠ Correct the reasoning here too. "Keeps values ≤ 1 for f32" is a misconception — IEEE-754 relative precision is scale-invariant across 76 decades. Non-dimensionalizing buys zero precision. Do it for three real reasons: the floors, the sponge coefficient and the positivity thresholds are only portable if the state is O(1) (in SI they need re-deriving every time p₀ changes); the chamber state being exactly (1,0,0,1) makes T1 testable against exact literals; and the T4 Sod threshold is a non-dimensional literature number that must be compared in the same units.
+
+**Every reduction in `f64`.** Mandatory, not advisory. An f32 sum over the 64k default grid has RMS noise 1.5e-5 and a sequential worst case of 3.8e-3 — larger than the T4 Sod pass threshold itself. On the 256k measure grid the worst case is 1.5e-2. Mass, momentum, energy, thrust integrals, L1 norms: all f64.
+
+Put `pub type Real = f32;` in the contract crate so it is a one-line flip if T3 or T4 disappoint.
+
+---
+
+## 8. Grid sizing
+
+The three requirements — a domain long enough for a Mach disk, a throat resolved enough for defensible mass flow, and interactive frame rates on an M1 Air — cannot all be met. Cost scales as `L_z²·L_r/(dz·dr²)`, so halving dr is 4× the work, not 2×.
+
+The lever nobody used: **dz and dr need not be equal.** dt is set by `(|u|+a)/dz + (|v|+a)/dr`; with dr ≪ dz the radial term dominates, so widening dz is nearly free in dt while linearly cutting cells. An anisotropic uniform grid captures essentially all of the benefit of a stretched grid at zero complexity. Geometric stretching in r would save ~40% of radial cells but saves no steps (dt is set by the finest dr), nets 1.4×, and breaks exact area rasterization, the `r_j = (j+0.5)dr` identity that makes §1 well-balanced, and uniform-grid slope limiting. Not worth it.
+
+| | nz × nr | cells | L_z | L_r | dz / dr (r_t) | N_throat | ṁ error | M1 steps/s | PC steps/s |
+|---|---|---|---|---|---|---|---|---|---|
+| **Interactive (default)** | **320 × 200** | 64k | 46.4 r_t | 10.0 r_t | 0.1449 / 0.0500 | **20** | **±5%** | 150–350 | 400–860 |
+| Measure (badged) | 640 × 400 | 256k | 46.4 r_t | 10.0 r_t | 0.0724 / 0.0250 | 40 | ±2.5% | 40–90 | 100–215 |
+
+Steps/s ranges bracket an optimistic measured kernel (5.0 Mcups/core, validated against Sod) against a 0.35–0.6× derate for agent-written Rust with bounds checks, IB branching and the carbuncle sensor. Plan on the low end.
+
+Domain: 11 r_t of nozzle (2 chamber + converging cone + arcs = 4.13, diverging L_n = 6.87) plus 12.5 exit radii of plume. L_r = 3.54 r_e against a peak plume radius near 2.2 r_e, so 1.6× margin, sponge starting at 8.8 r_t.
+
+**What is sacrificed: plume length, by 3.2×.** You get the Mach disk (around 6–9 r_e) plus the leading half of the first reflected cell. You do not get 4.5 visible diamonds. This is the right thing to give up, and not only because it is cheapest — the solver is inviscid, so there is no entrainment, the plume edge stays razor-sharp, and shock cells persist further downstream than in any photograph. **The downstream diamonds are the least trustworthy pixels on the screen.** Trading them to protect throat mass flow, which is the number a propulsion engineer checks, is the correct direction. The 40-exit-radii domain at the same throat resolution costs 204k cells and roughly two minutes per altitude drag on the M1. Dead.
+
+⚠ Two premise corrections. Ashkenas & Sherman's `z_M/D = 0.67√(p₀/p_a)` is for a **sonic orifice** with D the orifice diameter; applied at a nozzle exit it gives 5.84 r_e, not 8.5. The true Mach-disk station is likely 6–9 r_e; the domain above covers the band. And Prandtl–Pack shock-cell spacing is a weakly-imperfectly-expanded linearization — at high underexpansion it is decorative. **Do not put a numeric shock-cell-spacing readout in the UI.**
+
+**Clamp the sliders so N_throat ≥ 20 at every reachable setting, and display N_throat in cells next to the thrust readout.** Also worth knowing: at this anisotropy the throat downstream arc (0.382 r_t) spans only 2.6 axial cells. That, not radial resolution, is the weakest link in T8. If T8 misses, the first lever is dz → 0.10 r_t (3.8 cells across the arc), not more radial cells.
+
+⚠ Quantize `r_t` (or `dr`) so the throat lands exactly on a cell face. The ±1/N_throat mass-flow error is one geometric quantization of `r_t` against `dr`; aligning them collapses the systematic term to the second-order arc-curvature effect. About 10 lines, parametric nozzle only. Do not apply it to drawn geometry, which has no theoretical thrust to match.
+
+---
+
+## 9. Time to steady, and what the UI does about it
+
+Two different questions were being answered by two different estimates, and both were right:
+
+| Criterion | Physical time | Steps at the default grid |
+|---|---|---|
+| Supersonic core, barrel shock and Mach disk settled (≈5 plume transits) | ≈1.5 ms | ≈6,100 |
+| Far field acoustically equilibrated (≈2 radial transits with a sponge) | ≈3.8 ms | ≈15,800 |
+
+1.5 ms for a nozzle start transient is physically right, which is a useful check on the whole chain.
+
+| | PC | M1 Air |
+|---|---|---|
+| Visual steady | 20–40 s | 50–100 s |
+| Full steady | 55–105 s | 2.2–4.4 min |
+| **Altitude change** (plume only) | **5–15 s** | **12–40 s** |
+
+The altitude number is the one that matters, and it is small for a physical reason: **the nozzle interior is supersonic downstream of the throat, so ambient pressure cannot propagate upstream into it.** Changing ambient pressure re-equilibrates only the plume, 1–2 plume transits. This is why `set_environment` must never reset the field — that requirement is now load-bearing, not a nicety.
+
+Exception: at the high-ambient end an over-expanded nozzle can push a shock inside the divergent section, and that shock moves slowly. The separation warning already flags that regime.
+
+**Decision: the slider re-converges, asynchronously and visibly. It never resets the field, never blocks, and never interpolates between pre-converged states.** Three supports:
+
+- `set_environment(p_a)` mutates only the outflow BC and the sponge target.
+- The solver thread streams frames at 60 Hz regardless. The user *watches* the plume adjust, and that transient is the most compelling thing the app has.
+- A **residual meter** (normalized L2 of ∂ρ/∂t) with a green "settled" dot below 1e-3, and **thrust, c\* and C_f greyed out whenever unsettled.** This is what makes the transient honest instead of a bug.
+- A **turbo control** (1× / 4× / 16×) running N solver steps per rendered frame, gated by a frame-time budget. Five lines, and it buys most of what local timestepping would, without the 30 minutes and without destroying the transient's physical meaning.
+
+Interpolating between pre-converged states is the worst option: more code, a lie, and it kills the only thing that looks alive.
+
+---
+
+## 10. Geometry
+
+**Conical.** Upstream arc 1.5 r_t, downstream arc 0.382 r_t, converging half-angle 30°, contraction ratio 4 (r_c = 2 r_t).
+
+```
+throat arc (parameterize by local wall angle φ ∈ [0, α]):
+    z(φ) = R_cd·sin φ;  r(φ) = r_t + R_cd·(1 − cos φ)
+tangency:  zA = R_cd·sin α;  rA = r_t + R_cd·(1 − cos α)
+cone:      r(z) = rA + (z − zA)·tan α  for zA ≤ z ≤ L_n
+L_n = ( r_t(√ε − 1) + R_cd(sec α − 1) ) / tan α          ✓ identity verified in sympy
+```
+
+**Parabolic bell** (Rao approximation). Same 1.5 r_t converging arc; downstream arc 0.382 r_t running to wall angle θ_n; quadratic Bézier from there to the exit.
+
+```
+L_c15 = ( r_t(√ε − 1) + 0.382·r_t(sec 15° − 1) ) / tan 15°
+L_n   = bell_percent · L_c15
+N = ( 0.382 r_t sin θ_n ,  r_t + 0.382 r_t (1 − cos θ_n) )
+E = ( L_n , r_t√ε )
+m1 = tan θ_n; m2 = tan θ_e; C1 = N_r − m1·N_z; C2 = E_r − m2·E_z
+Q = ( (C2−C1)/(m1−m2) , (m1·C2 − m2·C1)/(m1−m2) )
+P(t) = (1−t)²N + 2t(1−t)Q + t²E
+```
+
+Verified for r_t = 50 mm, ε = 25, 80%: wall angle is exactly θ_n at t = 0 and exactly θ_e at t = 1 (error 0.00e+00 both), N_z < Q_z < E_z, monotone in both z and r. Guards the code needs: assert `θ_n > θ_e` (else division by zero) and assert `N_z < Q_z < E_z` (if bell_percent is too small for the area ratio, Q falls outside and the contour turns back on itself). Note `t` is not proportional to z.
+
+**θ_n and θ_e** come from a digitized Rao table interpolated **log-linearly in ε** and linearly in bell percent. There is no published polynomial fit; every implementation uses a table. Verified: log-linear interpolation between ε = 20 (28.8°/9.0°) and ε = 30 (30.0°/8.5°) reproduces 29.4604°/8.7248° at ε = 25 exactly, confirming log-linear is the right axis (linear gives 29.400°/8.750°).
+
+⚠ **Two circulating definitions of L_c15 differ by 0.337%.** The Huzel–Huang form above includes the throat-arc term; Aspirespace and the widely-copied `bell_nozzle.py` drop it. Pick the form above and state it, or "80% bell" is ambiguous.
+
+⚠ The commonly-published digitized 60% column is non-monotonic (θ_n goes 37.1° at ε = 40 → 35.0° at ε = 50 — a digitization typo). It does not affect an 80% bell, but if the UI exposes bell percent, interpolating that row produces a nozzle whose divergence angle *decreases* with area ratio.
+
+**Divergence factor:** `λ = (1 + cos θ_e)/2` for a bell, `(1 + cos α)/2` for a cone. Verified: the momentum-weighted integral `2∫₀¹ s·cos(θ_e s) ds` differs from `(1+cos θ_e)/2` by `−θ⁴/144`, which is 3.7e-6 at θ_e = 8.72°. The alternative `(1+cos((θ_n+θ_e)/2))/2` has no traceable primary source and gives a 2.75% loss against an accepted 0.5–1.5%. Note the two candidates differ by 1.1% and the product refuses to display efficiencies to better than 1%, so this is settled — do not let a session spend time on it.
+
+---
+
+## 11. Reports — one definition each
+
+```
+ṁ   = Σ_exit  ρ u_z · 2π r_j dr                      [exit-plane control surface]
+F   = Σ_exit (ρ u_z² + p − p_a) · 2π r_j dr
+C_f = F / (p₀ A_t)
+c*  = p₀ A_t / ṁ
+C_d = c*_ideal / c*,   c*_ideal = sqrt(γRT₀) / (γ·(2/(γ+1))^((γ+1)/(2(γ−1))))
+```
+
+Exit-plane control volume, not the wall-pressure integral. Both are defensible and they give different numbers with different mesh sensitivity; the exit-plane form stays valid when the domain extends past the lip into the plume, which it does.
+
+**Quasi-1D reference** (verified end to end for r_t = 50 mm, ε = 25, γ = 1.20, Mw = 22, p₀ = 5 MPa, T₀ = 3200 K, p_a = 101325 Pa — every claimed digit reproduced): M_e = 3.9127686, ṁ = 23.1584772 kg/s via both the Vandenkerckhove Γ and ρ_e V_e A_e (agreement 6e-16), c\* = 1695.703 m/s, F = 52455.11 N, C_f = 1.335758 (closed form and momentum integral agree to 4e-16), Isp_SL = 230.971 s, Isp_vac = 318.573 s. Use this as a unit test for the reference path.
+
+**What a correct 2D axisymmetric solver should show against quasi-1D**, so a developer can tell physics from a bug:
+
+| | quasi-1D | correct 2D | why |
+|---|---|---|---|
+| ṁ | ideal | 0.3–1.0% lower | curved sonic line; discharge coefficient below 1 |
+| exit Mach | uniform | centreline 0.1–0.3 above wall; area-average within 1% | radial equilibrium |
+| C_f | ideal | 0.5–1.5% lower | divergence loss |
+| sonic line | flat at throat | bulges downstream 0.1–0.3 r_t on the axis | standard. A flat sonic line means your solver is 1-D in disguise |
+
+Bug indicators, not physics: ṁ more than 2% off, ṁ *above* the 1-D value, exit Mach outside ±5% area-averaged, exit-Mach non-uniformity above 0.5 in a bell (the Bézier is throwing an internal shock — check θ_n and that Q lies between N and E).
+
+---
+
+## 12. Acceptance ladder
+
+Headless, exit 0/1, one number per line. T0–T5 run in under two minutes total.
+
+| | Test | Reference | Pass |
+|---|---|---|---|
+| **T0** | Rasterizer area, no flow, <1 s | πR² for a disk on a cell corner | rel area error ≤ 0.5% at R ∈ {3,4,6,8,12,20}. ✓ Exact sub-cell fractions measure 1.4e-13%; binary point-sampling measures **+13.18% at R=3, +3.45% at R=8, −0.97% at R=12**. Note the sign at R=12 — a signed assertion fails |
+| **T1** | Free-stream preservation, planar-uniform, 200 steps | source vanishes identically at v = 0 | max\|ρ−1\|, \|u−2\|, \|p−1\| ≤ 1e-5; max\|ρv\| ≤ 1e-6 |
+| **T2** | Conservation drift, periodic, 1000 steps, f64 diagnostics | exact | ≤ 2e-6 relative, measured against the geometry-edit ledger, not against zero |
+| **T3** | Order of accuracy, smooth advection, 1D periodic, one period | exact = initial condition | **unlimited slope ≥ 1.90**, limited ≥ 1.50. Two thresholds, because a limited scheme cannot hit 2.0 and "1.6" alone is ambiguous between a healthy limiter and broken reconstruction. This is the cheapest unambiguous test on the ladder |
+| **T4** | Sod, 1-cell-tall strip, N = 200, t = 0.2, γ = 1.4 | ✓ p\* = 0.3031301781, u\* = 0.9274526200, ρ\*_L = 0.4263194282, ρ\*_R = 0.2655737117, shock speed 1.7521557320; positions 0.2633568 / 0.4859454 / 0.6854905 / 0.8504311 | L1(ρ) ≤ 6.0e-3. Correct 2nd order measures 2.4–4.1e-3, first order 1.32e-2 — the threshold sits in the gap. Also: shock front within ±1.5 dz, max ρ ≤ 1.001, max\|ρv\| ≤ 1e-8 (catches transverse flux leakage) |
+| **T5** | Positivity, Toro test 2 and the vacuum-end nozzle | p\* = 1.894e-3 | floor activations **= 0**. Nonzero is a hard stop, not a soft failure — every downstream number becomes un-auditable |
+| **T6** | Oblique shock off a 15° wedge, M = 2, γ = 1.4 | ✓ β = **45.34362°**, p₂/p₁ = 2.1946531, ρ₂/ρ₁ = 1.7289223, M₂ = 1.4457164, dβ/dθ = 1.3490216 | β within ±1.5°, fitted by least squares over x ∈ [x₀+60dz, x₀+150dz]. **Exclude the first 60 cells** — the leading edge is where a staircase wall is worst and including it fails a correct solver |
+| **T7** | Cone vs Taylor–Maccoll, M = 2.35, θ_c = 10°, γ = 1.4 | ✓ β = **26.736718°**, M_surface = 2.146831, p_c/p_∞ = **1.373936** | β ±1.5°, surface p ±8%, surface M ±5%. Plus: max \|v\| in the two rows next to the axis upstream of the cone ≤ 1e-3 of freestream |
+| **T8** | Nozzle vs isentropic | recomputed from `case.gas.gamma` | ṁ/ṁ_ideal ∈ [0.94, 1.00]; exit Mach area-averaged ±4%; C_f 0.975–0.995 of ideal |
+
+**T7 has a trap.** The NASA NPARC validation archive lists p₃/p₁ = 1.4234 for this case. That value is wrong for a 10° cone — ✓ it corresponds to a **10.791°** cone (⚠ the earlier estimate of 10.90° was itself off; 10.90° gives 1.43040). The archive's own pair is internally inconsistent: its β = 27.1843° implies p = 1.4306, not 1.4234. Its *Mach* numbers match to five digits. Put this in the test comment so nobody "fixes" the value back to the archive's.
+
+**T1 cannot catch a wrong axisymmetric source term** — the source is identically zero there. T7 is the only test that validates the axisymmetric machinery against a nontrivial exact solution. In an axisymmetric app, it is not optional.
+
+---
+
+## 13. Honesty rules
+
+**Separation warning.** Show when `p_e/p_a < max(0.40, (1.88·M_e − 1)^−0.64)`.
+
+✓ The Schmucker form was reconstructed from two OCR-garbled sources and is confirmed against NASA TM-77396 eq. (11), valid to M ≤ 5. Values: 0.522 at M = 2, 0.433 at 2.5, 0.374 at 3, 0.301 at 4, 0.256 at 5, crossing Summerfield's 0.40 at M = 2.758. It brackets the independent Zukoski criterion within 10% over M = 2–6.
+
+⚠ Note that `max()` makes the Schmucker term dead code in the demo range: every nozzle at M_e > 2.758 has a Schmucker threshold below 0.40, so the trigger is always exactly 0.40. That is correct if the intent is "warn at whichever criterion fires first as ambient pressure rises," which it is. Keep `max()`; just do not expect Schmucker to participate at the demo settings.
+
+Wording when it fires:
+
+> **⚠ SEPARATED FLOW — NOT SIMULATED.** Exit pressure ratio p_e/p_a = 0.28 is below the separation threshold of 0.40. A real nozzle would separate inside the divergent section: the boundary layer would detach and a shock would stand inside the nozzle. **This simulation is inviscid — it has no boundary layer and cannot separate.** Thrust and exit-pressure readouts are not valid in this regime.
+
+Shade the altitude slider track below the trigger and put a labeled tick at the crossing point, recomputed when the area ratio changes, so the user sees where the trustworthy range ends before dragging.
+
+**Refuse to display:** Isp in seconds (needs real gas and chemistry — show C_f relative to the 1-D ideal instead, which is a ratio and defensible); any efficiency to better than 1%; wall heat flux, shear, skin friction, boundary-layer thickness or wall temperature (there is no boundary layer — these are undefined, not merely inaccurate); separation station as a simulation result; absolute thrust for a named real engine; anything at all while the floor counter is nonzero.
+
+**Display with a badge:** mass flow (±5%, computed live from `2·ε_eff/N_throat`, amber below N_throat = 20); exit pressure and exit Mach ("area-averaged, ±4%" — the exit plane is genuinely non-uniform, so a single number is a choice); thrust coefficient ("inviscid, no divergence correction applied", or apply λ and say so — pick one); shock angles ±1.5°; everything in drawn-geometry mode ("sandbox — qualitative only", since no acceptance test covers an arbitrary user drawing).
+
+**One permanent line of screen space:** `Inviscid Euler · γ = 1.24 · no boundary layer · no chemistry · no heat transfer`.
