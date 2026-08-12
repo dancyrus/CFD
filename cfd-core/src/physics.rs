@@ -21,6 +21,13 @@ use cfd_contract::{
 /// bit-exactly zero. Special-cased, NOT computed by calling hllc_flux with a
 /// mirrored state (the S_M = 0 cancellation is exact in real arithmetic but
 /// not under FMA contraction). See docs/physics-reference.md §3.
+///
+/// CONSUMPTION RULE (session A): the sgn premultiplication encodes the face
+/// orientation so the sweep applies the UNIFORM rule `rhs[fluid] -= F/dz`
+/// (r: `-= r_face*F/(dr*r_c)`) for a wall face on EITHER side of the cell.
+/// Plugging this return directly into the textbook difference as F_{i-1/2}
+/// for a low-side wall flips the sign and breaks quiescent equilibrium —
+/// the well_balanced acceptance test catches exactly that.
 pub fn wall_flux_z(w: Prim, sgn: Real, gamma: Real) -> Cons {
     [0.0, sgn * wall_star_pressure(w[0], w[1], w[3], sgn, gamma), 0.0, 0.0]
 }
@@ -53,6 +60,8 @@ fn inlet_ghost(wi: Prim, chamber: &Chamber, g: Real) -> Cons {
     let rm = wi[1] - 2.0 * ai / (g - 1.0);
     let aa = (g + 1.0) / (g - 1.0);
     let d = ((g + 1.0) * a02 / (g - 1.0) - 0.5 * (g - 1.0) * rm * rm).max(0.0);
+    // The 1e-6 floor is a guard beyond the reference: if D clamps to 0 while
+    // R- > 0 (supersonic reverse inflow), a_b would be <= 0 and rho_b = 0/0.
     let ab = ((-rm + d.sqrt()) / aa).max(1e-6);
     let ub = (rm + 2.0 * ab / (g - 1.0)).max(0.0);
     let pb = chamber.p0 * (ab * ab / a02).powf(g / (g - 1.0));
@@ -183,6 +192,9 @@ pub fn apply_sponge(u: &mut [Cons], g: &Grid, dt: Real, ambient: &Ambient,
 
     for ir in ir0..g.nr {
         let s = ((ir - ir0) as Real + 0.5) / cells as Real;
+        // .min(1.0) is a stability guard beyond the reference: an explicit
+        // relaxation step must not overshoot past ambient. At CFL 0.4 the
+        // coefficient is ~0.2, so the clamp never engages in normal runs.
         let coef = (dt * sigma_max * s * s).min(1.0);
         for iz in 0..g.nz {
             let c = &mut u[g.gidx(iz as isize, ir as isize)];
