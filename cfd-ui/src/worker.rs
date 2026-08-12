@@ -18,7 +18,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use cfd_contract::{Report, Snapshot, SolveSetup, Solver, SolverCommand, StepInfo};
-use cfd_core::MockSolver;
+use cfd_core::{EulerSolver, MockSolver};
 
 /// Everything the UI reads per frame, published atomically.
 #[derive(Clone)]
@@ -61,9 +61,20 @@ const FRESH_INFO: StepInfo = StepInfo {
     floor_activations: 0,
 };
 
-fn build(setup: &SolveSetup) -> cfd_contract::Result<Box<dyn Solver>> {
-    // The one-line swap at integration: MockSolver -> EulerSolver.
-    Ok(Box::new(MockSolver::new(setup.clone())?))
+/// Which solver to build. Real by default; `CFD_SOLVER=mock` flips back to
+/// the analytic preview without a rebuild (abort-ladder rung 0).
+pub fn solver_kind() -> cfd_contract::SolverKind {
+    match std::env::var("CFD_SOLVER").as_deref() {
+        Ok("mock") => cfd_contract::SolverKind::Mock,
+        _ => cfd_contract::SolverKind::Real,
+    }
+}
+
+pub fn build(setup: &SolveSetup) -> cfd_contract::Result<Box<dyn Solver>> {
+    Ok(match solver_kind() {
+        cfd_contract::SolverKind::Mock => Box::new(MockSolver::new(setup.clone())?),
+        cfd_contract::SolverKind::Real => Box::new(EulerSolver::new(setup.clone())?),
+    })
 }
 
 pub fn make_frame(solver: &dyn Solver, info: StepInfo) -> UiFrame {
@@ -260,8 +271,14 @@ mod tests {
 
     /// Every control the UI exposes, exercised headlessly against the worker
     /// thread. An orphan `egui::Context` swallows the repaint requests.
+    ///
+    /// Pinned to the mock: this test checks the worker's command plumbing, and
+    /// its assertions (e.g. the report tracking p0 across a Rebuild within
+    /// seconds) rely on the mock's instant analytic response. The real solver
+    /// needs convergence time and reports NaN until flow reaches the exit.
     #[test]
     fn worker_honours_every_command() {
+        std::env::set_var("CFD_SOLVER", "mock");
         let params = CaseParams::default();
         let wall = case::conical_contour(params.area_ratio);
         let setup = case::make_setup(&params, &wall);

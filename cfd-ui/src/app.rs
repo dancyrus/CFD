@@ -64,6 +64,8 @@ pub struct CfdApp {
     geometry_custom: bool,
     space_panned: bool,
     hover_text: String,
+    /// ANALYTIC PREVIEW overlay — true only for MockSolver builds.
+    watermark: bool,
 }
 
 impl CfdApp {
@@ -73,6 +75,7 @@ impl CfdApp {
         initial: UiFrame,
         params: CaseParams,
         wall: Vec<[f64; 2]>,
+        watermark: bool,
     ) -> Self {
         let mut locked = [(0.0f32, 1.0f32); 8];
         for k in FieldKind::ALL {
@@ -98,6 +101,7 @@ impl CfdApp {
             geometry_custom: false,
             space_panned: false,
             hover_text: String::new(),
+            watermark,
         }
     }
 
@@ -615,7 +619,7 @@ impl eframe::App for CfdApp {
                     &mut self.editor,
                     self.editor_on,
                     &self.committed_wall,
-                    true, // MockSolver build: watermark on
+                    self.watermark, // ANALYTIC PREVIEW watermark: mock builds only
                 );
                 if output.space_panned {
                     self.space_panned = true;

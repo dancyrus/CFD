@@ -13,18 +13,18 @@ mod colormap;
 mod editor;
 mod worker;
 
-use cfd_contract::{Solver, StepInfo};
-use cfd_core::MockSolver;
+use cfd_contract::{Solver, SolverKind, StepInfo};
 
 fn main() -> eframe::Result {
     let params = case::CaseParams::default();
     let wall = case::conical_contour(params.area_ratio);
     let setup = case::make_setup(&params, &wall);
 
-    // MockSolver from minute one; EulerSolver is a one-line swap here and in
-    // worker::build once sessions A and B land.
+    // EulerSolver by default; CFD_SOLVER=mock flips back to the analytic
+    // preview without a rebuild (abort-ladder rung 0).
+    let mock = worker::solver_kind() == SolverKind::Mock;
     let solver: Box<dyn Solver> =
-        Box::new(MockSolver::new(setup.clone()).expect("mock solver rejected the demo case"));
+        worker::build(&setup).expect("solver rejected the demo case");
     let info = StepInfo {
         step: 0,
         time: 0.0,
@@ -43,7 +43,11 @@ fn main() -> eframe::Result {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 880.0])
             .with_min_inner_size([980.0, 600.0])
-            .with_title("CFD Nozzle Sandbox — analytic preview"),
+            .with_title(if mock {
+                "CFD Nozzle Sandbox — analytic preview"
+            } else {
+                "CFD Nozzle Sandbox"
+            }),
         vsync: true,
         ..Default::default()
     };
@@ -54,7 +58,7 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             worker::spawn(setup, solver, info, cc.egui_ctx.clone(), rx, buf_in);
             Ok(Box::new(ExitGuard {
-                app: app::CfdApp::new(buf_out, tx, initial, params, wall),
+                app: app::CfdApp::new(buf_out, tx, initial, params, wall, mock),
                 tx: tx_exit,
             }))
         }),
