@@ -595,6 +595,7 @@ name = "cfd-core"
 version = "0.1.0"
 dependencies = [
  "cfd-contract",
+ "cfd-geom",
  "rayon",
 ]
 
