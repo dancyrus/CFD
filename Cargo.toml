@@ -17,3 +17,14 @@ cfd-geom      = { path = "cfd-geom" }
 # bug. Do not remove this.
 [profile.dev.package."*"]
 opt-level = 3
+
+# package."*" does NOT match workspace members, so the solver crates need
+# explicit entries or `cargo run -p cfd-ui` ships the 20-50x slowdown anyway
+# (measured: MockSolver::snapshot at 320x200 is 165 ms unoptimized, 6 ms with
+# this). cfd-ui itself stays unoptimized for fast UI iteration.
+[profile.dev.package.cfd-contract]
+opt-level = 3
+[profile.dev.package.cfd-core]
+opt-level = 3
+[profile.dev.package.cfd-geom]
+opt-level = 3
