@@ -1,0 +1,15 @@
+[package]
+name = "cfd-ui"
+version = "0.1.0"
+edition = "2021"
+
+# eframe/egui live HERE and nowhere else. Each worktree has its own empty
+# target/ and eframe is a 2-5 minute cold build; keeping it in one crate means
+# one session pays instead of four.
+[dependencies]
+cfd-contract = { workspace = true }
+cfd-core = { workspace = true }
+cfd-geom = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+triple_buffer = { workspace = true }

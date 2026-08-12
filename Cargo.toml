@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["cfd-contract", "cfd-core", "cfd-geom", "cfd-ui"]
+
+[workspace.dependencies]
+# Pinned exactly. Do not run `cargo update`.
+eframe        = "=0.31.1"
+egui          = "=0.31.1"
+rayon         = "=1.10.0"
+triple_buffer = "=8.0.0"
+thiserror     = "2"
+cfd-contract  = { path = "cfd-contract" }
+cfd-core      = { path = "cfd-core" }
+cfd-geom      = { path = "cfd-geom" }
+
+# An unoptimized MUSCL-HLLC kernel is 20-50x slower and reads as a performance
+# bug. Do not remove this.
+[profile.dev.package."*"]
+opt-level = 3
