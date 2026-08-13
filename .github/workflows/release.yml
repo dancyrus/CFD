@@ -32,7 +32,10 @@ jobs:
           - os: macos-latest
             artifact: cfd-sandbox-macos-arm64
             bin: cfd-ui
-          - os: macos-13
+          # Intel macOS is cross-compiled from the arm64 runner: macos-13
+          # (the last Intel runner image) is retired and jobs queue forever.
+          - os: macos-latest
+            target: x86_64-apple-darwin
             artifact: cfd-sandbox-macos-x86_64
             bin: cfd-ui
     runs-on: ${{ matrix.os }}
@@ -47,12 +50,23 @@ jobs:
             libxcb-xfixes0-dev libxkbcommon-dev libwayland-dev libssl-dev
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --release -p cfd-ui
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.target }}" ]; then
+            rustup target add "${{ matrix.target }}"
+            cargo build --release -p cfd-ui --target "${{ matrix.target }}"
+          else
+            cargo build --release -p cfd-ui
+          fi
       - name: Package
         shell: bash
         run: |
           mkdir dist
-          cp "target/release/${{ matrix.bin }}" dist/
+          if [ -n "${{ matrix.target }}" ]; then
+            cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" dist/
+          else
+            cp "target/release/${{ matrix.bin }}" dist/
+          fi
           cd dist
           if [ "$RUNNER_OS" = "Windows" ]; then
             7z a "../${{ matrix.artifact }}.zip" "${{ matrix.bin }}"
