@@ -248,3 +248,107 @@ fn diag_nozzle_measure_grid() {
                  info.residual);
     }
 }
+
+/// T8 failure diagnosis, in the order asked: (1) convergence history with the
+/// report values every 2000 steps, (2) fine centerline Mach from throat to
+/// exit plus the ambient-vs-design condition, (3) the exact exit-plane
+/// sampling: which column, which cells, what solid fractions sit there, and
+/// how the integrals move if sampled one or two columns upstream.
+#[test]
+#[ignore = "diagnostic"]
+fn diag_t8_convergence_and_exit_plane() {
+    let gas = GasModel { gamma: 1.24, r_specific_si: 378.0 };
+    let refs = RefScales::from_chamber(0.05, 5.0e6, 3200.0, &gas);
+    let grid = Grid { nz: 320, nr: 200, dz: 0.1449, dr: 0.05 };
+    let spec = cfd_geom::NozzleSpec {
+        throat_radius_m: 0.05, area_ratio: 8.0, contraction_ratio: 4.0,
+        converge_half_angle_deg: 30.0, throat_arc_up: 1.5, throat_arc_down: 0.382,
+        contour: cfd_geom::ContourKind::Conical { half_angle_deg: 15.0 },
+    };
+    let wall = cfd_geom::generate_contour(&spec, 512).unwrap();
+    let solid = cfd_geom::rasterize(&wall, &grid, &refs).unwrap();
+
+    // --- (3a) geometry bookkeeping before any stepping ---------------------
+    let lip = (0..grid.nz)
+        .filter(|&iz| (0..grid.nr).any(|ir| solid.is_solid(grid.idx(iz, ir))))
+        .max().unwrap();
+    let z_exit_contour = wall.points.last().unwrap()[0] / refs.l_m; // nondim
+    println!("exit plane: lip column {lip}, cell z-range [{:.3}, {:.3}] r_t; \
+              contour ends at z = {:.3} r_t",
+             lip as f32 * grid.dz, (lip as f32 + 1.0) * grid.dz, z_exit_contour);
+    for iz in [lip - 2, lip - 1, lip] {
+        let first_solid = (0..grid.nr).find(|&ir| solid.is_solid(grid.idx(iz, ir))).unwrap();
+        println!("  col {iz}: first solid row {first_solid} (r_face {:.3}); fractions \
+                  rows {}..{}: {:?}",
+                 grid.r_face(first_solid), first_solid.saturating_sub(2), first_solid + 1,
+                 (first_solid.saturating_sub(2)..=first_solid + 1)
+                     .map(|ir| solid.fraction[grid.idx(iz, ir)])
+                     .collect::<Vec<_>>());
+    }
+    // Throat: minimum bore over nozzle columns.
+    let (throat_col, throat_rows) = (0..=lip)
+        .filter_map(|iz| (0..grid.nr).find(|&ir| solid.is_solid(grid.idx(iz, ir)))
+            .map(|ir| (iz, ir)))
+        .min_by_key(|&(_, ir)| ir).unwrap();
+    println!("throat: column {throat_col}, first solid row {throat_rows} \
+              (bore {:.3} r_t, N_throat = {})", grid.r_face(throat_rows), throat_rows);
+
+    // --- ambient vs design -------------------------------------------------
+    let p_a_nd = 101_325.0 / refs.p_pa;
+    let g = gas.gamma as f64;
+    let m_e = cfd_core::physics::mach_from_area_ratio(8.0, g, true);
+    let p_e_ideal = (1.0 + 0.5 * (g - 1.0) * m_e * m_e).powf(-g / (g - 1.0));
+    println!("ambient: p_a = 101325 Pa = {:.5} p0; ideal p_e = {:.5} p0 ({:.1} kPa); \
+              p_e/p_a(design) = {:.3} -> {} at sea level (separation threshold 0.40)",
+             p_a_nd, p_e_ideal, p_e_ideal * refs.p_pa / 1e3, p_e_ideal / p_a_nd,
+             if p_e_ideal / p_a_nd < 1.0 { "OVERexpanded" } else { "UNDERexpanded" });
+
+    // --- (1) convergence history ------------------------------------------
+    let setup = SolveSetup {
+        grid, solid: Arc::new(solid), gas,
+        chamber: Chamber { p0: 1.0, t0: 1.0 },
+        ambient: Ambient { p: p_a_nd as f32, t: (288.15 / refs.t_k) as f32 },
+        numerics: Numerics::default(),
+        refs,
+    };
+    let mut s = EulerSolver::new(setup).unwrap();
+    let mut info = s.step().unwrap();
+    println!("step | residual | exit M | mdot kg/s | C_f | p_e/p_a");
+    for target in (2000u64..=20000).step_by(2000) {
+        while info.step < target { info = s.step().unwrap(); }
+        let r = s.report();
+        println!("{:5} | {:.3e} | {:.3} | {:.3} | {:.4} | {:.3}",
+                 target, info.residual, r.exit_mach, r.mass_flow_kg_s,
+                 r.thrust_coefficient, r.exit_pressure_ratio);
+    }
+
+    // --- (2) fine centerline Mach, throat to exit -------------------------
+    let snap = s.snapshot();
+    println!("centerline M, every column from throat ({throat_col}) to lip ({lip}):");
+    let vals: Vec<String> = (throat_col..=lip)
+        .map(|iz| format!("{:.2}", snap.sample(FieldKind::Mach, iz, 0))).collect();
+    println!("  {}", vals.join(" "));
+
+    // --- (3b) the integral, column by column near the exit ----------------
+    println!("exit-plane integrals vs sampling column (fluid cells 0..first-solid):");
+    for iz in [lip - 4, lip - 2, lip - 1, lip] {
+        let first_solid = (0..grid.nr).find(|&ir| snap.solid.is_solid(grid.idx(iz, ir))).unwrap();
+        let (mut mdot, mut mach_a, mut area) = (0.0f64, 0.0f64, 0.0f64);
+        for ir in 0..first_solid {
+            let da = 2.0 * std::f64::consts::PI * grid.r_center(ir) as f64 * grid.dr as f64;
+            let rho = snap.sample(FieldKind::Density, iz, ir) as f64;
+            let uz = snap.sample(FieldKind::VelocityZ, iz, ir) as f64;
+            mdot += rho * uz * da * refs.l_m * refs.l_m;
+            mach_a += snap.sample(FieldKind::Mach, iz, ir) as f64 * da;
+            area += da;
+        }
+        println!("  col {iz} (bore {} rows): mdot {:.3} kg/s, area-avg M {:.3}",
+                 first_solid, mdot, mach_a / area);
+    }
+    // Radial Mach at the lip, fine near the wall.
+    let first_solid = (0..grid.nr).find(|&ir| snap.solid.is_solid(grid.idx(lip, ir))).unwrap();
+    println!("lip column radial M, last 14 fluid rows to the wall:");
+    for ir in first_solid.saturating_sub(14)..first_solid {
+        println!("  r {:.2}: M {:.3}", grid.r_center(ir), snap.sample(FieldKind::Mach, lip, ir));
+    }
+}
