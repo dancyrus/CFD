@@ -21,10 +21,6 @@ pub const CELLS_PER_RT: f64 = 20.0;
 /// (the radial term dominates) while linearly cutting cells.
 const DZ_OVER_DR: f64 = 2.9;
 
-/// Radial thickness of the rasterized wall band, in r_t. 8 cells at the
-/// default dr — enough that the solver's column scan always finds the wall.
-pub const WALL_THICKNESS: f64 = 0.4;
-
 /// Altitude ceiling, docs/physics-reference.md §5: 58 km is where the
 /// thinnest ambient still clears the pressure floor for the highest-pressure
 /// preset (Raptor 2, 300 bar: p_a(58 km) ≈ 27 Pa ≈ 1e-6 p₀). Above the cap
@@ -415,7 +411,9 @@ pub fn conical_contour(area_ratio: f64) -> Vec<[f64; 2]> {
 }
 
 /// Wall radius at axial station z by linear interpolation, `None` outside the
-/// polyline's z range (open plume region).
+/// polyline's z range (open plume region). Test-only since the exact
+/// rasterizer replaced the band stub.
+#[cfg(test)]
 pub fn wall_radius(points: &[[f64; 2]], z: f64) -> Option<f64> {
     if points.len() < 2 || z < points[0][0] || z > points[points.len() - 1][0] {
         return None;
@@ -521,7 +519,7 @@ mod tests {
             let end = pts.last().unwrap();
             assert!(end[0] < c.lz_rt, "{}: nozzle longer than domain", p.name);
             assert!(
-                end[1] + WALL_THICKNESS < c.lr_rt,
+                end[1] + 0.4 < c.lr_rt, // bell exit clears the domain top with margin
                 "{}: bell exit outside domain",
                 p.name
             );
