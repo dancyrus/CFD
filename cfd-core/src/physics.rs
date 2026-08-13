@@ -220,7 +220,15 @@ pub fn carbuncle_mask(w: &[Prim], g: &Grid, mask: &mut [bool]) {
                 pmin = pmin.min(p);
                 pmax = pmax.max(p);
             }
-            if pmin < 0.7 * pmax {
+            // Compression gate (integration fix, approved 2026-08-13): the
+            // plain min/max-p sensor cannot tell a captured shock from a
+            // smooth steep expansion — on the demo nozzle it masked ~1300
+            // shock-free cells at quasi-1D init, putting dissipative HLL
+            // radial fluxes across the whole divergent section. A shock has
+            // converging axial velocity across the window in either flow
+            // direction; an expansion diverges.
+            let compressing = w[g.gidx(iz + 2, ir)][1] < w[g.gidx(iz - 2, ir)][1];
+            if compressing && pmin < 0.7 * pmax {
                 for d in -1..=1 {
                     let j = iz + d;
                     if j >= 0 && j < nz {
@@ -755,10 +763,13 @@ mod tests {
     #[test]
     fn carbuncle_mask_fires_three_cells_around_a_shock_only() {
         let g = Grid { nz: 30, nr: 3, dz: 0.1, dr: 0.05 };
-        let mut w = vec![[1.0f32, 0.0, 0.0, 1.0]; g.glen()];
-        // Pressure jump 1.0 -> 0.5 (Omega = 0.5 < 0.7) at iz = 10, row 1 only.
+        let mut w = vec![[1.0f32, 2.0, 0.0, 1.0]; g.glen()];
+        // Shock-like jump at iz = 10, row 1 only: pressure 1.0 -> 0.5 with
+        // DECELERATING axial velocity (the compression gate requires it; a
+        // pressure jump with diverging velocity is an expansion).
         for iz in 10..(g.nz as isize + NG as isize) {
             w[g.gidx(iz, 1)][3] = 0.5;
+            w[g.gidx(iz, 1)][1] = 1.0;
         }
         let mut mask = vec![false; g.glen()];
         carbuncle_mask(&w, &g, &mut mask);
@@ -768,6 +779,24 @@ mod tests {
             assert!(!mask[g.gidx(iz, 0)], "row 0 must stay unmasked");
             assert!(!mask[g.gidx(iz, 2)], "row 2 must stay unmasked");
         }
+    }
+
+    #[test]
+    fn carbuncle_mask_quiet_on_steep_smooth_expansion() {
+        let g = Grid { nz: 30, nr: 3, dz: 0.1, dr: 0.05 };
+        let mut w = vec![[1.0f32, 0.5, 0.0, 1.0]; g.glen()];
+        // Nozzle-like expansion: over 5 cells p falls by 2x (Omega = 0.5
+        // < 0.7 — the old sensor fired) while u RISES. Must stay unmasked.
+        for ir in -2..(g.nr as isize + 2) {
+            for iz in -2..(g.nz as isize + 2) {
+                let f = 0.87f32.powi(iz as i32 + 2);
+                w[g.gidx(iz, ir)][3] = f;
+                w[g.gidx(iz, ir)][1] = 0.5 + 0.1 * (iz + 2) as f32;
+            }
+        }
+        let mut mask = vec![true; g.glen()];
+        carbuncle_mask(&w, &g, &mut mask);
+        assert!(mask.iter().all(|&m| !m), "sensor fired on a smooth expansion");
     }
 
     #[test]
