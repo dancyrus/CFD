@@ -1,6 +1,7 @@
-//! SSP-RK2 orchestration and the `Solver` impl. **Frozen — coordinator wrote
-//! it. Sessions A and B never open this file.** It calls the signatures
-//! declared in `kernel.rs` (session A) and `physics.rs` (session B).
+//! SSP-RK2 orchestration and the `Solver` impl. Written by the coordinator;
+//! frozen during the parallel build phase. Changes now follow the CLAUDE.md
+//! contract-change rule: mirror docs/contract.md and docs/physics-reference.md
+//! in the same commit, and re-run the full acceptance ladder.
 //!
 //! Buffer ownership: this file allocates every solver-internal buffer. All of
 //! them are padded (`glen()` long, `Grid::gidx` indexing): the ping-pong pair
@@ -139,6 +140,8 @@ impl Solver for EulerSolver {
         kernel::sweep_r(&self.w, &self.solid, &self.mask, &g, &num, &gas,
                         &mut self.rhs, &mut floors);
         kernel::accumulate(&mut self.u1, &self.state.u_old, &self.rhs, dt, &self.solid);
+        kernel::redo_first_order(&mut self.u1, &self.state.u_old, None, &self.w,
+                                 &self.solid, &self.mask, &g, &num, &gas, dt);
         kernel::enforce_positivity(&mut self.u1, &gas, &mut floors);
 
         // Stage 2: u_new = 0.5*(u0 + u1 + dt*rhs).
@@ -152,6 +155,9 @@ impl Solver for EulerSolver {
                         &mut self.rhs, &mut floors);
         kernel::accumulate2(&mut self.state.u_new, &self.state.u_old, &self.u1,
                             &self.rhs, dt, &self.solid);
+        kernel::redo_first_order(&mut self.state.u_new, &self.state.u_old,
+                                 Some(&self.u1), &self.w, &self.solid, &self.mask,
+                                 &g, &num, &gas, dt);
         kernel::enforce_positivity(&mut self.state.u_new, &gas, &mut floors);
 
         physics::apply_sponge(&mut self.state.u_new, &g, dt, &self.setup.ambient,

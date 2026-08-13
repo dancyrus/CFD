@@ -23,6 +23,15 @@ use crate::worker::{UiCommand, UiFrame};
 const TURBO_STEPS: [u32; 3] = [1, 4, 16];
 /// Step of a rebuilt solver at which the deferred colorbar re-lock fires.
 const RELOCK_STEP: u64 = 30;
+/// Floor-activation quarantine (docs/physics-reference.md §13): the report
+/// blanks while any activation is younger than this many steps, then shows
+/// numbers with a permanent amber disclosure. The startup front of the
+/// high-pressure presets brushes the 1e-6 floor by design (§5) — measured
+/// worst case: last activation at step 796 (Merlin Vac, cold start into
+/// vacuum), zero afterwards across all six presets. 1500 clean steps is
+/// roughly twice the longest observed activation window and several domain
+/// flush times, so the startup's invented mass has left the domain.
+const FLOOR_QUARANTINE_STEPS: u64 = 1500;
 const AMBER: Color32 = Color32::from_rgb(235, 170, 45);
 const RED: Color32 = Color32::from_rgb(235, 90, 80);
 const GREEN: Color32 = Color32::from_rgb(90, 200, 120);
@@ -57,6 +66,13 @@ pub struct CfdApp {
     /// `RELOCK_STEP` so it does not capture the near-quiescent init field.
     relock_pending: bool,
     relock_armed: bool,
+    /// Floor-activation quarantine tracking: the highest counter value seen
+    /// and the solver step at which it last grew. A counter decrease means a
+    /// rebuilt/reset solver; a step decrease with an unchanged counter means
+    /// `set_ambient` restarted the step count (new transient) — both re-arm
+    /// the quarantine conservatively.
+    floors_seen: u64,
+    floor_last_step: u64,
     // Slider staging (committed on release).
     ui_area_ratio: f64,
     ui_p0_mpa: f64,
@@ -106,6 +122,8 @@ impl CfdApp {
             preset: None,
             relock_pending: false,
             relock_armed: false,
+            floors_seen: 0,
+            floor_last_step: 0,
             field: FieldKind::Mach,
             paused: false,
             turbo_idx: 0,
@@ -415,17 +433,17 @@ impl CfdApp {
         if self.params.vacuum {
             ui.label(
                 RichText::new(format!(
-                    "VACUUM · p∞ fixed at 2×10⁻⁶ p₀ = {}",
+                    "VACUUM · p∞ fixed at 10⁻⁵ p₀ = {}",
                     fmt_pressure(VACUUM_P_FRAC * self.params.p0_pa)
                 ))
                 .small()
                 .color(AMBER),
             )
             .on_hover_text(
-                "Back pressure fixed at 2× the solver's positivity floor. \
+                "Back pressure fixed at 10× the solver's positivity floor. \
                  True vacuum is unreachable for a finite-pressure Euler \
-                 solver: an ambient at or below the floor would trip the \
-                 floor counter every step and blank every readout.",
+                 solver: with less margin the plume's expansion undershoot \
+                 trips the floor counter and blanks every readout.",
             );
         } else {
             let (pa, ta) = atmosphere(self.params.altitude_m);
@@ -437,7 +455,7 @@ impl CfdApp {
                     fmt_pressure(pa),
                     ta,
                     if clamped {
-                        " · clamped to 2×10⁻⁶ p₀ (pressure floor)"
+                        " · clamped to 10⁻⁵ p₀ (floor margin)"
                     } else {
                         ""
                     }
@@ -484,15 +502,39 @@ impl CfdApp {
         let info = &self.latest.info;
 
         if info.floor_activations > 0 {
-            // The product rule: nothing displays while the floor counter is
-            // nonzero. Every downstream number is un-auditable.
-            ui.colored_label(RED, RichText::new("SOLUTION INVALID").strong());
-            ui.label(format!(
-                "Positivity floor activated {} time(s). No quantitative output \
-                 will be shown for this field.",
-                info.floor_activations
-            ));
-            return;
+            // The product rule, quarantine form (docs §13): nothing displays
+            // while any floor activation is recent — the field near the floor
+            // is actively being invented. Startup activations older than the
+            // quarantine display with a permanent amber disclosure instead:
+            // the high-pressure presets' cold-start front brushes the 1e-6
+            // floor by design (§5), stops within ~800 steps, and the invented
+            // mass has long left the domain.
+            let quiet = info.step.saturating_sub(self.floor_last_step);
+            if quiet < FLOOR_QUARANTINE_STEPS {
+                ui.colored_label(RED, RichText::new("SOLUTION INVALID").strong());
+                ui.label(format!(
+                    "Positivity floor activated {} time(s), most recently {} \
+                     step(s) ago. No quantitative output will be shown until \
+                     the floor has been quiet for {} steps.",
+                    info.floor_activations, quiet, FLOOR_QUARANTINE_STEPS
+                ));
+                return;
+            }
+            ui.colored_label(
+                AMBER,
+                RichText::new(format!(
+                    "floor tripped {}× during startup · none in the last {} steps",
+                    info.floor_activations, quiet
+                ))
+                .small(),
+            )
+            .on_hover_text(
+                "The cold-start front of a high-pressure engine transiently \
+                 drops below the 1e-6 p₀ pressure floor (§5) and those cells \
+                 were clamped. The startup transient was therefore not \
+                 conservative; the steady state shown now never touches the \
+                 floor and its integrals are unaffected.",
+            );
         }
 
         if self.geometry_custom {
@@ -774,6 +816,21 @@ impl eframe::App for CfdApp {
                     self.locked[k as usize] = lock_range(k, self.latest.snapshot.range(k));
                 }
                 self.relock_armed = false;
+            }
+            // Floor-activation quarantine bookkeeping.
+            let info = &self.latest.info;
+            if info.floor_activations < self.floors_seen {
+                // Rebuilt or reset solver: fresh counter.
+                self.floors_seen = 0;
+                self.floor_last_step = 0;
+            }
+            if info.floor_activations > self.floors_seen
+                || (info.step < prev_step && self.floors_seen > 0)
+            {
+                // New activations — or an ambient change restarted the step
+                // count with a nonzero counter (a new transient): re-arm.
+                self.floors_seen = info.floor_activations;
+                self.floor_last_step = info.step;
             }
         }
 

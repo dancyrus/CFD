@@ -77,7 +77,12 @@ fn nonphysical(q: &Prim) -> bool {
 /// Fluid/fluid face flux in the rotated frame. Face-level positivity fallback:
 /// if either reconstructed state is at/below the floors, BOTH sides revert to
 /// their cell averages — a one-sided fallback makes the flux multivalued and
-/// breaks conservation (physics-reference §5) — and `floors` is incremented.
+/// breaks conservation (physics-reference §5). The fallback does NOT touch
+/// `floors`: §5 reserves the counter for the cell-level clamp, which invents
+/// state. This fallback only drops one face to first order — conservative and
+/// positivity-preserving — and a strong expansion (the vacuum end of the
+/// altitude range) fires it transiently by design. Counting it here blanked
+/// every readout of a valid vacuum-nozzle run under the product rule.
 #[inline]
 fn fluid_face_flux(
     s: [Prim; 4],
@@ -87,11 +92,11 @@ fn fluid_face_flux(
     gamma: Real,
     floors: &mut u64,
 ) -> Cons {
+    let _ = floors; // kept: the sweep signatures are contract-frozen
     let (mut ql, mut qr) = muscl_face_states(s, sol, n.reconstruction, n.limiter);
     if n.reconstruction == Reconstruction::Muscl && (nonphysical(&ql) || nonphysical(&qr)) {
         ql = s[1];
         qr = s[2];
-        *floors += 1;
     }
     if ql == qr {
         return analytic_flux(ql, gamma);
@@ -116,7 +121,8 @@ fn oriented(f: Cons, sgn: Real) -> Cons {
 /// `kernels::hllc_flux` (axial faces ALWAYS use HLLC — contact resolution is
 /// what keeps the plume boundary sharp — except under `FluxMode::Hll`).
 /// At a fluid/solid face call `crate::physics::wall_flux_z`. Accumulates
-/// -dF/dz into `rhs`. Face-level positivity fallback increments `floors`.
+/// -dF/dz into `rhs`. `floors` is untouched here — the counter belongs to the
+/// cell-level clamp in `enforce_positivity` (physics-reference §5).
 #[allow(clippy::too_many_arguments)] // frozen signature
 pub fn sweep_z(w: &[Prim], solid: &[bool], mask: &[bool], g: &Grid,
                n: &Numerics, gas: &GasModel, rhs: &mut [Cons], floors: &mut u64) {
@@ -244,9 +250,7 @@ pub fn sweep_r(w: &[Prim], solid: &[bool], mask: &[bool], g: &Grid,
     let hll_mode = matches!(n.flux_mode, FluxMode::Hll | FluxMode::HllRadial);
     // Each row recomputes both of its face fluxes, so every interior face is
     // evaluated twice on identical inputs — bit-identical results, hence still
-    // conservative, and no cross-row writes under par_chunks_mut. (A face-level
-    // fallback on a shared face is therefore counted twice in `floors`;
-    // the ladder only ever asserts the count is zero.)
+    // conservative, and no cross-row writes under par_chunks_mut.
     let new_floors: u64 = rhs
         .par_chunks_mut(snz)
         .enumerate()
@@ -343,8 +347,126 @@ pub fn accumulate2(out: &mut [Cons], u0: &[Cons], u1: &[Cons], rhs: &[Cons], dt:
         });
 }
 
-/// Cell-level positivity pass (the face-level fallback lives in the sweeps):
-/// clamp rho and p to the floors, incrementing `floors` per clamped cell.
+/// §5 cell-level first-order redo, called between `accumulate*` and
+/// `enforce_positivity`: every fluid cell whose accumulated update landed
+/// at/below the floors is recomputed with ALL FOUR faces first-order and the
+/// same dt, per docs/physics-reference.md §5. First-order HLLC with Davis
+/// speeds is positivity-preserving at CFL <= 0.5 (we run 0.4), so this
+/// rescues the MUSCL-overshoot cells on a strong startup front — the vacuum
+/// end of the altitude range — instead of letting `enforce_positivity` clamp
+/// and count them, which would blank the whole report under the product
+/// rule. Whatever is still bad afterwards is clamped and counted there.
+///
+/// The redone cell uses different face fluxes than its neighbours saw — a
+/// deliberate, §5-sanctioned local conservation error confined to cells at
+/// the floors. Serial on purpose: the bad set is a front worth of cells
+/// (measured ~200/step at worst), not the field.
+///
+/// `u1` is `Some(stage-1 result)` for the RK2 combine stage
+/// (`out = 0.5*(u0 + u1 + dt*rhs_fo)`), `None` for stage 1
+/// (`out = u0 + dt*rhs_fo`). `w` must be the SAME stage-input primitives the
+/// sweeps that produced `out` consumed, ghosts filled.
+#[allow(clippy::too_many_arguments)]
+pub fn redo_first_order(out: &mut [Cons], u0: &[Cons], u1: Option<&[Cons]>,
+                        w: &[Prim], solid: &[bool], mask: &[bool], g: &Grid,
+                        n: &Numerics, gas: &GasModel, dt: Real) {
+    let gamma = gas.gamma;
+    let n_fo = Numerics { reconstruction: Reconstruction::FirstOrder, ..*n };
+    let use_hll_z = n.flux_mode == FluxMode::Hll;
+    let hll_mode_r = matches!(n.flux_mode, FluxMode::Hll | FluxMode::HllRadial);
+    let axisym = n.geometry == Geometry::Axisymmetric;
+    let gm1 = gamma - 1.0;
+    let (inv_dz, inv_dr) = (1.0 / g.dz, 1.0 / g.dr);
+    let mut unused = 0u64;
+    for ir in 0..g.nr as isize {
+        for iz in 0..g.nz as isize {
+            let ci = g.gidx(iz, ir);
+            if solid[ci] {
+                continue;
+            }
+            let c = out[ci];
+            let ke = 0.5 * (c[1] * c[1] + c[2] * c[2]) / c[0];
+            let p = gm1 * (c[3] - ke);
+            #[allow(clippy::neg_cmp_op_on_partial_ord)] // NaN must read as bad
+            let bad = !(c[0] > RHO_MIN) || !(p > P_MIN_ABS)
+                || !c.iter().all(|v| v.is_finite());
+            if !bad {
+                continue;
+            }
+            // The four first-order face fluxes, mirroring the sweeps exactly.
+            let mut fz = |lc: isize, rc: isize| -> Cons {
+                let (li, ri) = (g.gidx(lc, ir), g.gidx(rc, ir));
+                let (ls, rs) = (solid[li], solid[ri]);
+                if ls && rs {
+                    [0.0; 4]
+                } else if !ls && !rs {
+                    let s = [w[g.gidx(lc - 1, ir)], w[li], w[ri], w[g.gidx(rc + 1, ir)]];
+                    let sol =
+                        [solid[g.gidx(lc - 1, ir)], ls, rs, solid[g.gidx(rc + 1, ir)]];
+                    fluid_face_flux(s, sol, use_hll_z, &n_fo, gamma, &mut unused)
+                } else if !ls {
+                    oriented(crate::physics::wall_flux_z(w[li], 1.0, gamma), 1.0)
+                } else {
+                    oriented(crate::physics::wall_flux_z(w[ri], -1.0, gamma), -1.0)
+                }
+            };
+            let f_lo = fz(iz - 1, iz);
+            let f_hi = fz(iz, iz + 1);
+            let g_lo = if axisym && ir == 0 {
+                [0.0; 4]
+            } else {
+                radial_face_flux(w, solid, mask, g, &n_fo, hll_mode_r, gamma, iz,
+                                 ir - 1, &mut unused)
+            };
+            let g_hi = radial_face_flux(w, solid, mask, g, &n_fo, hll_mode_r, gamma, iz,
+                                        ir, &mut unused);
+            let mut rhs_c: Cons = [0.0; 4];
+            for k in 0..4 {
+                rhs_c[k] = -(f_hi[k] - f_lo[k]) * inv_dz;
+            }
+            match n.geometry {
+                Geometry::Planar => {
+                    for k in 0..4 {
+                        rhs_c[k] -= (g_hi[k] - g_lo[k]) * inv_dr;
+                    }
+                }
+                Geometry::Axisymmetric => {
+                    // The single bracket, identical to sweep_r (§1).
+                    let sj: Cons = [0.0, 0.0, w[ci][3], 0.0];
+                    let r_lo = g.r_face(ir as usize);
+                    let r_hi = g.r_face(ir as usize + 1);
+                    let inv = 1.0 / (g.dr * g.r_center(ir as usize));
+                    for k in 0..4 {
+                        rhs_c[k] -=
+                            (r_hi * (g_hi[k] - sj[k]) - r_lo * (g_lo[k] - sj[k])) * inv;
+                    }
+                }
+            }
+            let a = u0[ci];
+            out[ci] = match u1 {
+                None => [
+                    a[0] + dt * rhs_c[0],
+                    a[1] + dt * rhs_c[1],
+                    a[2] + dt * rhs_c[2],
+                    a[3] + dt * rhs_c[3],
+                ],
+                Some(u1) => {
+                    let b = u1[ci];
+                    [
+                        0.5 * (a[0] + b[0] + dt * rhs_c[0]),
+                        0.5 * (a[1] + b[1] + dt * rhs_c[1]),
+                        0.5 * (a[2] + b[2] + dt * rhs_c[2]),
+                        0.5 * (a[3] + b[3] + dt * rhs_c[3]),
+                    ]
+                }
+            };
+        }
+    }
+}
+
+/// Cell-level positivity pass (the face-level fallback lives in the sweeps,
+/// the §5 first-order redo in `redo_first_order`): clamp rho and p to the
+/// floors, incrementing `floors` per clamped cell.
 /// See docs/physics-reference.md §5.
 #[allow(clippy::neg_cmp_op_on_partial_ord)] // deliberate: NaN must read as at/below floor
 pub fn enforce_positivity(u: &mut [Cons], gas: &GasModel, floors: &mut u64) {

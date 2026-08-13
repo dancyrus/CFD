@@ -294,6 +294,7 @@ step():
   kernel::sweep_z(w, solid, mask, grid, num, gas, &mut rhs, &mut floors)
   kernel::sweep_r(w, solid, mask, grid, num, gas, &mut rhs, &mut floors)   // adds axisym source
   kernel::accumulate(&mut u_1, u_old, &rhs, dt, solid)                     // u1 = u0 + dt*rhs
+  kernel::redo_first_order(&mut u_1, u_old, None, w, ...)                  // §5 cell-level redo
   kernel::enforce_positivity(&mut u_1, gas, &mut floors)
 
   // stage 2
@@ -301,6 +302,7 @@ step():
   kernel::compute_primitives(u_1, w, gamma)
   kernel::sweep_z(...); kernel::sweep_r(...)
   kernel::accumulate2(&mut u_new, u_old, u_1, &rhs, dt, solid)             // 0.5*(u0 + u1 + dt*rhs)
+  kernel::redo_first_order(&mut u_new, u_old, Some(u_1), w, ...)           // §5 cell-level redo
   kernel::enforce_positivity(&mut u_new, gas, &mut floors)
 
   physics::apply_sponge(&mut u_new, grid, dt, ambient, gas, num.sponge_cells)
@@ -326,6 +328,14 @@ pub fn sweep_r(w: &[Prim], solid: &[bool], mask: &[bool], g: &Grid,
 
 pub fn accumulate(out: &mut [Cons], u0: &[Cons], rhs: &[Cons], dt: Real, solid: &[bool]);
 pub fn accumulate2(out: &mut [Cons], u0: &[Cons], u1: &[Cons], rhs: &[Cons], dt: Real, solid: &[bool]);
+/// §5 cell-level positivity redo: cells at/below the floors after accumulate*
+/// are recomputed with all four faces first-order (same dt) before
+/// enforce_positivity clamps and counts what remains. u1 = Some(stage-1
+/// result) selects the RK2 combine form; the floor counter is untouched here
+/// — it belongs to the clamp alone.
+pub fn redo_first_order(out: &mut [Cons], u0: &[Cons], u1: Option<&[Cons]>,
+                        w: &[Prim], solid: &[bool], mask: &[bool], g: &Grid,
+                        n: &Numerics, gas: &GasModel, dt: Real);
 pub fn enforce_positivity(u: &mut [Cons], gas: &GasModel, floors: &mut u64);
 pub fn density_residual_f64(u0: &[Cons], u1: &[Cons], solid: &[bool]) -> f64;
 ```
