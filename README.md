@@ -4,8 +4,23 @@ A 2D axisymmetric compressible CFD sandbox built on real numerical methods. Draw
 shape or dial in a rocket nozzle, watch supersonic flow run through it, drag an
 altitude slider and watch the plume change.
 
-This repository is the **plan**, not the code. The code is written by parallel
+This repository started as the **plan**; the code now exists, written by parallel
 Claude Code sessions working from the briefs in `docs/sessions/`.
+
+## Download
+
+Prebuilt binaries for Linux, Windows and macOS are on the
+[releases page](https://github.com/dancyrus/CFD/releases): unzip and run — the
+app is a single executable, no installer.
+
+- **Windows**: run `cfd-ui.exe`.
+- **Linux**: `chmod +x cfd-ui && ./cfd-ui` (needs an X11 or Wayland desktop).
+- **macOS**: the binary is unsigned, so the first launch needs
+  `chmod +x cfd-ui`, then right-click → Open (or
+  `xattr -d com.apple.quarantine cfd-ui`). Pick the `arm64` zip for Apple
+  Silicon, `x86_64` for Intel.
+
+Or build from source: `cargo run --release -p cfd-ui`.
 
 ## What it does
 

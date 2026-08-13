@@ -1,0 +1,72 @@
+# Build cfd-ui for the three desktop platforms and attach the binaries to a
+# GitHub Release. Fires on version tags (v*) and can be run by hand from the
+# Actions tab (manual runs upload workflow artifacts only, no release).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: cfd-sandbox-linux-x86_64
+            bin: cfd-ui
+          - os: windows-latest
+            artifact: cfd-sandbox-windows-x86_64
+            bin: cfd-ui.exe
+          - os: macos-latest
+            artifact: cfd-sandbox-macos-arm64
+            bin: cfd-ui
+          - os: macos-13
+            artifact: cfd-sandbox-macos-x86_64
+            bin: cfd-ui
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux system libraries (eframe/winit)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxkbcommon-dev libwayland-dev libssl-dev
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release -p cfd-ui
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          cp "target/release/${{ matrix.bin }}" dist/
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "../${{ matrix.artifact }}.zip" "${{ matrix.bin }}"
+          else
+            zip "../${{ matrix.artifact }}.zip" "${{ matrix.bin }}"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: "*.zip"
+          generate_release_notes: true
