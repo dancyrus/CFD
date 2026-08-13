@@ -1,12 +1,18 @@
 # Build cfd-ui for the three desktop platforms and attach the binaries to a
-# GitHub Release. Fires on version tags (v*) and can be run by hand from the
-# Actions tab (manual runs upload workflow artifacts only, no release).
+# GitHub Release. Fires on version tags (v*), or run it by hand from the
+# Actions tab with a tag name — the release step then creates that tag at the
+# built commit (useful because some clients cannot push tags directly).
 name: release
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create/update (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
 
 permissions:
   contents: write
@@ -59,7 +65,6 @@ jobs:
           path: ${{ matrix.artifact }}.zip
 
   release:
-    if: startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -68,5 +73,6 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           files: "*.zip"
           generate_release_notes: true
