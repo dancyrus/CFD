@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use cfd_contract::kernels::{cons_to_prim, prim_to_cons};
 use cfd_contract::{
-    Ambient, Chamber, Cons, GasModel, Grid, Numerics, Prim, Real, SolidField, NG, P_MIN_ABS,
+    Ambient, Chamber, Cons, GasModel, Grid, Numerics, Prim, Real, SolidField, WallMode, NG,
+    P_MIN_ABS,
 };
 
 /// Wall flux at a fluid/solid face. `w` is the fluid cell's CANONICAL
@@ -152,6 +153,31 @@ pub fn fill_ghosts(u: &mut [Cons], g: &Grid, solid: &[bool], gas: &GasModel,
         };
         u[g.gidx(iz, nr)] = ghost;
         u[g.gidx(iz, nr + 1)] = ghost;
+    }
+
+    if _n.wall_mode == WallMode::ColumnReflect {
+        column_reflect_fill(u, g, solid);
+    }
+}
+
+/// WallMode::ColumnReflect (abort-ladder rung 3, also used as a measurement of
+/// the staircase wall's own contribution to the wall layer): per column, every
+/// solid cell is overwritten with the mirror image of the fluid below the bore
+/// (u_r negated), so the sweeps can run the REGULAR flux solver at wall faces
+/// and the bore face becomes a reflecting condition. Only star-convex-in-r
+/// geometry survives; solid cells stay frozen (accumulate skips them) and are
+/// refilled here before every stage.
+fn column_reflect_fill(u: &mut [Cons], g: &Grid, solid: &[bool]) {
+    let ng = NG as isize;
+    let nr = g.nr as isize;
+    for iz in -ng..(g.nz as isize + ng) {
+        let Some(b) = (0..nr).find(|&ir| solid[g.gidx(iz, ir)]) else { continue };
+        for ir in b..nr + ng {
+            let src = (2 * b - 1 - ir).max(0); // mirror about the bore face
+            let mut m = u[g.gidx(iz, src)];
+            m[2] = -m[2];
+            u[g.gidx(iz, ir)] = m;
+        }
     }
 }
 

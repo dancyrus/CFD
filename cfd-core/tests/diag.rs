@@ -352,3 +352,53 @@ fn diag_t8_convergence_and_exit_plane() {
         println!("  r {:.2}: M {:.3}", grid.r_center(ir), snap.sample(FieldKind::Mach, lip, ir));
     }
 }
+
+/// Step-2 measurement (NOT adopted): the T8 nozzle under
+/// WallMode::ColumnReflect. Compares against the Mirror staircase to
+/// attribute how much of the exit wall layer is the staircase wall itself.
+#[test]
+#[ignore = "diagnostic"]
+fn diag_t8_column_reflect() {
+    let gas = GasModel { gamma: 1.24, r_specific_si: 378.0 };
+    let refs = RefScales::from_chamber(0.05, 5.0e6, 3200.0, &gas);
+    let grid = Grid { nz: 320, nr: 200, dz: 0.1449, dr: 0.05 };
+    let spec = cfd_geom::NozzleSpec {
+        throat_radius_m: 0.05, area_ratio: 8.0, contraction_ratio: 4.0,
+        converge_half_angle_deg: 30.0, throat_arc_up: 1.5, throat_arc_down: 0.382,
+        contour: cfd_geom::ContourKind::Conical { half_angle_deg: 15.0 },
+    };
+    let wall = cfd_geom::generate_contour(&spec, 512).unwrap();
+    let solid = cfd_geom::rasterize(&wall, &grid, &refs).unwrap();
+    let lip = (0..grid.nz)
+        .filter(|&iz| (0..grid.nr).any(|ir| solid.is_solid(grid.idx(iz, ir))))
+        .max().unwrap();
+    let setup = SolveSetup {
+        grid, solid: Arc::new(solid), gas,
+        chamber: Chamber { p0: 1.0, t0: 1.0 },
+        ambient: Ambient { p: (101_325.0 / refs.p_pa) as f32, t: (288.15 / refs.t_k) as f32 },
+        numerics: Numerics { wall_mode: cfd_contract::WallMode::ColumnReflect,
+                             ..Numerics::default() },
+        refs,
+    };
+    let mut s = EulerSolver::new(setup).unwrap();
+    let mut info = s.step().unwrap();
+    for target in [4000u64, 8000, 12000] {
+        while info.step < target { info = s.step().unwrap(); }
+        let r = s.report();
+        println!("ColumnReflect step {target}: mdot {:.3} (/ideal {:.4}), exit M {:.3}, \
+                  C_f {:.4} (/ideal {:.4}), p_e/p_a {:.3}, floors {}, residual {:.2e}",
+                 r.mass_flow_kg_s, r.mass_flow_kg_s / 23.4297, r.exit_mach,
+                 r.thrust_coefficient, r.thrust_coefficient / 1.5313,
+                 r.exit_pressure_ratio, info.floor_activations, info.residual);
+    }
+    let snap = s.snapshot();
+    let first_solid = (0..grid.nr).find(|&ir| snap.solid.is_solid(grid.idx(lip, ir))).unwrap();
+    println!("lip radial M, last 14 fluid rows (Mirror baseline fell 2.95 -> 0.02 here):");
+    for ir in first_solid.saturating_sub(14)..first_solid {
+        println!("  r {:.2}: M {:.3}", grid.r_center(ir), snap.sample(FieldKind::Mach, lip, ir));
+    }
+    println!("centerline M every 4 cols, throat to lip:");
+    let vals: Vec<String> = (27..=lip).step_by(4)
+        .map(|iz| format!("{:.2}", snap.sample(FieldKind::Mach, iz, 0))).collect();
+    println!("  {}", vals.join(" "));
+}

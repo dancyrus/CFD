@@ -16,8 +16,8 @@
 
 use cfd_contract::kernels::{cons_to_prim, hll_flux, hllc_flux, muscl_face_states};
 use cfd_contract::{
-    Cons, FluxMode, GasModel, Geometry, Grid, Numerics, Prim, Real, Reconstruction, NG,
-    P_MIN_ABS, RHO_MIN,
+    Cons, FluxMode, GasModel, Geometry, Grid, Numerics, Prim, Real, Reconstruction, WallMode,
+    NG, P_MIN_ABS, RHO_MIN,
 };
 use rayon::prelude::*;
 
@@ -144,6 +144,11 @@ pub fn sweep_z(w: &[Prim], solid: &[bool], mask: &[bool], g: &Grid,
                 if ls && rs {
                     continue;
                 }
+                // NOTE: axial fluid/solid faces stay WALL faces in every
+                // wall mode. ColumnReflect applies only to the radial bore
+                // face; making these transparent lets mass flow axially
+                // through the wall region and the nozzle cannot choke
+                // (measured: mdot 7.6x ideal).
                 let flux: Cons = if !ls && !rs {
                     let s = [w[g.gidx(lc - 1, ir)], w[li], w[ri], w[g.gidx(rc + 1, ir)]];
                     let sol = [solid[g.gidx(lc - 1, ir)], ls, rs, solid[g.gidx(rc + 1, ir)]];
@@ -194,7 +199,9 @@ fn radial_face_flux(
     if ls && rs {
         return [0.0; 4];
     }
-    if !ls && !rs {
+    if (!ls && !rs) || n.wall_mode == WallMode::ColumnReflect {
+        // ColumnReflect: solid cells hold mirror-filled states, wall faces
+        // run the regular solver (first-order — solid flags zero the slopes).
         // Rotate to the r-sweep frame: u_n = u_r, u_t = u_z.
         let rot = |q: Prim| -> Prim { [q[0], q[2], q[1], q[3]] };
         let s = [
