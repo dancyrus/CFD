@@ -433,17 +433,17 @@ impl CfdApp {
         if self.params.vacuum {
             ui.label(
                 RichText::new(format!(
-                    "VACUUM · p∞ fixed at 10⁻⁵ p₀ = {}",
+                    "VACUUM · p∞ fixed at 3×10⁻⁵ p₀ = {}",
                     fmt_pressure(VACUUM_P_FRAC * self.params.p0_pa)
                 ))
                 .small()
                 .color(AMBER),
             )
             .on_hover_text(
-                "Back pressure fixed at 10× the solver's positivity floor. \
+                "Back pressure fixed at 30× the solver's positivity floor. \
                  True vacuum is unreachable for a finite-pressure Euler \
                  solver: with less margin the plume's expansion undershoot \
-                 trips the floor counter and blanks every readout.",
+                 rides the floor at steady state and blanks every readout.",
             );
         } else {
             let (pa, ta) = atmosphere(self.params.altitude_m);
@@ -455,7 +455,7 @@ impl CfdApp {
                     fmt_pressure(pa),
                     ta,
                     if clamped {
-                        " · clamped to 10⁻⁵ p₀ (floor margin)"
+                        " · clamped to 3×10⁻⁵ p₀ (floor margin)"
                     } else {
                         ""
                     }
