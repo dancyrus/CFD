@@ -427,29 +427,30 @@ pub fn wall_radius(points: &[[f64; 2]], z: f64) -> Option<f64> {
     None
 }
 
-/// Stub rasterizer: solid band from the wall contour outward, per-cell radial
-/// overlap fractions. Swap for `cfd_geom::rasterize` (exact sub-cell area)
-/// when session C lands; this one is exact for the band's radial extent but
-/// ignores axial sub-cell geometry.
+/// Exact rasterization via session C's polygon clipper: the solid region is
+/// everything at or above the wall polyline, closed past the domain top —
+/// the same semantics the solver's report (open-radius throat scan, lip
+/// detection) and the T8 rig assume. The old stub laid only a thin band and
+/// left fluid above the wall, which made the detected throat span the whole
+/// domain and the report integrate ambient cells.
 pub fn rasterize_wall(points: &[[f64; 2]], g: &Grid) -> SolidField {
-    let mut s = SolidField::empty(*g);
-    let dr = g.dr as f64;
-    for iz in 0..g.nz {
-        let z = (iz as f64 + 0.5) * g.dz as f64;
-        let Some(rw) = wall_radius(points, z) else {
-            continue;
-        };
-        let top = rw + WALL_THICKNESS;
-        for ir in 0..g.nr {
-            let rf0 = g.r_face(ir) as f64;
-            let rf1 = rf0 + dr;
-            let overlap = (rf1.min(top) - rf0.max(rw)).max(0.0);
-            if overlap > 0.0 {
-                s.fraction[g.idx(iz, ir)] = (overlap / dr) as f32;
-            }
-        }
+    let mut poly = points.to_vec();
+    if poly.len() >= 2 {
+        let r_top = poly
+            .iter()
+            .map(|p| p[1])
+            .fold(g.nr as f64 * g.dr as f64, f64::max)
+            + 1.0;
+        let (z_first, z_last) = (poly[0][0], poly[poly.len() - 1][0]);
+        poly.push([z_last, r_top]);
+        poly.push([z_first, r_top]);
     }
-    s
+    cfd_geom::rasterize_solid_polygon(&poly, g).unwrap_or_else(|e| {
+        // Degenerate hand-drawn input: no wall beats a poisoned one, and the
+        // vanished nozzle is immediately visible.
+        eprintln!("cfd-ui: wall rasterization failed ({e}); solving without a wall");
+        SolidField::empty(*g)
+    })
 }
 
 pub fn make_setup(p: &CaseParams, wall: &[[f64; 2]]) -> SolveSetup {
