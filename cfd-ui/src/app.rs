@@ -21,6 +21,8 @@ use crate::editor::{EditorBackend, StubEditor};
 use crate::worker::{UiCommand, UiFrame};
 
 const TURBO_STEPS: [u32; 3] = [1, 4, 16];
+/// Step of a rebuilt solver at which the deferred colorbar re-lock fires.
+const RELOCK_STEP: u64 = 30;
 const AMBER: Color32 = Color32::from_rgb(235, 170, 45);
 const RED: Color32 = Color32::from_rgb(235, 90, 80);
 const GREEN: Color32 = Color32::from_rgb(90, 200, 120);
@@ -47,10 +49,14 @@ pub struct CfdApp {
     /// Index into `case::PRESETS`; `None` is the custom/demo case. Touching
     /// any slider or the wall editor clears it — a preset is all-or-nothing.
     preset: Option<usize>,
-    /// Re-lock the colorbar ranges on the first frames of a rebuilt solver:
-    /// a preset or p₀ change can move the reference scales by 35×, and
-    /// ranges locked to the old scales display as a solid color.
+    /// Re-lock the colorbar ranges after a rebuild: a preset or p₀ change
+    /// can move the reference scales by 35×, and ranges locked to the old
+    /// scales display as a solid color. Two stages — `relock_pending` is set
+    /// when the rebuild is sent, `relock_armed` when the new solver's frames
+    /// arrive (step count restarted); the actual re-lock waits until
+    /// `RELOCK_STEP` so it does not capture the near-quiescent init field.
     relock_pending: bool,
+    relock_armed: bool,
     // Slider staging (committed on release).
     ui_area_ratio: f64,
     ui_p0_mpa: f64,
@@ -99,6 +105,7 @@ impl CfdApp {
             params,
             preset: None,
             relock_pending: false,
+            relock_armed: false,
             field: FieldKind::Mach,
             paused: false,
             turbo_idx: 0,
@@ -752,15 +759,21 @@ impl eframe::App for CfdApp {
             if self.latest.error.is_some() && self.latest.paused {
                 self.paused = true;
             }
-            // First frames from a rebuilt solver (step count restarted):
-            // re-lock the colorbar ranges to the new reference scales.
+            // Frames from a rebuilt solver (step count restarted): arm the
+            // re-lock, then fire it once the startup transient has developed
+            // a usable range — the init field is near-quiescent and locking
+            // to it saturates the display.
             if self.relock_pending
                 && (self.latest.info.step < prev_step || self.latest.info.step <= 2)
             {
+                self.relock_pending = false;
+                self.relock_armed = true;
+            }
+            if self.relock_armed && self.latest.info.step >= RELOCK_STEP {
                 for k in FieldKind::ALL {
                     self.locked[k as usize] = lock_range(k, self.latest.snapshot.range(k));
                 }
-                self.relock_pending = false;
+                self.relock_armed = false;
             }
         }
 
