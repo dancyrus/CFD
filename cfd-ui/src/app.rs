@@ -433,7 +433,7 @@ impl CfdApp {
         if self.params.vacuum {
             ui.label(
                 RichText::new(format!(
-                    "VACUUM · p∞ fixed at 3×10⁻⁵ p₀ = {}",
+                    "VACUUM · p∞ fixed at 3e-5 p₀ = {}",
                     fmt_pressure(VACUUM_P_FRAC * self.params.p0_pa)
                 ))
                 .small()
@@ -455,7 +455,7 @@ impl CfdApp {
                     fmt_pressure(pa),
                     ta,
                     if clamped {
-                        " · clamped to 3×10⁻⁵ p₀ (floor margin)"
+                        " · clamped to 3e-5 p₀ (floor margin)"
                     } else {
                         ""
                     }
