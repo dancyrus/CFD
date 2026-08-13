@@ -17,15 +17,26 @@ which session you are, ask.
 
 | Path | Owner |
 |---|---|
-| `cfd-contract/` | coordinator. **Frozen.** |
-| `cfd-core/src/lib.rs`, `step.rs` | coordinator. **Frozen.** |
+| `cfd-contract/` | coordinator — changeable, see the contract-change rule below |
+| `cfd-core/src/lib.rs`, `step.rs` | coordinator — changeable, see the contract-change rule below |
 | `cfd-core/src/kernel.rs` | session A — sweeps, dt, rayon, positivity |
 | `cfd-core/src/physics.rs` | session B — axisym source, wall, BCs, sponge, init |
 | `cfd-geom/` | session C — contours, rasterizer, editor data model. No egui. |
 | `cfd-ui/` | session D — the app. **Sole owner of eframe/egui.** |
 
-If you need a contract change, print `CONTRACT CHANGE REQUEST:` followed by the
-exact diff and stop. Do not make the change yourself.
+**Contract changes.** The freeze on `cfd-contract/`, `cfd-core/src/lib.rs` and
+`step.rs` applied during the parallel build phase, which is over. Changes are
+now allowed, under two conditions, both non-negotiable:
+
+1. Mirror the change into `docs/contract.md` and `docs/physics-reference.md`
+   **in the same commit** — the docs are the authority and must never disagree
+   with the code.
+2. Re-run the **full acceptance ladder** (`cargo test -p cfd-core --test ladder
+   -- --include-ignored` plus `--test acceptance -- --include-ignored`) and do
+   not commit unless it is green.
+
+Precedent: the `P_MIN_ABS` raise from 1e-8 to 1e-6 (real-engine presets) did
+exactly this — constant, both docs, and T1–T8 re-run with floors = 0.
 
 ## Conventions that cause silent bugs if broken
 
