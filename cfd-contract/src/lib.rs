@@ -37,9 +37,12 @@ pub type Prim = [Real; 4]; // [rho, u_n, u_t, p] — rotated to the sweep direct
 pub const NG: usize = 2; // ghost width. MUSCL needs 2. Baked into the padded layout.
 pub const SOLID_THRESHOLD: f32 = 0.5; // cells at/above this fraction are frozen, never updated
 pub const CFL_DEFAULT: Real = 0.4;
-// Non-dimensional floors. See docs/physics-reference.md §5.
+// Non-dimensional floors. See docs/physics-reference.md §5. The pressure
+// floor is 1e-6 of chamber pressure so it tracks the 8.6–300 bar range of
+// the real-engine presets; the UI's 58 km altitude cap and fixed-back-
+// pressure vacuum mode keep ambient strictly above it.
 pub const RHO_MIN: Real = 1e-8;
-pub const P_MIN_ABS: Real = 1e-8;
+pub const P_MIN_ABS: Real = 1e-6;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CfdError {

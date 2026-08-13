@@ -355,7 +355,7 @@ mod tests {
 
         // Geometry edits reach the solver: a bigger bell raises exit Mach.
         let wall12 = case::conical_contour(12.0);
-        let solid = case::rasterize_wall(&wall12, &case::grid());
+        let solid = case::rasterize_wall(&wall12, &case::grid(&params));
         let mach_before = f_high.report.exit_mach;
         send(SolverCommand::SetGeometry(Arc::new(solid)));
         let f_geo = wait_for(&mut out, T, |f| f.report.exit_mach > mach_before + 0.1);

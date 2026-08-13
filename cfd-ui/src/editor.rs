@@ -24,16 +24,29 @@ pub trait EditorBackend {
 
 pub struct StubEditor {
     points: Vec<[f64; 2]>,
+    /// Domain extents in r_t; presets resize the domain, so these are set
+    /// alongside `set_points` when the case changes.
+    lz: f64,
+    lr: f64,
 }
 
 /// Keep walls off the axis and clear of the radial sponge.
 const R_MIN: f64 = 0.15;
-const R_MAX: f64 = LR - 1.5;
+const R_MARGIN: f64 = 1.5;
 const Z_GAP: f64 = 1e-3;
 
 impl StubEditor {
     pub fn new(points: Vec<[f64; 2]>) -> Self {
-        StubEditor { points }
+        StubEditor {
+            points,
+            lz: LZ,
+            lr: LR,
+        }
+    }
+
+    pub fn set_domain(&mut self, lz: f64, lr: f64) {
+        self.lz = lz;
+        self.lr = lr;
     }
 }
 
@@ -63,17 +76,21 @@ impl EditorBackend for StubEditor {
             self.points[i - 1][0] + Z_GAP
         };
         let z_hi = if i + 1 == self.points.len() {
-            LZ
+            self.lz
         } else {
             self.points[i + 1][0] - Z_GAP
         };
-        self.points[i] = [world[0].clamp(z_lo, z_hi), world[1].clamp(R_MIN, R_MAX)];
+        self.points[i] = [
+            world[0].clamp(z_lo, z_hi),
+            world[1].clamp(R_MIN, self.lr - R_MARGIN),
+        ];
     }
 
     fn insert(&mut self, world: [f64; 2]) -> usize {
-        let z = world[0].clamp(0.0, LZ);
+        let z = world[0].clamp(0.0, self.lz);
         let i = self.points.partition_point(|p| p[0] < z);
-        self.points.insert(i, [z, world[1].clamp(R_MIN, R_MAX)]);
+        self.points
+            .insert(i, [z, world[1].clamp(R_MIN, self.lr - R_MARGIN)]);
         i
     }
 
@@ -101,7 +118,7 @@ mod tests {
         for w in e.points().windows(2) {
             assert!(w[1][0] > w[0][0]);
         }
-        assert!(e.points()[3][1] <= R_MAX && e.points()[3][1] >= R_MIN);
+        assert!(e.points()[3][1] <= LR - R_MARGIN && e.points()[3][1] >= R_MIN);
         e.remove(0);
         e.remove(n - 1);
         assert_eq!(e.points().len(), n, "endpoints must be protected");

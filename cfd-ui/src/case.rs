@@ -11,18 +11,35 @@ use std::sync::Arc;
 
 use cfd_contract::{Ambient, Chamber, GasModel, Grid, Numerics, RefScales, SolidField, SolveSetup};
 
-/// Interactive grid from docs/physics-reference.md §8: 320 x 200, 46.4 x 10 r_t.
-pub const NZ: usize = 320;
-pub const NR: usize = 200;
+/// Demo-case domain from docs/physics-reference.md §8: 46.4 x 10 r_t at
+/// 20 radial cells per throat radius -> the interactive 320 x 200 grid.
+/// Presets size their own domain via `preset_domain`.
 pub const LZ: f64 = 46.4;
 pub const LR: f64 = 10.0;
+pub const CELLS_PER_RT: f64 = 20.0;
+/// The §8 anisotropy, dz/dr = 0.1449/0.0500. Widening dz is nearly free in dt
+/// (the radial term dominates) while linearly cutting cells.
+const DZ_OVER_DR: f64 = 2.9;
 
 /// Radial thickness of the rasterized wall band, in r_t. 8 cells at the
 /// default dr — enough that the solver's column scan always finds the wall.
 pub const WALL_THICKNESS: f64 = 0.4;
 
-/// Altitude ceiling, docs/physics-reference.md §5.
-pub const ALT_MAX_M: f64 = 40_000.0;
+/// Altitude ceiling, docs/physics-reference.md §5: 58 km is where the
+/// thinnest ambient still clears the pressure floor for the highest-pressure
+/// preset (Raptor 2, 300 bar: p_a(58 km) ≈ 27 Pa ≈ 1e-6 p₀). Above the cap
+/// the UI switches to the labelled vacuum mode instead.
+pub const ALT_MAX_M: f64 = 58_000.0;
+
+/// Fixed back pressure of the vacuum mode, as a fraction of chamber pressure:
+/// 2x the positivity floor. Ambient exactly AT the floor would trip the
+/// solver's strict positivity checks every step, and the product rule blanks
+/// every readout while the floor counter is nonzero. Atmospheric ambients
+/// below this value are clamped to it for the same reason.
+pub const VACUUM_P_FRAC: f64 = 2.0 * (cfd_contract::P_MIN_ABS as f64);
+
+/// Universal gas constant, J/(kmol·K).
+pub const R_UNIVERSAL_SI: f64 = 8_314.462_618;
 
 /// The separation trigger is effectively the Summerfield 0.40 over the whole
 /// demo range — see docs/physics-reference.md §13 (the Schmucker term only
@@ -43,6 +60,15 @@ pub struct CaseParams {
     pub r_throat_m: f64,
     pub area_ratio: f64,
     pub altitude_m: f64,
+    /// Labelled vacuum mode: back pressure fixed at `VACUUM_P_FRAC * p0`,
+    /// ignoring `altitude_m`. The region above the 58 km slider cap.
+    pub vacuum: bool,
+    /// Domain size in throat radii and radial cells per throat radius. The
+    /// demo case uses the §8 defaults; presets size the domain to their bell
+    /// via `preset_domain` (and Merlin Vac drops to 14 cells/r_t).
+    pub lz_rt: f64,
+    pub lr_rt: f64,
+    pub cells_per_rt: f64,
 }
 
 impl Default for CaseParams {
@@ -56,22 +82,40 @@ impl Default for CaseParams {
             r_throat_m: 0.05,
             area_ratio: 8.0,
             altitude_m: 0.0,
+            vacuum: false,
+            lz_rt: LZ,
+            lr_rt: LR,
+            cells_per_rt: CELLS_PER_RT,
         }
     }
 }
 
-pub fn grid() -> Grid {
+/// Uniform anisotropic grid for this case, dz/dr = 2.9 (§8). At the defaults
+/// this is exactly the historic 320 x 200 interactive grid.
+pub fn grid(p: &CaseParams) -> Grid {
+    let dr = 1.0 / p.cells_per_rt;
+    let dz = DZ_OVER_DR * dr;
     Grid {
-        nz: NZ,
-        nr: NR,
-        dz: (LZ / NZ as f64) as f32,
-        dr: (LR / NR as f64) as f32,
+        nz: (p.lz_rt / dz).round() as usize,
+        nr: (p.lr_rt / dr).round() as usize,
+        dz: dz as f32,
+        dr: dr as f32,
     }
 }
 
-/// US standard atmosphere 1976, layers to 47 km. Returns (pressure Pa, temperature K).
+/// Preset domain sizing in throat radii, (length, height). Height must hold
+/// the bell exit plus plume spread; length the nozzle plus a plume that grows
+/// with exit radius. Run time goes roughly as length² · height — see the
+/// preset tooltips for the relative cost.
+pub fn preset_domain(area_ratio: f64) -> (f64, f64) {
+    let s = area_ratio.sqrt();
+    (3.0 * (s - 1.0) + 20.0, (2.5 * s).max(10.0))
+}
+
+/// US standard atmosphere 1976, layers to 71 km (clamped at the 58 km slider
+/// cap). Returns (pressure Pa, temperature K).
 pub fn atmosphere(h_m: f64) -> (f64, f64) {
-    let h = h_m.clamp(0.0, 47_000.0);
+    let h = h_m.clamp(0.0, ALT_MAX_M);
     if h < 11_000.0 {
         let t = 288.15 - 0.0065 * h;
         (101_325.0 * (t / 288.15).powf(5.255_88), t)
@@ -81,18 +125,183 @@ pub fn atmosphere(h_m: f64) -> (f64, f64) {
     } else if h < 32_000.0 {
         let t = 216.65 + 0.001 * (h - 20_000.0);
         (5_474.889 * (216.65 / t).powf(34.162_6), t)
-    } else {
+    } else if h < 47_000.0 {
         let t = 228.65 + 0.0028 * (h - 32_000.0);
         (868.019 * (228.65 / t).powf(12.200_9), t)
+    } else if h < 51_000.0 {
+        let t = 270.65;
+        (110.906 * (-(h - 47_000.0) / 7_922.3).exp(), t)
+    } else {
+        let t = 270.65 - 0.0028 * (h - 51_000.0);
+        (66.939 * (t / 270.65).powf(12.200_9), t)
     }
 }
 
-/// Non-dimensional ambient state (chamber-referenced) at the case altitude.
+/// Non-dimensional ambient state (chamber-referenced). Vacuum mode fixes the
+/// back pressure at `VACUUM_P_FRAC`; the altitude path clamps to the same
+/// value so a high-pressure chamber (Raptor 2 above ~52 km) can never push
+/// the ambient onto the positivity floor.
 pub fn ambient_nd(p: &CaseParams) -> Ambient {
+    if p.vacuum {
+        let (_, ta) = atmosphere(ALT_MAX_M);
+        return Ambient {
+            p: VACUUM_P_FRAC as f32,
+            t: (ta / p.t0_k) as f32,
+        };
+    }
     let (pa, ta) = atmosphere(p.altitude_m);
     Ambient {
-        p: (pa / p.p0_pa) as f32,
+        p: (pa / p.p0_pa).max(VACUUM_P_FRAC) as f32,
         t: (ta / p.t0_k) as f32,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Real-engine presets. Numbers researched and verified — do not substitute.
+// γ, T₀ and MW are propellant-class values, not measured: no manufacturer
+// publishes combustion-gas properties per engine, and the UI labels them so.
+// A preset is applied whole (geometry, area ratio, chamber pressure, gas
+// model, domain) — never partially.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EnginePreset {
+    pub name: &'static str,
+    pub propellant: &'static str,
+    pub area_ratio: f64,
+    pub p0_pa: f64,
+    pub r_throat_m: f64,
+    pub gamma: f64,
+    pub t0_k: f64,
+    pub mw_g_mol: f64,
+    pub cells_per_rt: f64,
+    /// Shown as "(slow)" in the selector: run time ≈12× Merlin 1D.
+    pub slow: bool,
+    /// Preset-specific honesty note, surfaced as a tooltip.
+    pub note: &'static str,
+}
+
+pub const PRESETS: [EnginePreset; 6] = [
+    EnginePreset {
+        name: "Merlin 1D",
+        propellant: "LOX/RP-1",
+        area_ratio: 16.0,
+        p0_pa: 9.7e6,
+        r_throat_m: 0.131,
+        gamma: 1.24,
+        t0_k: 3600.0,
+        mw_g_mol: 21.9,
+        cells_per_rt: CELLS_PER_RT,
+        slow: false,
+        note: "",
+    },
+    EnginePreset {
+        name: "F-1",
+        propellant: "LOX/RP-1",
+        area_ratio: 16.0,
+        p0_pa: 7.0e6,
+        r_throat_m: 0.465,
+        // Hard-coded 1.24 on purpose: the F-1 sits 3% inside the separation
+        // threshold at sea level BY DESIGN. Let γ drift and that marginal
+        // warning flickers in and out, which reads as a bug instead of a
+        // deliberate design point.
+        gamma: 1.24,
+        t0_k: 3600.0,
+        mw_g_mol: 21.9,
+        cells_per_rt: CELLS_PER_RT,
+        slow: false,
+        note: "Sits 3% inside the separation threshold at sea level by design \
+               — γ is hard-coded at 1.24 so the marginal warning is a \
+               deliberate design point, not parameter drift.",
+    },
+    EnginePreset {
+        name: "Raptor 2",
+        propellant: "LOX/CH4",
+        area_ratio: 34.3,
+        p0_pa: 3.0e7,
+        r_throat_m: 0.115,
+        gamma: 1.16,
+        t0_k: 3600.0,
+        mw_g_mol: 22.0,
+        cells_per_rt: CELLS_PER_RT,
+        slow: false,
+        note: "",
+    },
+    EnginePreset {
+        name: "AJ10-190",
+        propellant: "N2O4/MMH",
+        area_ratio: 55.0,
+        p0_pa: 8.6e5,
+        r_throat_m: 0.073,
+        gamma: 1.23,
+        t0_k: 3200.0,
+        mw_g_mol: 21.5,
+        cells_per_rt: CELLS_PER_RT,
+        slow: false,
+        note: "",
+    },
+    EnginePreset {
+        name: "RS-25",
+        propellant: "LOX/LH2",
+        area_ratio: 69.0,
+        p0_pa: 2.06e7,
+        r_throat_m: 0.138,
+        gamma: 1.20,
+        t0_k: 3600.0,
+        mw_g_mol: 13.5,
+        cells_per_rt: CELLS_PER_RT,
+        slow: false,
+        note: "Shows a separation warning at sea level: a known conservatism \
+               of the criterion, not an error — the real engine runs on the \
+               pad.",
+    },
+    EnginePreset {
+        name: "Merlin Vac",
+        propellant: "LOX/RP-1",
+        area_ratio: 165.0,
+        p0_pa: 9.7e6,
+        r_throat_m: 0.128,
+        gamma: 1.24,
+        t0_k: 3600.0,
+        mw_g_mol: 21.9,
+        // The one preset below the §8 resolution target: at 20 cells/r_t the
+        // ε = 165 domain would run ~34× the Merlin 1D case. 14 cells/r_t
+        // keeps it usable; the report's N_throat badge goes amber, honestly.
+        cells_per_rt: 14.0,
+        slow: true,
+        note: "≈12× the Merlin 1D run time even at the reduced 14 cells per \
+               throat radius (the mass-flow badge goes amber for that reason).",
+    },
+];
+
+impl EnginePreset {
+    /// The complete case for this engine. Everything a preset controls is set
+    /// here, together — geometry, area ratio, chamber pressure, γ, chamber
+    /// temperature, molecular weight and domain. Never apply one partially.
+    pub fn case(&self, altitude_m: f64, vacuum: bool) -> CaseParams {
+        let (lz_rt, lr_rt) = preset_domain(self.area_ratio);
+        CaseParams {
+            p0_pa: self.p0_pa,
+            t0_k: self.t0_k,
+            gamma: self.gamma,
+            r_specific_si: R_UNIVERSAL_SI / self.mw_g_mol,
+            r_throat_m: self.r_throat_m,
+            area_ratio: self.area_ratio,
+            altitude_m,
+            vacuum,
+            lz_rt,
+            lr_rt,
+            cells_per_rt: self.cells_per_rt,
+        }
+    }
+
+    /// Run time relative to Merlin 1D (length² · height), for tooltips.
+    pub fn relative_cost(&self) -> f64 {
+        let cost = |ar: f64| {
+            let (lz, lr) = preset_domain(ar);
+            lz * lz * lr
+        };
+        cost(self.area_ratio) / cost(PRESETS[0].area_ratio)
     }
 }
 
@@ -244,7 +453,7 @@ pub fn rasterize_wall(points: &[[f64; 2]], g: &Grid) -> SolidField {
 }
 
 pub fn make_setup(p: &CaseParams, wall: &[[f64; 2]]) -> SolveSetup {
-    let g = grid();
+    let g = grid(p);
     let gas = GasModel {
         gamma: p.gamma as f32,
         r_specific_si: p.r_specific_si,
@@ -269,7 +478,7 @@ mod tests {
         let (p0, t0) = atmosphere(0.0);
         assert!((p0 - 101_325.0).abs() < 1.0 && (t0 - 288.15).abs() < 0.01);
         let mut last = f64::INFINITY;
-        for km in 0..=40 {
+        for km in 0..=58 {
             let (p, t) = atmosphere(km as f64 * 1000.0);
             assert!(p < last, "pressure not monotone at {km} km");
             assert!(t > 180.0 && t < 300.0);
@@ -277,6 +486,53 @@ mod tests {
         }
         // 11 km tropopause ~22.6 kPa.
         assert!((atmosphere(11_000.0).0 / 22_632.0 - 1.0).abs() < 0.01);
+        // Layer joins: 47 km stratopause ~110.9 Pa, 51 km ~66.9 Pa, and the
+        // 58 km cap ~27 Pa (the Raptor-2 floor crossing the cap is set by).
+        assert!((atmosphere(47_000.0).0 / 110.906 - 1.0).abs() < 0.01);
+        assert!((atmosphere(51_000.0).0 / 66.939 - 1.0).abs() < 0.01);
+        assert!((atmosphere(58_000.0).0 / 26.8 - 1.0).abs() < 0.02);
+    }
+
+    #[test]
+    fn default_grid_is_the_reference_320x200() {
+        let g = grid(&CaseParams::default());
+        assert_eq!((g.nz, g.nr), (320, 200));
+        assert!((g.dz - 0.145).abs() < 1e-6 && (g.dr - 0.05).abs() < 1e-7);
+    }
+
+    #[test]
+    fn presets_fit_their_domain_and_match_the_costed_ratios() {
+        // Relative run times quoted in the task/tooltips: Raptor 2.1,
+        // AJ10 3.4, RS-25 4.3, Merlin Vac 11.7 (F-1 shares Merlin's domain).
+        let expect = [1.0, 1.0, 2.1, 3.4, 4.3, 11.7];
+        for (p, want) in PRESETS.iter().zip(expect) {
+            assert!(
+                (p.relative_cost() / want - 1.0).abs() < 0.05,
+                "{}: cost {:.2} vs {want}",
+                p.name,
+                p.relative_cost()
+            );
+            let c = p.case(0.0, false);
+            let pts = conical_contour(c.area_ratio);
+            let end = pts.last().unwrap();
+            assert!(end[0] < c.lz_rt, "{}: nozzle longer than domain", p.name);
+            assert!(
+                end[1] + WALL_THICKNESS < c.lr_rt,
+                "{}: bell exit outside domain",
+                p.name
+            );
+            // Ambient stays strictly above the positivity floor everywhere
+            // on the slider, and in vacuum mode.
+            for alt in [0.0, ALT_MAX_M] {
+                let a = ambient_nd(&CaseParams { altitude_m: alt, ..c });
+                assert!(a.p > cfd_contract::P_MIN_ABS, "{} at {alt} m", p.name);
+            }
+            let a = ambient_nd(&CaseParams { vacuum: true, ..c });
+            assert!((a.p as f64 / VACUUM_P_FRAC - 1.0).abs() < 1e-6);
+        }
+        // Merlin Vac is the one reduced-resolution preset.
+        assert_eq!(PRESETS[5].cells_per_rt, 14.0);
+        assert!(PRESETS[5].slow && PRESETS.iter().filter(|p| p.slow).count() == 1);
     }
 
     #[test]
@@ -295,7 +551,7 @@ mod tests {
 
     #[test]
     fn rasterized_throat_matches_the_contour() {
-        let g = grid();
+        let g = grid(&CaseParams::default());
         let pts = conical_contour(8.0);
         let s = rasterize_wall(&pts, &g);
         // Narrowest open radius across nozzle columns should be r_t = 1 +- dr.

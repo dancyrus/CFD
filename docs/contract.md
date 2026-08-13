@@ -40,7 +40,7 @@ pub const SOLID_THRESHOLD: f32 = 0.5;
 pub const CFL_DEFAULT: Real = 0.4;
 /// Non-dimensional floors. See docs/physics-reference.md §5.
 pub const RHO_MIN: Real = 1e-8;
-pub const P_MIN_ABS: Real = 1e-8;
+pub const P_MIN_ABS: Real = 1e-6;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CfdError {

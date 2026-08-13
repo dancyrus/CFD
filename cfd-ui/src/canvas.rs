@@ -16,7 +16,6 @@ use eframe::egui::{
 
 use cfd_contract::{FieldKind, Snapshot};
 
-use crate::case::{LR, LZ};
 use crate::colormap::{lut_for, SOLID_RGBA};
 use crate::editor::EditorBackend;
 use crate::worker::UiFrame;
@@ -35,10 +34,12 @@ pub struct View {
 }
 
 impl View {
-    pub fn fit(rect: Rect) -> Self {
-        let scale = (rect.width() / LZ as f32).min(rect.height() / (2.0 * LR) as f32) * 0.96;
+    /// Fit to the current domain (lz, lr in r_t) — per-case since presets
+    /// resize the domain.
+    pub fn fit(rect: Rect, lz: f64, lr: f64) -> Self {
+        let scale = (rect.width() / lz as f32).min(rect.height() / (2.0 * lr) as f32) * 0.96;
         View {
-            center: [LZ * 0.5, 0.0],
+            center: [lz * 0.5, 0.0],
             scale: scale.max(1.0),
         }
     }
@@ -125,8 +126,12 @@ impl Canvas {
         is_mock: bool,
     ) -> CanvasOutput {
         let mut out = CanvasOutput::default();
+        // Domain extents come from the snapshot's own grid: presets resize
+        // the domain, and the frame is the truth about what is being solved.
+        let g = frame.snapshot.grid;
+        let (lz, lr) = (g.nz as f64 * g.dz as f64, g.nr as f64 * g.dr as f64);
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
-        let mut view = *self.view.get_or_insert_with(|| View::fit(rect));
+        let mut view = *self.view.get_or_insert_with(|| View::fit(rect, lz, lr));
 
         // ---- zoom toward the cursor (scroll wheel + pinch), never the centre.
         if response.hovered() {
@@ -248,12 +253,12 @@ impl Canvas {
         if let Some(tex) = &self.tex {
             let full_uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
             let flipped_uv = Rect::from_min_max(Pos2::new(0.0, 1.0), Pos2::new(1.0, 0.0));
-            let upper = Rect::from_two_pos(view.w2s(rect, [0.0, LR]), view.w2s(rect, [LZ, 0.0]));
-            let lower = Rect::from_two_pos(view.w2s(rect, [0.0, 0.0]), view.w2s(rect, [LZ, -LR]));
+            let upper = Rect::from_two_pos(view.w2s(rect, [0.0, lr]), view.w2s(rect, [lz, 0.0]));
+            let lower = Rect::from_two_pos(view.w2s(rect, [0.0, 0.0]), view.w2s(rect, [lz, -lr]));
             painter.image(tex.id(), upper, full_uv, Color32::WHITE);
             painter.image(tex.id(), lower, flipped_uv, Color32::WHITE);
             // Domain outline and centreline.
-            let outline = Rect::from_two_pos(view.w2s(rect, [0.0, LR]), view.w2s(rect, [LZ, -LR]));
+            let outline = Rect::from_two_pos(view.w2s(rect, [0.0, lr]), view.w2s(rect, [lz, -lr]));
             painter.rect_stroke(
                 outline,
                 0.0,
@@ -261,7 +266,7 @@ impl Canvas {
                 StrokeKind::Outside,
             );
             painter.line_segment(
-                [view.w2s(rect, [0.0, 0.0]), view.w2s(rect, [LZ, 0.0])],
+                [view.w2s(rect, [0.0, 0.0]), view.w2s(rect, [lz, 0.0])],
                 Stroke::new(1.0, Color32::from_white_alpha(14)),
             );
         }
@@ -275,8 +280,7 @@ impl Canvas {
         if let Some(pos) = response.hover_pos() {
             let w = view.s2w(rect, pos);
             let (z, r) = (w[0], w[1].abs());
-            if (0.0..LZ).contains(&z) && r < LR {
-                let g = frame.snapshot.grid;
+            if (0.0..lz).contains(&z) && r < lr {
                 let iz = ((z / g.dz as f64) as usize).min(g.nz - 1);
                 let ir = ((r / g.dr as f64) as usize).min(g.nr - 1);
                 let solid = frame.snapshot.solid.is_solid(g.idx(iz, ir));

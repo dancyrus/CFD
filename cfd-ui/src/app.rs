@@ -14,7 +14,8 @@ use cfd_contract::{FieldKind, SolverCommand};
 use crate::canvas::{colorbar, fmt_value, Canvas, BG};
 use crate::case::{
     self, ambient_nd, atmosphere, conical_contour, ideal_cf, make_setup, rasterize_wall,
-    separation_altitude_m, separation_threshold, CaseParams, ALT_MAX_M,
+    separation_altitude_m, separation_threshold, CaseParams, ALT_MAX_M, PRESETS,
+    R_UNIVERSAL_SI, VACUUM_P_FRAC,
 };
 use crate::editor::{EditorBackend, StubEditor};
 use crate::worker::{UiCommand, UiFrame};
@@ -43,6 +44,13 @@ pub struct CfdApp {
     frame_gen: u64,
 
     params: CaseParams,
+    /// Index into `case::PRESETS`; `None` is the custom/demo case. Touching
+    /// any slider or the wall editor clears it — a preset is all-or-nothing.
+    preset: Option<usize>,
+    /// Re-lock the colorbar ranges on the first frames of a rebuilt solver:
+    /// a preset or p₀ change can move the reference scales by 35×, and
+    /// ranges locked to the old scales display as a solid color.
+    relock_pending: bool,
     // Slider staging (committed on release).
     ui_area_ratio: f64,
     ui_p0_mpa: f64,
@@ -89,6 +97,8 @@ impl CfdApp {
             ui_area_ratio: params.area_ratio,
             ui_p0_mpa: params.p0_pa / 1e6,
             params,
+            preset: None,
+            relock_pending: false,
             field: FieldKind::Mach,
             paused: false,
             turbo_idx: 0,
@@ -117,28 +127,64 @@ impl CfdApp {
     fn commit_editor_geometry(&mut self) {
         self.committed_wall = self.editor.points().to_vec();
         self.geometry_custom = true;
-        let solid = rasterize_wall(&self.committed_wall, &case::grid());
+        self.preset = None; // hand-drawn walls are no named engine
+        let solid = rasterize_wall(&self.committed_wall, &case::grid(&self.params));
         self.cmd(SolverCommand::SetGeometry(Arc::new(solid)));
     }
 
     /// Parametric regeneration from the area-ratio slider: replaces any hand
     /// edits and clears sandbox mode.
     fn regenerate_contour(&mut self) {
+        if self.params.area_ratio != self.ui_area_ratio {
+            self.preset = None; // partial change: no longer the named engine
+        }
         self.params.area_ratio = self.ui_area_ratio;
         let wall = conical_contour(self.params.area_ratio);
         self.editor.set_points(wall.clone());
         self.committed_wall = wall;
         self.geometry_custom = false;
-        let solid = rasterize_wall(&self.committed_wall, &case::grid());
+        let solid = rasterize_wall(&self.committed_wall, &case::grid(&self.params));
         self.cmd(SolverCommand::SetGeometry(Arc::new(solid)));
     }
 
     /// Chamber-pressure change: `RefScales` are fixed at construction, so this
-    /// is the one control that rebuilds the solver and discards the field.
+    /// control rebuilds the solver and discards the field.
     fn rebuild_solver(&mut self) {
+        if self.params.p0_pa != self.ui_p0_mpa * 1e6 {
+            self.preset = None; // partial change: no longer the named engine
+        }
         self.params.p0_pa = self.ui_p0_mpa * 1e6;
         let setup = make_setup(&self.params, &self.committed_wall);
         let _ = self.tx.send(UiCommand::Rebuild(Box::new(setup)));
+        self.relock_pending = true;
+    }
+
+    /// Apply a preset whole — geometry, area ratio, chamber pressure, gas
+    /// model and domain together, never partially — or revert to the demo
+    /// case (`None`). Altitude and vacuum mode carry over: they describe the
+    /// ambient, not the engine.
+    fn apply_preset(&mut self, preset: Option<usize>) {
+        self.preset = preset;
+        let (alt, vac) = (self.params.altitude_m, self.params.vacuum);
+        self.params = match preset {
+            Some(i) => PRESETS[i].case(alt, vac),
+            None => CaseParams {
+                altitude_m: alt,
+                vacuum: vac,
+                ..CaseParams::default()
+            },
+        };
+        self.ui_area_ratio = self.params.area_ratio;
+        self.ui_p0_mpa = self.params.p0_pa / 1e6;
+        let wall = conical_contour(self.params.area_ratio);
+        self.editor.set_domain(self.params.lz_rt, self.params.lr_rt);
+        self.editor.set_points(wall.clone());
+        self.committed_wall = wall;
+        self.geometry_custom = false;
+        let setup = make_setup(&self.params, &self.committed_wall);
+        let _ = self.tx.send(UiCommand::Rebuild(Box::new(setup)));
+        self.relock_pending = true;
+        self.canvas.request_fit(); // the domain just changed size
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -275,31 +321,132 @@ impl CfdApp {
         });
     }
 
+    fn engine_section(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Engine");
+        ui.horizontal_wrapped(|ui| {
+            let r = ui
+                .selectable_label(self.preset.is_none(), "Custom")
+                .on_hover_text(
+                    "The demo case (docs §6). Moving any slider while a named \
+                     engine is selected also lands here — a preset is applied \
+                     whole or not at all.",
+                );
+            if r.clicked() && self.preset.is_some() {
+                self.apply_preset(None);
+            }
+            for i in 0..PRESETS.len() {
+                let p = &PRESETS[i];
+                let label = if p.slow {
+                    format!("{} (slow)", p.name)
+                } else {
+                    p.name.to_string()
+                };
+                let r = ui
+                    .selectable_label(self.preset == Some(i), label)
+                    .on_hover_text(preset_tooltip(p));
+                if r.clicked() && self.preset != Some(i) {
+                    self.apply_preset(Some(i));
+                }
+            }
+        });
+        // The gas model in effect. γ, T₀ and MW are labelled for what they
+        // are: no manufacturer publishes combustion-gas properties per
+        // engine, so these are propellant-class values, not measurements.
+        let mw = R_UNIVERSAL_SI / self.params.r_specific_si;
+        let head = match self.preset {
+            Some(i) => format!("{} · {}", PRESETS[i].name, PRESETS[i].propellant),
+            None => "custom gas".to_string(),
+        };
+        ui.label(
+            RichText::new(format!(
+                "{head} · r_t {:.0} mm · ε {:.1}",
+                self.params.r_throat_m * 1e3,
+                self.params.area_ratio
+            ))
+            .weak()
+            .small(),
+        );
+        ui.label(
+            RichText::new(format!(
+                "γ {} · T₀ {:.0} K · MW {:.1} g/mol — propellant class, not measured",
+                self.params.gamma, self.params.t0_k, mw
+            ))
+            .weak()
+            .small(),
+        )
+        .on_hover_text(
+            "No manufacturer publishes combustion-gas γ, chamber temperature \
+             or molecular weight per engine. These are representative values \
+             for the propellant class, and every readout inherits that \
+             approximation.",
+        );
+        let g = case::grid(&self.params);
+        ui.label(
+            RichText::new(format!(
+                "domain {:.0} × {:.0} r_t · {} × {} cells",
+                self.params.lz_rt, self.params.lr_rt, g.nz, g.nr
+            ))
+            .weak()
+            .small(),
+        );
+    }
+
     fn operating_point(&mut self, ui: &mut egui::Ui) {
         ui.heading("Operating point");
 
         // ---- Altitude: never resets the field; the transient IS the demo.
         let sep_m = separation_altitude_m(&self.params);
         ui.label("Altitude");
-        if altitude_slider(ui, &mut self.params.altitude_m, sep_m) {
+        if altitude_slider(
+            ui,
+            &mut self.params.altitude_m,
+            sep_m,
+            &mut self.params.vacuum,
+        ) {
             self.cmd(SolverCommand::SetAmbient(ambient_nd(&self.params)));
         }
-        let (pa, ta) = atmosphere(self.params.altitude_m);
-        ui.label(
-            RichText::new(format!(
-                "{:.1} km · p∞ {} · T∞ {:.0} K",
-                self.params.altitude_m / 1000.0,
-                fmt_pressure(pa),
-                ta
-            ))
-            .weak()
-            .small(),
-        );
+        if self.params.vacuum {
+            ui.label(
+                RichText::new(format!(
+                    "VACUUM · p∞ fixed at 2×10⁻⁶ p₀ = {}",
+                    fmt_pressure(VACUUM_P_FRAC * self.params.p0_pa)
+                ))
+                .small()
+                .color(AMBER),
+            )
+            .on_hover_text(
+                "Back pressure fixed at 2× the solver's positivity floor. \
+                 True vacuum is unreachable for a finite-pressure Euler \
+                 solver: an ambient at or below the floor would trip the \
+                 floor counter every step and blank every readout.",
+            );
+        } else {
+            let (pa, ta) = atmosphere(self.params.altitude_m);
+            let clamped = pa / self.params.p0_pa < VACUUM_P_FRAC;
+            ui.label(
+                RichText::new(format!(
+                    "{:.1} km · p∞ {} · T∞ {:.0} K{}",
+                    self.params.altitude_m / 1000.0,
+                    fmt_pressure(pa),
+                    ta,
+                    if clamped {
+                        " · clamped to 2×10⁻⁶ p₀ (pressure floor)"
+                    } else {
+                        ""
+                    }
+                ))
+                .weak()
+                .small(),
+            );
+        }
         ui.add_space(6.0);
 
         // ---- Area ratio (regenerates the parametric contour on release).
+        // The range stretches to hold a selected preset (up to ε = 165);
+        // egui would otherwise clamp the staged value back into 2..16.
+        let ar_max = self.ui_area_ratio.max(16.0);
         let r = ui.add(
-            egui::Slider::new(&mut self.ui_area_ratio, 2.0..=16.0)
+            egui::Slider::new(&mut self.ui_area_ratio, 2.0..=ar_max)
                 .text("Area ratio ε")
                 .fixed_decimals(1),
         );
@@ -307,9 +454,10 @@ impl CfdApp {
             self.regenerate_contour();
         }
 
-        // ---- Chamber pressure (the one field-discarding control).
+        // ---- Chamber pressure (a field-discarding control).
+        let p0_max = self.ui_p0_mpa.max(10.0);
         let r = ui.add(
-            egui::Slider::new(&mut self.ui_p0_mpa, 0.5..=10.0)
+            egui::Slider::new(&mut self.ui_p0_mpa, 0.5..=p0_max)
                 .text("Chamber p₀ [MPa]")
                 .fixed_decimals(1),
         );
@@ -382,26 +530,45 @@ impl CfdApp {
                     ui.end_row();
 
                     ui.label("thrust");
-                    ui.monospace(if rep.thrust_n.is_finite() {
-                        format!("{:.2} kN", rep.thrust_n / 1000.0)
+                    // Honesty rules (docs §13): absolute thrust is never
+                    // displayed for a named real engine — this model has no
+                    // boundary layer, chemistry or divergence correction to
+                    // defend such a number. C_f below is the honest ratio.
+                    if self.preset.is_some() {
+                        ui.monospace("—");
+                        ui.label(
+                            RichText::new(format!(
+                                "{n_throat:.0} cells / r_t · withheld for a named engine — see C_f"
+                            ))
+                            .small()
+                            .color(if underresolved {
+                                AMBER
+                            } else {
+                                ui.visuals().weak_text_color()
+                            }),
+                        );
                     } else {
-                        "—".into()
-                    });
-                    // N_throat lives NEXT TO the thrust readout, by decree.
-                    // The bias figure is measured (T8, ladder.rs): the
-                    // staircase wall's entropy layer costs ~13% of thrust at
-                    // the default N_throat = 20.
-                    ui.label(
-                        RichText::new(format!(
-                            "{n_throat:.0} cells / r_t · ≈13% low (staircase wall)"
-                        ))
-                        .small()
-                        .color(if underresolved {
-                            AMBER
+                        ui.monospace(if rep.thrust_n.is_finite() {
+                            format!("{:.2} kN", rep.thrust_n / 1000.0)
                         } else {
-                            ui.visuals().weak_text_color()
-                        }),
-                    );
+                            "—".into()
+                        });
+                        // N_throat lives NEXT TO the thrust readout, by decree.
+                        // The bias figure is measured (T8, ladder.rs): the
+                        // staircase wall's entropy layer costs ~13% of thrust at
+                        // the default N_throat = 20.
+                        ui.label(
+                            RichText::new(format!(
+                                "{n_throat:.0} cells / r_t · ≈13% low (staircase wall)"
+                            ))
+                            .small()
+                            .color(if underresolved {
+                                AMBER
+                            } else {
+                                ui.visuals().weak_text_color()
+                            }),
+                        );
+                    }
                     ui.end_row();
 
                     let pa_p0 = ambient_nd(&self.params).p as f64;
@@ -577,12 +744,23 @@ impl eframe::App for CfdApp {
         // Pull the newest published frame; the clone only happens when the
         // worker actually published (max ~60/s), not per repaint.
         if self.out.updated() {
+            let prev_step = self.latest.info.step;
             self.latest = self.out.read().clone();
             self.frame_gen += 1;
             // The worker pauses itself on a solver error; mirror that here so
             // the transport bar tells the truth.
             if self.latest.error.is_some() && self.latest.paused {
                 self.paused = true;
+            }
+            // First frames from a rebuilt solver (step count restarted):
+            // re-lock the colorbar ranges to the new reference scales.
+            if self.relock_pending
+                && (self.latest.info.step < prev_step || self.latest.info.step <= 2)
+            {
+                for k in FieldKind::ALL {
+                    self.locked[k as usize] = lock_range(k, self.latest.snapshot.range(k));
+                }
+                self.relock_pending = false;
             }
         }
 
@@ -597,6 +775,8 @@ impl eframe::App for CfdApp {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     self.display_section(ui);
+                    ui.separator();
+                    self.engine_section(ui);
                     ui.separator();
                     self.operating_point(ui);
                     ui.separator();
@@ -710,23 +890,56 @@ fn warning_box(ui: &mut egui::Ui, color: Color32, title: &str, body: &str) {
     ui.add_space(4.0);
 }
 
+fn preset_tooltip(p: &case::EnginePreset) -> String {
+    let mut s = format!(
+        "{} · ε {} · p₀ {:.0} bar · r_t {:.0} mm\n≈{:.1}× Merlin 1D run time",
+        p.propellant,
+        p.area_ratio,
+        p.p0_pa / 1e5,
+        p.r_throat_m * 1e3,
+        p.relative_cost()
+    );
+    if !p.note.is_empty() {
+        s.push('\n');
+        s.push_str(p.note);
+    }
+    s
+}
+
 /// Custom altitude slider: the track is shaded below the separation crossing
 /// and carries a labeled tick there, recomputed as the area ratio moves, so
-/// the user sees where the trustworthy range ends BEFORE dragging.
-fn altitude_slider(ui: &mut egui::Ui, alt_m: &mut f64, sep_m: Option<f64>) -> bool {
+/// the user sees where the trustworthy range ends BEFORE dragging. The track
+/// caps at 58 km (docs §5); past its right end sits the labelled vacuum stop
+/// with a fixed back pressure.
+fn altitude_slider(
+    ui: &mut egui::Ui,
+    alt_m: &mut f64,
+    sep_m: Option<f64>,
+    vacuum: &mut bool,
+) -> bool {
     let width = ui.available_width().min(300.0);
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 48.0), Sense::click_and_drag());
     let track_y = rect.top() + 26.0;
-    let (x0, x1) = (rect.left() + 8.0, rect.right() - 8.0);
+    // Rightmost stop is the vacuum zone, past the 58 km end of the track.
+    const VAC_W: f32 = 30.0;
+    let (x0, x1) = (rect.left() + 8.0, rect.right() - 8.0 - VAC_W - 8.0);
     let x_of = |m: f64| x0 + ((m / ALT_MAX_M) as f32) * (x1 - x0);
 
     let mut changed = false;
     if response.dragged() || response.clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
-            let m = (((pos.x - x0) / (x1 - x0)) as f64 * ALT_MAX_M).clamp(0.0, ALT_MAX_M);
-            if (m - *alt_m).abs() > 1.0 {
-                *alt_m = m;
-                changed = true;
+            if pos.x > x1 + 4.0 {
+                if !*vacuum {
+                    *vacuum = true;
+                    changed = true;
+                }
+            } else {
+                let m = (((pos.x - x0) / (x1 - x0)) as f64 * ALT_MAX_M).clamp(0.0, ALT_MAX_M);
+                if *vacuum || (m - *alt_m).abs() > 1.0 {
+                    *alt_m = m;
+                    *vacuum = false;
+                    changed = true;
+                }
             }
         }
     }
@@ -735,6 +948,37 @@ fn altitude_slider(ui: &mut egui::Ui, alt_m: &mut f64, sep_m: Option<f64>) -> bo
     painter.line_segment(
         [Pos2::new(x0, track_y), Pos2::new(x1, track_y)],
         Stroke::new(4.0, ui.visuals().widgets.inactive.bg_fill),
+    );
+    // The vacuum stop.
+    let vac_rect = Rect::from_min_max(
+        Pos2::new(x1 + 8.0, track_y - 9.0),
+        Pos2::new(x1 + 8.0 + VAC_W, track_y + 9.0),
+    );
+    let (vac_fill, vac_stroke) = if *vacuum {
+        (AMBER.gamma_multiply(0.25), AMBER)
+    } else {
+        (
+            ui.visuals().widgets.inactive.bg_fill.gamma_multiply(0.5),
+            ui.visuals().weak_text_color(),
+        )
+    };
+    painter.rect_filled(vac_rect, 3.0, vac_fill);
+    painter.rect_stroke(
+        vac_rect,
+        3.0,
+        Stroke::new(1.0, vac_stroke),
+        StrokeKind::Outside,
+    );
+    painter.text(
+        vac_rect.center(),
+        Align2::CENTER_CENTER,
+        "vac",
+        FontId::proportional(10.0),
+        if *vacuum {
+            AMBER
+        } else {
+            ui.visuals().weak_text_color()
+        },
     );
     // Separation zone: everything below the crossing altitude is where a real
     // nozzle would separate — shade it before the user drags into it.
@@ -756,8 +1000,8 @@ fn altitude_slider(ui: &mut egui::Ui, alt_m: &mut f64, sep_m: Option<f64>) -> bo
             RED,
         );
     }
-    // 10 km ticks.
-    for km in (0..=40).step_by(10) {
+    // 10 km ticks, plus the 58 km cap.
+    for km in [0, 10, 20, 30, 40, 50, 58] {
         let x = x_of(km as f64 * 1000.0);
         painter.line_segment(
             [Pos2::new(x, track_y + 4.0), Pos2::new(x, track_y + 8.0)],
@@ -771,13 +1015,15 @@ fn altitude_slider(ui: &mut egui::Ui, alt_m: &mut f64, sep_m: Option<f64>) -> bo
             ui.visuals().weak_text_color(),
         );
     }
-    // Handle.
-    let hx = x_of(*alt_m);
-    painter.circle(
-        Pos2::new(hx, track_y),
-        7.0,
-        ui.visuals().widgets.active.bg_fill,
-        Stroke::new(1.5, ui.visuals().widgets.active.fg_stroke.color),
-    );
+    // Handle: parked in the vacuum stop when vacuum mode is on.
+    if !*vacuum {
+        let hx = x_of(*alt_m);
+        painter.circle(
+            Pos2::new(hx, track_y),
+            7.0,
+            ui.visuals().widgets.active.bg_fill,
+            Stroke::new(1.5, ui.visuals().widgets.active.fg_stroke.color),
+        );
+    }
     changed
 }
