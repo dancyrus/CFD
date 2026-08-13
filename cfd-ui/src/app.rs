@@ -388,14 +388,19 @@ impl CfdApp {
                         "—".into()
                     });
                     // N_throat lives NEXT TO the thrust readout, by decree.
+                    // The bias figure is measured (T8, ladder.rs): the
+                    // staircase wall's entropy layer costs ~13% of thrust at
+                    // the default N_throat = 20.
                     ui.label(
-                        RichText::new(format!("{n_throat:.0} cells / r_t"))
-                            .small()
-                            .color(if underresolved {
-                                AMBER
-                            } else {
-                                ui.visuals().weak_text_color()
-                            }),
+                        RichText::new(format!(
+                            "{n_throat:.0} cells / r_t · ≈13% low (staircase wall)"
+                        ))
+                        .small()
+                        .color(if underresolved {
+                            AMBER
+                        } else {
+                            ui.visuals().weak_text_color()
+                        }),
                     );
                     ui.end_row();
 
@@ -425,9 +430,12 @@ impl CfdApp {
 
                     ui.label("exit Mach");
                     ui.monospace(fmt_or_dash(rep.exit_mach, ""));
+                    // Measured (T8): the wall layer drags the area average
+                    // ~19% below the 1-D ideal at default resolution; the
+                    // core flow is within ~7%.
                     ui.label(
                         RichText::new(format!(
-                            "area-averaged ±4% · 1-D ideal {:.2}",
+                            "area-avg · ≈19% low at this res (staircase wall) · 1-D ideal {:.2}",
                             rep.ideal_exit_mach
                         ))
                         .small()

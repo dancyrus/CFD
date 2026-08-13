@@ -459,3 +459,80 @@ fn diag_t8_dz_010() {
         println!("  r {:.2}: M {:.3}", grid.r_center(ir), snap.sample(FieldKind::Mach, lip, ir));
     }
 }
+
+/// Settling trend for the cut-domain wall-layer measurement: delta50 and exit
+/// M at several step counts and two measurement columns, both resolutions.
+#[test]
+#[ignore = "diagnostic"]
+fn diag_wall_layer_settling() {
+    for (n_throat, steps) in [(20usize, [1500u64, 3000, 6000, 12000]),
+                              (40, [3000, 6000, 12000, 24000])] {
+        for target in steps {
+            let (d_lip, d_mid, m, mdot, res) = wall_layer_probe(n_throat, target);
+            println!("N{n_throat} step {target:5}: delta50 lip-4 {d_lip:.3} r_t, \
+                      mid-divergent {d_mid:.3} r_t, exit M {m:.3}, mdot/ideal {mdot:.4}, \
+                      residual {res:.2e}");
+        }
+    }
+}
+
+fn wall_layer_probe(n_throat: usize, steps: u64) -> (f64, f64, f64, f64, f64) {
+    let gas = GasModel { gamma: 1.24, r_specific_si: 378.0 };
+    let refs = RefScales::from_chamber(0.05, 5.0e6, 3200.0, &gas);
+    let dr = 1.0f32 / n_throat as f32;
+    let dz = 2.898 * dr;
+    let grid = Grid { nz: (12.6 / dz).ceil() as usize, nr: (4.0 / dr) as usize, dz, dr };
+    let spec = cfd_geom::NozzleSpec {
+        throat_radius_m: 0.05, area_ratio: 8.0, contraction_ratio: 4.0,
+        converge_half_angle_deg: 30.0, throat_arc_up: 1.5, throat_arc_down: 0.382,
+        contour: cfd_geom::ContourKind::Conical { half_angle_deg: 15.0 },
+    };
+    let wall = cfd_geom::generate_contour(&spec, 512).unwrap();
+    let solid = cfd_geom::rasterize(&wall, &grid, &refs).unwrap();
+    let lip = (0..grid.nz)
+        .filter(|&iz| (0..grid.nr).any(|ir| solid.is_solid(grid.idx(iz, ir))))
+        .max().unwrap();
+    let throat = (0..=lip)
+        .filter_map(|iz| (0..grid.nr).find(|&ir| solid.is_solid(grid.idx(iz, ir)))
+            .map(|b| (iz, b)))
+        .min_by_key(|&(_, b)| b).unwrap().0;
+    let setup = SolveSetup {
+        grid, solid: Arc::new(solid), gas,
+        chamber: Chamber { p0: 1.0, t0: 1.0 },
+        ambient: Ambient { p: (101_325.0 / refs.p_pa) as f32, t: (288.15 / refs.t_k) as f32 },
+        numerics: Numerics { sponge_cells: 0, ..Numerics::default() },
+        refs,
+    };
+    let mut s = EulerSolver::new(setup).unwrap();
+    let mut info = s.step().unwrap();
+    while info.step < steps { info = s.step().unwrap(); }
+    let snap = s.snapshot();
+    let delta50 = |iz: usize| -> f64 {
+        let b = (0..grid.nr).find(|&ir| snap.solid.is_solid(grid.idx(iz, ir))).unwrap();
+        let core: f64 = (0..b / 2).map(|ir| snap.sample(FieldKind::Mach, iz, ir) as f64)
+            .sum::<f64>() / (b / 2) as f64;
+        for ir in (0..b).rev() {
+            let m = snap.sample(FieldKind::Mach, iz, ir) as f64;
+            if m >= 0.5 * core {
+                return grid.r_face(b) as f64 - grid.r_center(ir) as f64;
+            }
+        }
+        f64::NAN
+    };
+    let iz = lip - 4;
+    let b = (0..grid.nr).find(|&ir| snap.solid.is_solid(grid.idx(iz, ir))).unwrap();
+    let (mut mdot, mut mach_a, mut area) = (0.0f64, 0.0f64, 0.0f64);
+    for ir in 0..b {
+        let da = 2.0 * std::f64::consts::PI * grid.r_center(ir) as f64 * grid.dr as f64;
+        mdot += snap.sample(FieldKind::Density, iz, ir) as f64
+            * snap.sample(FieldKind::VelocityZ, iz, ir) as f64 * da * refs.l_m * refs.l_m;
+        mach_a += snap.sample(FieldKind::Mach, iz, ir) as f64 * da;
+        area += da;
+    }
+    let g = gas.gamma as f64;
+    let a_t = std::f64::consts::PI * refs.l_m * refs.l_m;
+    let mdot_ideal = g.sqrt() * (2.0 / (g + 1.0)).powf((g + 1.0) / (2.0 * (g - 1.0)))
+        * refs.p_pa * a_t / (gas.r_specific_si * refs.t_k).sqrt();
+    (delta50(lip - 4), delta50((throat + lip) / 2), mach_a / area,
+     mdot / mdot_ideal, info.residual)
+}
