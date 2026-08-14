@@ -9,7 +9,7 @@ Items marked ✓ were independently recomputed by a separate verification pass �
 
 | Decision | Value | Why |
 |---|---|---|
-| Grid | Uniform Cartesian axisymmetric (z, r), anisotropic (dz ≠ dr) | Body-fitted meshing is build step 10 in the long-term architecture; it is not a PoC item |
+| Grid | Graded tensor-product axisymmetric (z, r): arbitrary per-axis cell-edge lists, anisotropic; uniform is the special case | Body-fitted meshing is build step 10 in the long-term architecture; it is not a PoC item. Grading (docs/work-orders/grid-grading.md) buys a readable plume without the ~14× cost of enlarging the uniform grid; the spacing rule lives in cfd-geom, never in cfd-core |
 | Geometry | Solid volume fraction, exact sub-cell area | Both the parametric nozzle and drawn strokes rasterize into one field, so one solver serves both |
 | Wall | Sharp threshold at fraction ≥ 0.5, reflecting wall flux | Bit-exact zero mass flux through the wall, zero timestep penalty, works on a one-cell-thick stroke |
 | Precision | `f32` in the hot loop, `f64` in every reduction | See §7 |
@@ -32,22 +32,37 @@ F = (ρu, ρu²+p, ρuv, u(E+p))
 G = (ρv, ρuv, ρv²+p, v(E+p))
 ```
 
-Cell centres at `r_j = (j+0.5)·dr`, faces at `r_{j±1/2} = (j+0.5±0.5)·dr`. Update:
+The grid is a tensor product of per-axis cell-edge lists (graded or uniform). Faces at the edges `r_{j±1/2}`; per-cell widths `dz_i`, `dr_j`. Two distinct cell radii exist and they differ by up to `dr/6` (~4% on graded rows):
+
+- `r_j = (r_{j−1/2} + r_{j+1/2})/2`, the **arithmetic mean of the face radii** — the exact volume radius (`r_j·dr_j` is the true shell area). Volumes, areas and the update below use this.
+- the **shell volume centroid** `(2/3)(r_hi³−r_lo³)/(r_hi²−r_lo²)` — where a cell average of a linear-in-r field actually sits. Radial RECONSTRUCTION uses this (in z, cell centres/midpoints).
+
+Update:
 
 ```
-dU_j/dt = −(F_{i+1/2} − F_{i−1/2})/dz
-          − [ (r_{j+1/2}·G_{j+1/2} − r_{j−1/2}·G_{j−1/2}) − p_j·dr ] / (dr·r_j)
+dU_i,j/dt = −(F_{i+1/2} − F_{i−1/2})/dz_i
+            − [ r_{j+1/2}·(G_{j+1/2} − S_j) − r_{j−1/2}·(G_{j−1/2} − S_j) ] / (dr_j·r_j)
+
+S_j = (0, 0, (p̂_{j−1/2} + p̂_{j+1/2})/2, 0)
 ```
 
-**Write it exactly as bracketed above.** The pressure source is folded inside the same bracket as the radial flux difference. Algebraically this is identical to computing the flux difference and adding `+p_j/r_j` separately, but in `f32` the separate form leaves a residue of order `1e-7 × 40p × dt` per step at j = 0 (where `p/r = 2p/dr = 40p`), which accumulates into a faint axis artifact over a cold start. Inside one bracket the identical operands cancel bit-exactly.
+where `p̂_{j±1/2}` are the **interface pressures the Riemann solver sampled at the two radial faces** (`hllc_flux_p`/`hll_flux_p`; a wall face contributes its star pressure; identical face states contribute their own p). **Write it exactly as bracketed above.**
+
+Why the face-pressure source (work-order item c): since `(1/r)∂(rp)/∂r − p/r ≡ ∂p/∂r`, the pressure part of the radial momentum equation is a plain gradient — it should not be discretized through the geometric r-weighting at all. With `S_j` built from face pressures and `r_j` the arithmetic face mean, the bracket is algebraically identical to *conservative r-weighted advective flux difference plus `(p̂_hi − p̂_lo)/dr_j`*: no cell-centre radius enters the pressure balance, and a linear-in-r pressure field is differenced exactly on ANY radial grid (ref arXiv 1701.04834). The earlier uniform-grid form with `S_j = (0,0,p_j,0)` (cell-centre pressure) is the special case that was only exact for uniform p; substituting the cell-centre pressure at the axis row mis-differences a linear `dp/dr` by a factor 3.
+
+The axis face (`j = 0` lower face, `r_{−1/2} = 0`): the flux is weighted by zero, but its **interface pressure still anchors the source** — it comes from the mirrored Riemann problem against the axis ghost, whose star pressure is the symmetry-plane pressure.
+
+In `f32` a separated flux-difference-plus-source form leaves a residue of order `1e-7 × 40p × dt` per step at j = 0, which accumulates into a faint axis artifact over a cold start. Inside one bracket the identical operands cancel bit-exactly.
 
 Three properties this form gives you:
 
 - The axis face at j = 0 has `r_{−1/2} = 0`, so it carries zero flux by construction. The axis is a wall because of the geometry, not because of a boundary condition.
-- Exactly well-balanced **for the quiescent uniform state**: for uniform p, `p(r_{j+1/2} − r_{j−1/2}) = p·dr` cancels the source exactly at every j including 0. This is precisely test T1. Do not claim well-balancing for anything stronger.
-- `r_j ≥ dr/2` always, so nothing divides by zero.
+- Exactly well-balanced **for the quiescent uniform state at any radial grading**: for uniform p every face returns `p̂ = p` and `G − S` vanishes identically, at every j including 0. Verified bit-exact at growth ratio 1.2 (`well_balanced_graded`). Do not claim well-balancing for anything stronger.
+- `r_j ≥ dr_0/2 > 0` always, so nothing divides by zero.
 
-Axis boundary: two mirror ghost rows, `(ρ, u, −v, p)`. Needed only to feed the MUSCL slope at j = 0.
+Axis boundary: two mirror ghost rows, `(ρ, u, −v, p)`, at mirrored radii (ghost widths mirror the interior). Needed to feed the MUSCL slope at j = 0 and the axis-face interface pressure.
+
+**Non-uniform reconstruction** (work-order items a–b): slopes are computed from one-sided difference QUOTIENTS `Δ± = ΔW/Δx` over the actual positions, and face states extrapolate over the actual centre-to-face distances. minmod needs no change beyond that. The unlimited slope must be the full quadratic-fit gradient `(h_l·Δ+ + h_r·Δ−)/(h_l + h_r)` — including the cell's own value term; the naive average `(Δ− + Δ+)/2` or plain distance weighting `(W_{i+1} − W_{i−1})/(h_l + h_r)` is formally first order off-uniform and injects an O(ratio−1) fraction of upwind dissipation. Van Leer generalizes to the weighted harmonic `Δ−Δ+(h_l+h_r)/(h_l·Δ− + h_r·Δ+)`. All reduce exactly to the uniform formulas at equal spacing. Guards: `t1_freestream_graded`, `well_balanced_graded`, `t4_sod_graded` (acceptance.rs) run at growth ratios 1.15–1.2.
 
 ---
 
@@ -173,7 +188,8 @@ u_b = (u_i + 2a_i/(γ−1)) − 2a_b/(γ−1);  v_b = v_i;  p_b = p_a
 
 ```
 U −= dt · σ_max · s² · (U − U_ambient),   s = (depth into sponge)/L_sponge
-L_sponge = 24 cells
+L_sponge = PHYSICAL depth of the outer 24 rows (on a graded far field those
+           rows are wide; an index-based depth misplaces the profile)
 σ_max    = 12·a_ambient / L_sponge        // units of 1/time
 ```
 
@@ -185,10 +201,10 @@ That gives 1.8% one-way transmission and under 0.1% round-trip return. Add a dia
 
 **Quasi-1D isentropic init** in the nozzle interior, ambient elsewhere, blended over 4 cells at the exit plane. Roughly 3× fewer steps to steady than a cold start, and the app needs the quasi-1D solution anyway for the textbook-comparison overlay, so it is nearly free.
 
-⚠ The open-radius formula in the first draft was dimensionally wrong (`dz·Σ_j`) and unweighted. Correct:
+⚠ The open-radius formula in the first draft was dimensionally wrong (`dz·Σ_j`) and unweighted. Correct (per-cell `dr_j` inside the sum on a graded grid):
 
 ```
-r_w(i) = sqrt( 2·dr·Σ_j (1 − frac[i][j])·r_j )
+r_w(i) = sqrt( 2·Σ_j (1 − frac[i][j])·r_j·dr_j )
 ```
 
 Linear summing gives the wrong quasi-1D Mach number by the r-weighting and throws away part of the speedup.
@@ -223,7 +239,7 @@ First-order HLLC/HLL with Davis speeds is provably positivity-preserving at CFL 
 
 **Floors** (non-dimensional, chamber-referenced): `ρ_min = 1e-8`, `p_min = max(1e-6·p0, 1e-4·p_a)`. ⚠ The absolute floor has been raised twice: 1e-9 → 1e-8 because at the 50 km ceiling `1e-4·p_a` sat at the old clamp and the plume core rode the floor; 1e-8 → 1e-6 with the real-engine presets, so the floor tracks chamber pressure across the 8.6–300 bar preset range. Altitude ceiling 58 km — that is where the thinnest ambient still clears the floor for the highest-pressure preset (Raptor 2, 300 bar: p_a(58 km) ≈ 27 Pa ≈ 1e-6·p₀). Above the cap the UI switches to a **labelled vacuum mode** with back pressure fixed at 3e-5·p₀ — 30× the floor, an empirical margin from the Merlin Vac (ε = 165, exit pressure ≈ 8e-5·p₀) probes: at 2× the floor its plume rides the floor at steady state, at 10× the startup contact stretches to step ~1900, at 30× floor contact is confined to the cold-start front (last activation step 796, zero after — see §13's quarantine rule). Any atmospheric ambient below 3e-5·p₀ is clamped to it for the same reason.
 
-**Timestep.** `w_max = max[(|u|+a)/dz + (|v|+a)/dr]`, `dt = 0.4/w_max`, recomputed every step. Fold the reduction into the same rayon pass that computes primitives — it is one extra streaming pass and effectively free. A nozzle startup swings the max wave speed by 5×, so a fixed dt either diverges during startup or wastes 5× at steady state.
+**Timestep.** `w_max = max[(|u|+a)/dz_i + (|v|+a)/dr_j]` over fluid cells with the LOCAL cell widths, `dt = 0.4/w_max`, recomputed every step. Fold the reduction into the same rayon pass that computes primitives — it is one extra streaming pass and effectively free. A nozzle startup swings the max wave speed by 5×, so a fixed dt either diverges during startup or wastes 5× at steady state.
 
 ---
 
@@ -271,7 +287,9 @@ Put `pub type Real = f32;` in the contract crate so it is a one-line flip if T3 
 
 The three requirements — a domain long enough for a Mach disk, a throat resolved enough for defensible mass flow, and interactive frame rates on an M1 Air — cannot all be met. Cost scales as `L_z²·L_r/(dz·dr²)`, so halving dr is 4× the work, not 2×.
 
-The lever nobody used: **dz and dr need not be equal.** dt is set by `(|u|+a)/dz + (|v|+a)/dr`; with dr ≪ dz the radial term dominates, so widening dz is nearly free in dt while linearly cutting cells. An anisotropic uniform grid captures essentially all of the benefit of a stretched grid at zero complexity. Geometric stretching in r would save ~40% of radial cells but saves no steps (dt is set by the finest dr), nets 1.4×, and breaks exact area rasterization, the `r_j = (j+0.5)dr` identity that makes §1 well-balanced, and uniform-grid slope limiting. Not worth it.
+The lever nobody used: **dz and dr need not be equal.** dt is set by `(|u|+a)/dz + (|v|+a)/dr`; with dr ≪ dz the radial term dominates, so widening dz is nearly free in dt while linearly cutting cells.
+
+⚠ Superseded by the grid-grading work order: an earlier draft rejected geometric stretching because it "breaks exact area rasterization, the `r_j = (j+0.5)dr` identity that makes §1 well-balanced, and uniform-grid slope limiting." All three objections were about *implementations that assume uniformity*, not about stretching itself, and all three were closed properly: the rasterizer clips against the actual cell edges (T0 unchanged), §1's face-pressure source form is well-balanced at any radial grading (bit-exact, `well_balanced_graded`), and the reconstruction uses the full unequal-spacing stencils (§1). The spacing rule — hold base resolution across the solid span plus a margin, grade geometrically at 1.05 beyond, cap cell growth — lives in `cfd-geom::grade_from_solid`; the solver just takes edge lists. Grading the plume tail is what buys the Long domain (~40 exit radii) at roughly the compact cell count and an unchanged dt; base resolution across the geometry keeps every §8 number below intact on the held region.
 
 | | nz × nr | cells | L_z | L_r | dz / dr (r_t) | N_throat | ṁ error | M1 steps/s | PC steps/s |
 |---|---|---|---|---|---|---|---|---|---|
@@ -282,7 +300,9 @@ Steps/s ranges bracket an optimistic measured kernel (5.0 Mcups/core, validated 
 
 Domain: 11 r_t of nozzle (2 chamber + converging cone + arcs = 4.13, diverging L_n = 6.87) plus 12.5 exit radii of plume. L_r = 3.54 r_e against a peak plume radius near 2.2 r_e, so 1.6× margin, sponge starting at 8.8 r_t.
 
-**What is sacrificed: plume length, by 3.2×.** You get the Mach disk (around 6–9 r_e) plus the leading half of the first reflected cell. You do not get 4.5 visible diamonds. This is the right thing to give up, and not only because it is cheapest — the solver is inviscid, so there is no entrainment, the plume edge stays razor-sharp, and shock cells persist further downstream than in any photograph. **The downstream diamonds are the least trustworthy pixels on the screen.** Trading them to protect throat mass flow, which is the number a propulsion engineer checks, is the correct direction. The 40-exit-radii domain at the same throat resolution costs 204k cells and roughly two minutes per altitude drag on the M1. Dead.
+⚠ The paragraph below described the UNIFORM-grid tradeoff and set the historic Compact domain. The graded grid reopens it: the Standard (~20 r_e) and Long (~40 r_e) plume options extend the domain on the graded tail at roughly the compact cell count, with dt unchanged (set by the held base dr) — the far-field diamonds get coarser axial cells (capped at 6× base), which is the honest price, and radial resolution through the plume core stays at base. The trust caveat below still applies word for word: the downstream diamonds remain the least trustworthy pixels on the screen.
+
+**What the uniform grid sacrificed: plume length, by 3.2×.** You get the Mach disk (around 6–9 r_e) plus the leading half of the first reflected cell. You do not get 4.5 visible diamonds. This is the right thing to give up, and not only because it is cheapest — the solver is inviscid, so there is no entrainment, the plume edge stays razor-sharp, and shock cells persist further downstream than in any photograph. **The downstream diamonds are the least trustworthy pixels on the screen.** Trading them to protect throat mass flow, which is the number a propulsion engineer checks, is the correct direction. The 40-exit-radii domain at the same throat resolution costs 204k cells and roughly two minutes per altitude drag on the M1. Dead.
 
 ⚠ Two premise corrections. Ashkenas & Sherman's `z_M/D = 0.67√(p₀/p_a)` is for a **sonic orifice** with D the orifice diameter; applied at a nozzle exit it gives 5.84 r_e, not 8.5. The true Mach-disk station is likely 6–9 r_e; the domain above covers the band. And Prandtl–Pack shock-cell spacing is a weakly-imperfectly-expanded linearization — at high underexpansion it is decorative. **Do not put a numeric shock-cell-spacing readout in the UI.**
 
