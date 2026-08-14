@@ -21,12 +21,12 @@ fn identity_refs() -> RefScales {
 fn diag_cone_profiles() {
     let gamma = 1.4f64;
     let m_inf = 2.35f64;
-    let grid = Grid { nz: 300, nr: 220, dz: 0.01, dr: 0.01 };
+    let grid = Grid::uniform(300, 220, 0.01, 0.01);
     let z0 = 0.5f64;
     let tan_c = 10.0f64.to_radians().tan();
-    let mut solid = SolidField::empty(grid);
+    let mut solid = SolidField::empty(grid.clone());
     for iz in 0..grid.nz {
-        let z = (iz as f64 + 0.5) * grid.dz as f64;
+        let z = (iz as f64 + 0.5) * grid.dz(0) as f64;
         if z <= z0 { continue; }
         for ir in 0..grid.nr {
             if (grid.r_center(ir) as f64) < (z - z0) * tan_c {
@@ -37,7 +37,7 @@ fn diag_cone_profiles() {
     let u_inf = m_inf * gamma.sqrt();
     let t0 = 1.0 + 0.5 * (gamma - 1.0) * m_inf * m_inf;
     let setup = SolveSetup {
-        grid,
+        grid: grid.clone(),
         solid: Arc::new(solid),
         gas: GasModel { gamma: gamma as f32, r_specific_si: 287.0 },
         chamber: Chamber { p0: t0.powf(3.5) as f32, t0: t0 as f32 },
@@ -51,7 +51,7 @@ fn diag_cone_profiles() {
     let mut info = s.step().unwrap();
     while info.time < 4.0 { info = s.step().unwrap(); }
     let snap = s.snapshot();
-    let iz = (2.0 / grid.dz as f64) as usize; // z = 2.0, surface at r = 0.264
+    let iz = (2.0 / grid.dz(0) as f64) as usize; // z = 2.0, surface at r = 0.264
     println!("cone radial profile at z=2.0 (surface r=0.264, shock ~r=0.75):");
     println!("  ir     r     solid   M       p       uz      ur");
     for ir in 20..45 {
@@ -65,7 +65,7 @@ fn diag_cone_profiles() {
     }
     println!("first-fluid-above-surface M along z:");
     for iz in (60..260).step_by(20) {
-        let z = (iz as f64 + 0.5) * grid.dz as f64;
+        let z = (iz as f64 + 0.5) * grid.dz(0) as f64;
         if z <= z0 { continue; }
         let mut ir = 0;
         while snap.solid.is_solid(grid.idx(iz, ir)) { ir += 1; }
@@ -86,7 +86,7 @@ fn diag_cone_profiles() {
 fn diag_nozzle_centerline() {
     let gas = GasModel { gamma: 1.24, r_specific_si: 378.0 };
     let refs = RefScales::from_chamber(0.05, 5.0e6, 3200.0, &gas);
-    let grid = Grid { nz: 320, nr: 200, dz: 0.1449, dr: 0.05 };
+    let grid = Grid::uniform(320, 200, 0.1449, 0.05);
     let spec = cfd_geom::NozzleSpec {
         throat_radius_m: 0.05,
         area_ratio: 8.0,
@@ -104,7 +104,7 @@ fn diag_nozzle_centerline() {
         .max()
         .unwrap();
     let setup = SolveSetup {
-        grid,
+        grid: grid.clone(),
         solid: Arc::new(solid),
         gas,
         chamber: Chamber { p0: 1.0, t0: 1.0 },
@@ -156,7 +156,7 @@ fn diag_carbuncle_mask_in_nozzle() {
     use cfd_contract::{Prim, NG};
     let gas = GasModel { gamma: 1.24, r_specific_si: 378.0 };
     let refs = RefScales::from_chamber(0.05, 5.0e6, 3200.0, &gas);
-    let grid = Grid { nz: 320, nr: 200, dz: 0.1449, dr: 0.05 };
+    let grid = Grid::uniform(320, 200, 0.1449, 0.05);
     let spec = cfd_geom::NozzleSpec {
         throat_radius_m: 0.05, area_ratio: 8.0, contraction_ratio: 4.0,
         converge_half_angle_deg: 30.0, throat_arc_up: 1.5, throat_arc_down: 0.382,
@@ -165,7 +165,7 @@ fn diag_carbuncle_mask_in_nozzle() {
     let wall = cfd_geom::generate_contour(&spec, 512).unwrap();
     let solid = cfd_geom::rasterize(&wall, &grid, &refs).unwrap();
     let setup = SolveSetup {
-        grid, solid: Arc::new(solid), gas,
+        grid: grid.clone(), solid: Arc::new(solid), gas,
         chamber: Chamber { p0: 1.0, t0: 1.0 },
         ambient: Ambient { p: (101_325.0 / refs.p_pa) as f32, t: (288.15 / refs.t_k) as f32 },
         numerics: Numerics::default(),
@@ -208,7 +208,7 @@ fn diag_carbuncle_mask_in_nozzle() {
     println!("carbuncle mask on the SMOOTH quasi-1D init: {total} fluid cells masked");
     println!("masked cells per column, columns 20..90 (throat ~30, lip 75):");
     for iz in (20..90).step_by(5) {
-        println!("  col {iz:3} (z {:5.2}): {:3} masked", (iz as f32 + 0.5) * grid.dz, per_col[iz]);
+        println!("  col {iz:3} (z {:5.2}): {:3} masked", (iz as f32 + 0.5) * grid.dz(0), per_col[iz]);
     }
 }
 
@@ -220,7 +220,7 @@ fn diag_carbuncle_mask_in_nozzle() {
 fn diag_nozzle_measure_grid() {
     let gas = GasModel { gamma: 1.24, r_specific_si: 378.0 };
     let refs = RefScales::from_chamber(0.05, 5.0e6, 3200.0, &gas);
-    let grid = Grid { nz: 640, nr: 400, dz: 0.0724, dr: 0.025 };
+    let grid = Grid::uniform(640, 400, 0.0724, 0.025);
     let spec = cfd_geom::NozzleSpec {
         throat_radius_m: 0.05, area_ratio: 8.0, contraction_ratio: 4.0,
         converge_half_angle_deg: 30.0, throat_arc_up: 1.5, throat_arc_down: 0.382,
@@ -229,7 +229,7 @@ fn diag_nozzle_measure_grid() {
     let wall = cfd_geom::generate_contour(&spec, 1024).unwrap();
     let solid = cfd_geom::rasterize(&wall, &grid, &refs).unwrap();
     let setup = SolveSetup {
-        grid, solid: Arc::new(solid), gas,
+        grid: grid.clone(), solid: Arc::new(solid), gas,
         chamber: Chamber { p0: 1.0, t0: 1.0 },
         ambient: Ambient { p: (101_325.0 / refs.p_pa) as f32, t: (288.15 / refs.t_k) as f32 },
         numerics: Numerics::default(),
@@ -259,7 +259,7 @@ fn diag_nozzle_measure_grid() {
 fn diag_t8_convergence_and_exit_plane() {
     let gas = GasModel { gamma: 1.24, r_specific_si: 378.0 };
     let refs = RefScales::from_chamber(0.05, 5.0e6, 3200.0, &gas);
-    let grid = Grid { nz: 320, nr: 200, dz: 0.1449, dr: 0.05 };
+    let grid = Grid::uniform(320, 200, 0.1449, 0.05);
     let spec = cfd_geom::NozzleSpec {
         throat_radius_m: 0.05, area_ratio: 8.0, contraction_ratio: 4.0,
         converge_half_angle_deg: 30.0, throat_arc_up: 1.5, throat_arc_down: 0.382,
@@ -275,7 +275,7 @@ fn diag_t8_convergence_and_exit_plane() {
     let z_exit_contour = wall.points.last().unwrap()[0] / refs.l_m; // nondim
     println!("exit plane: lip column {lip}, cell z-range [{:.3}, {:.3}] r_t; \
               contour ends at z = {:.3} r_t",
-             lip as f32 * grid.dz, (lip as f32 + 1.0) * grid.dz, z_exit_contour);
+             lip as f32 * grid.dz(0), (lip as f32 + 1.0) * grid.dz(0), z_exit_contour);
     for iz in [lip - 2, lip - 1, lip] {
         let first_solid = (0..grid.nr).find(|&ir| solid.is_solid(grid.idx(iz, ir))).unwrap();
         println!("  col {iz}: first solid row {first_solid} (r_face {:.3}); fractions \
@@ -305,7 +305,7 @@ fn diag_t8_convergence_and_exit_plane() {
 
     // --- (1) convergence history ------------------------------------------
     let setup = SolveSetup {
-        grid, solid: Arc::new(solid), gas,
+        grid: grid.clone(), solid: Arc::new(solid), gas,
         chamber: Chamber { p0: 1.0, t0: 1.0 },
         ambient: Ambient { p: p_a_nd as f32, t: (288.15 / refs.t_k) as f32 },
         numerics: Numerics::default(),
@@ -335,7 +335,7 @@ fn diag_t8_convergence_and_exit_plane() {
         let first_solid = (0..grid.nr).find(|&ir| snap.solid.is_solid(grid.idx(iz, ir))).unwrap();
         let (mut mdot, mut mach_a, mut area) = (0.0f64, 0.0f64, 0.0f64);
         for ir in 0..first_solid {
-            let da = 2.0 * std::f64::consts::PI * grid.r_center(ir) as f64 * grid.dr as f64;
+            let da = 2.0 * std::f64::consts::PI * grid.r_center(ir) as f64 * grid.dr(0) as f64;
             let rho = snap.sample(FieldKind::Density, iz, ir) as f64;
             let uz = snap.sample(FieldKind::VelocityZ, iz, ir) as f64;
             mdot += rho * uz * da * refs.l_m * refs.l_m;
@@ -361,7 +361,7 @@ fn diag_t8_convergence_and_exit_plane() {
 fn diag_t8_column_reflect() {
     let gas = GasModel { gamma: 1.24, r_specific_si: 378.0 };
     let refs = RefScales::from_chamber(0.05, 5.0e6, 3200.0, &gas);
-    let grid = Grid { nz: 320, nr: 200, dz: 0.1449, dr: 0.05 };
+    let grid = Grid::uniform(320, 200, 0.1449, 0.05);
     let spec = cfd_geom::NozzleSpec {
         throat_radius_m: 0.05, area_ratio: 8.0, contraction_ratio: 4.0,
         converge_half_angle_deg: 30.0, throat_arc_up: 1.5, throat_arc_down: 0.382,
@@ -373,7 +373,7 @@ fn diag_t8_column_reflect() {
         .filter(|&iz| (0..grid.nr).any(|ir| solid.is_solid(grid.idx(iz, ir))))
         .max().unwrap();
     let setup = SolveSetup {
-        grid, solid: Arc::new(solid), gas,
+        grid: grid.clone(), solid: Arc::new(solid), gas,
         chamber: Chamber { p0: 1.0, t0: 1.0 },
         ambient: Ambient { p: (101_325.0 / refs.p_pa) as f32, t: (288.15 / refs.t_k) as f32 },
         numerics: Numerics { wall_mode: cfd_contract::WallMode::ColumnReflect,
@@ -412,7 +412,7 @@ fn diag_t8_column_reflect() {
 fn diag_t8_dz_010() {
     let gas = GasModel { gamma: 1.24, r_specific_si: 378.0 };
     let refs = RefScales::from_chamber(0.05, 5.0e6, 3200.0, &gas);
-    let grid = Grid { nz: 464, nr: 200, dz: 0.10, dr: 0.05 };
+    let grid = Grid::uniform(464, 200, 0.10, 0.05);
     let spec = cfd_geom::NozzleSpec {
         throat_radius_m: 0.05, area_ratio: 8.0, contraction_ratio: 4.0,
         converge_half_angle_deg: 30.0, throat_arc_up: 1.5, throat_arc_down: 0.382,
@@ -424,7 +424,7 @@ fn diag_t8_dz_010() {
         .filter(|&iz| (0..grid.nr).any(|ir| solid.is_solid(grid.idx(iz, ir))))
         .max().unwrap();
     let setup = SolveSetup {
-        grid, solid: Arc::new(solid), gas,
+        grid: grid.clone(), solid: Arc::new(solid), gas,
         chamber: Chamber { p0: 1.0, t0: 1.0 },
         ambient: Ambient { p: (101_325.0 / refs.p_pa) as f32, t: (288.15 / refs.t_k) as f32 },
         numerics: Numerics::default(),
@@ -481,7 +481,7 @@ fn wall_layer_probe(n_throat: usize, steps: u64) -> (f64, f64, f64, f64, f64) {
     let refs = RefScales::from_chamber(0.05, 5.0e6, 3200.0, &gas);
     let dr = 1.0f32 / n_throat as f32;
     let dz = 2.898 * dr;
-    let grid = Grid { nz: (12.6 / dz).ceil() as usize, nr: (4.0 / dr) as usize, dz, dr };
+    let grid = Grid::uniform((12.6 / dz).ceil() as usize, (4.0 / dr) as usize, dz, dr);
     let spec = cfd_geom::NozzleSpec {
         throat_radius_m: 0.05, area_ratio: 8.0, contraction_ratio: 4.0,
         converge_half_angle_deg: 30.0, throat_arc_up: 1.5, throat_arc_down: 0.382,
@@ -497,7 +497,7 @@ fn wall_layer_probe(n_throat: usize, steps: u64) -> (f64, f64, f64, f64, f64) {
             .map(|b| (iz, b)))
         .min_by_key(|&(_, b)| b).unwrap().0;
     let setup = SolveSetup {
-        grid, solid: Arc::new(solid), gas,
+        grid: grid.clone(), solid: Arc::new(solid), gas,
         chamber: Chamber { p0: 1.0, t0: 1.0 },
         ambient: Ambient { p: (101_325.0 / refs.p_pa) as f32, t: (288.15 / refs.t_k) as f32 },
         numerics: Numerics { sponge_cells: 0, ..Numerics::default() },
@@ -523,7 +523,7 @@ fn wall_layer_probe(n_throat: usize, steps: u64) -> (f64, f64, f64, f64, f64) {
     let b = (0..grid.nr).find(|&ir| snap.solid.is_solid(grid.idx(iz, ir))).unwrap();
     let (mut mdot, mut mach_a, mut area) = (0.0f64, 0.0f64, 0.0f64);
     for ir in 0..b {
-        let da = 2.0 * std::f64::consts::PI * grid.r_center(ir) as f64 * grid.dr as f64;
+        let da = 2.0 * std::f64::consts::PI * grid.r_center(ir) as f64 * grid.dr(0) as f64;
         mdot += snap.sample(FieldKind::Density, iz, ir) as f64
             * snap.sample(FieldKind::VelocityZ, iz, ir) as f64 * da * refs.l_m * refs.l_m;
         mach_a += snap.sample(FieldKind::Mach, iz, ir) as f64 * da;
