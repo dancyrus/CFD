@@ -596,6 +596,7 @@ version = "0.1.0"
 dependencies = [
  "cfd-contract",
  "cfd-geom",
+ "cfd-results",
  "rayon",
 ]
 
@@ -604,7 +605,12 @@ name = "cfd-geom"
 version = "0.1.0"
 dependencies = [
  "cfd-contract",
+ "cfd-results",
 ]
+
+[[package]]
+name = "cfd-results"
+version = "0.1.0"
 
 [[package]]
 name = "cfd-ui"
@@ -613,6 +619,7 @@ dependencies = [
  "cfd-contract",
  "cfd-core",
  "cfd-geom",
+ "cfd-results",
  "eframe",
  "egui",
  "triple_buffer",

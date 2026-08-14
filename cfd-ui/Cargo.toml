@@ -13,3 +13,6 @@ cfd-geom = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 triple_buffer = { workspace = true }
+
+[dev-dependencies]
+cfd-results = { workspace = true }

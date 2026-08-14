@@ -9,3 +9,4 @@ rayon = { workspace = true }
 
 [dev-dependencies]
 cfd-geom = { workspace = true }
+cfd-results = { workspace = true }

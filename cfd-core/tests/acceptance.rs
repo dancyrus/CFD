@@ -16,6 +16,17 @@ use cfd_contract::{
     SolidField, SolveSetup, Solver,
 };
 use cfd_core::EulerSolver;
+use cfd_results::{record_test, TestResult, Value};
+
+/// Results get committed, not reported in chat (CLAUDE.md): every rung
+/// records its measured numbers BEFORE its own asserts.
+fn record(id: &str, name: &str, expected: impl Into<Value>, actual: impl Into<Value>,
+          units: &str, pass: bool) {
+    record_test("ladder", TestResult {
+        id: id.into(), name: name.into(), expected: expected.into(),
+        actual: actual.into(), units: units.into(), pass,
+    });
+}
 
 /// Identity scales: SI == non-dimensional, so Snapshot fields can be asserted
 /// against non-dimensional literals directly.
@@ -73,6 +84,10 @@ fn t1_freestream() {
             e_rv = e_rv.max((d * snap.sample(FieldKind::VelocityR, iz, ir) as f64).abs());
         }
     }
+    let worst = e_rho.max(e_u).max(e_p);
+    record("T1", "free-stream preservation (planar uniform, 200 steps)",
+           "<= 1e-5", worst, "max abs state error",
+           worst <= 1e-5 && e_rv <= 1e-6);
     assert!(e_rho <= 1e-5, "max|rho-1| = {e_rho}");
     assert!(e_u <= 1e-5, "max|u-2| = {e_u}");
     assert!(e_p <= 1e-5, "max|p-1| = {e_p}");
@@ -151,6 +166,9 @@ fn t4_sod() {
         if rho > mid { shock_x = x; } // last cell still above the mid-density
     }
     let shock_exact = 0.5 + SHOCK_SPEED * t;
+    record("T4", "Sod shock tube, N = 200 uniform strip", "<= 6.0e-3", l1, "L1(rho)",
+           l1 <= 6.0e-3 && (shock_x - shock_exact).abs() <= 1.5 * grid.dz(0) as f64
+               && rho_max <= 1.001 && rv_max <= 1e-8);
     assert!(l1 <= 6.0e-3, "L1(rho) = {l1:.4e} (2nd order: 2.4-4.1e-3, 1st: 1.32e-2)");
     assert!((shock_x - shock_exact).abs() <= 1.5 * grid.dz(0) as f64,
             "shock at {shock_x}, exact {shock_exact}");
@@ -198,6 +216,8 @@ fn well_balanced() {
             err = err.max((snap.sample(FieldKind::VelocityR, iz, ir) as f64).abs());
         }
     }
+    record("WB", "well-balanced: quiescent axisymmetric box, 100 steps",
+           "<= 1e-7", err, "max abs drift", err <= 1e-7);
     assert!(err <= 1e-7, "quiescent uniform state drifted by {err:.3e}");
 }
 
@@ -270,6 +290,9 @@ fn t1_freestream_graded() {
         }
     }
     println!("T1-graded: |rho-1| {e_rho:.2e}, |u-2| {e_u:.2e}, |p-1| {e_p:.2e}, |rho*v| {e_rv:.2e}");
+    let worst = e_rho.max(e_u).max(e_p);
+    record("T1-graded", "free-stream preservation on a graded grid (growth 1.15/1.2)",
+           "<= 1e-5", worst, "max abs state error", worst <= 1e-5 && e_rv <= 1e-6);
     assert!(e_rho <= 1e-5, "max|rho-1| = {e_rho}");
     assert!(e_u <= 1e-5, "max|u-2| = {e_u}");
     assert!(e_p <= 1e-5, "max|p-1| = {e_p}");
@@ -314,6 +337,8 @@ fn well_balanced_graded() {
         }
     }
     println!("well-balanced (graded r): max drift {err:.3e}");
+    record("WB-graded", "well-balanced on a graded radial grid (growth 1.2)",
+           "<= 1e-7", err, "max abs drift", err <= 1e-7);
     assert!(err <= 1e-7, "quiescent uniform state drifted by {err:.3e} on the graded grid");
 }
 
@@ -355,6 +380,8 @@ fn t4_sod_graded() {
         rv_max = rv_max.max((rho * snap.sample(FieldKind::VelocityR, iz, 0) as f64).abs());
     }
     println!("T4-graded: L1(rho) = {l1:.4e} (uniform 2nd order: 2.4-4.1e-3, 1st: 1.32e-2)");
+    record("T4-graded", "Sod on a graded strip (growth 1.01, ratio ~11x)",
+           "<= 8.0e-3", l1, "L1(rho)", l1 <= 8.0e-3 && rv_max <= 1e-8);
     assert!(l1 <= 8.0e-3, "L1(rho) = {l1:.4e} on the graded strip");
     assert!(rv_max <= 1e-8, "max|rho*v| = {rv_max}");
     assert_eq!(info.floor_activations, 0);

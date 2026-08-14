@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["cfd-contract", "cfd-core", "cfd-geom", "cfd-ui"]
+members = ["cfd-contract", "cfd-core", "cfd-geom", "cfd-results", "cfd-ui"]
 
 [workspace.dependencies]
 # Pinned exactly. Do not run `cargo update`.
@@ -12,6 +12,7 @@ thiserror     = "2"
 cfd-contract  = { path = "cfd-contract" }
 cfd-core      = { path = "cfd-core" }
 cfd-geom      = { path = "cfd-geom" }
+cfd-results   = { path = "cfd-results" }
 
 # An unoptimized MUSCL-HLLC kernel is 20-50x slower and reads as a performance
 # bug. Do not remove this.
