@@ -28,12 +28,7 @@ fn disk(center: [f64; 2], radius: f64, n: usize) -> Vec<[f64; 2]> {
 
 #[test]
 fn t0_disk_area_is_exact() {
-    let g = Grid {
-        nz: 72,
-        nr: 72,
-        dz: 1.0,
-        dr: 1.0,
-    };
+    let g = Grid::uniform(72, 72, 1.0, 1.0);
     for radius in [3.0, 4.0, 6.0, 8.0, 12.0, 20.0] {
         let poly = disk([32.0, 32.0], radius, 2048); // centred on a cell corner
         let s = rasterize_solid_polygon(&poly, &g).unwrap();
@@ -88,12 +83,7 @@ fn t0_nozzle_throat_area_within_half_percent() {
     // Measure-like grid; dr quantized so the throat (r = 1) lies on a cell face.
     let dr = quantize_dr_to_throat(0.025);
     assert!((1.0 / dr as f64 - 40.0).abs() < 1e-4); // N_throat = 40 (f32 dr)
-    let g = Grid {
-        nz: 240,
-        nr: 220,
-        dz: 0.0724,
-        dr,
-    };
+    let g = Grid::uniform(240, 220, 0.0724, dr);
 
     // Five slider settings across both contour kinds.
     let settings: [(ContourKind, f64); 5] = [
@@ -138,14 +128,16 @@ fn t0_nozzle_throat_area_within_half_percent() {
         let z_end = profile.points.last().unwrap()[0] / refs.l_m;
         let mut min_rw2 = f64::MAX;
         for iz in 0..g.nz {
-            if (iz + 1) as f64 * g.dz as f64 > z_end {
+            if g.z_edges()[iz + 1] > z_end {
                 break; // past the exit lip the column is open to the far field
             }
             let mut acc: f64 = 0.0; // f64 reduction, mandatory
             for ir in 0..g.nr {
-                acc += (1.0 - solid.fraction[g.idx(iz, ir)] as f64) * g.r_center(ir) as f64;
+                acc += (1.0 - solid.fraction[g.idx(iz, ir)] as f64)
+                    * g.r_center(ir) as f64
+                    * g.dr(ir) as f64;
             }
-            min_rw2 = min_rw2.min(2.0 * g.dr as f64 * acc);
+            min_rw2 = min_rw2.min(2.0 * acc);
         }
         // Analytic throat area is pi * r_t^2, i.e. r_w^2 = 1 non-dimensionally.
         let rel = (min_rw2 - 1.0).abs();

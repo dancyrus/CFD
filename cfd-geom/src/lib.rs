@@ -9,11 +9,13 @@
 
 mod contour;
 mod editor;
+mod grade;
 mod rao;
 mod raster;
 
 pub use contour::generate_contour;
 pub use editor::Editor;
+pub use grade::{grade_from_solid, GradeSpec};
 pub use rao::rao_angles;
 pub use raster::{rasterize, rasterize_solid_polygon};
 
