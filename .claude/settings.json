@@ -13,12 +13,12 @@
       "Bash(git log:*)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
-      "Bash(git branch:*)"
+      "Bash(git branch:*)",
+      "Bash(git push:*)"
     ],
     "deny": [
       "Bash(cargo update:*)",
       "Bash(cargo add:*)",
-      "Bash(git push:*)",
       "Bash(git merge:*)",
       "Bash(git rebase:*)"
     ]
