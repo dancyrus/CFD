@@ -1,0 +1,16 @@
+{
+  "commit": "ab39fb48c9e0607289579a86238e92862e3ed06c",
+  "timestamp": "2026-08-14T18:52:00Z",
+  "machine": "intel-xeon-4c",
+  "tests": [],
+  "benchmarks": [
+    {"case":"demo nozzle (gamma 1.24, eps 8, sea level)","setting":"uniform Compact (historic)","cells":64000,"steps_per_sec":48.766078423056264,"seconds_to_steady":143.7465115566},
+    {"case":"demo nozzle (gamma 1.24, eps 8, sea level)","setting":"uniform Long (rejected)","cells":277120,"steps_per_sec":11.83388894280548,"seconds_to_steady":1394.9767552987041},
+    {"case":"demo nozzle (gamma 1.24, eps 8, sea level)","setting":"graded Standard (default)","cells":39312,"steps_per_sec":87.83889929021893,"seconds_to_steady":124.2597844516},
+    {"case":"demo nozzle (gamma 1.24, eps 8, sea level)","setting":"graded Long","cells":57318,"steps_per_sec":55.40096561214952,"seconds_to_steady":336.9140399272}
+  ],
+  "notes": [
+    "graded Long: 552 positivity-floor activations, all during the cold-start front (last at step 301, zero after) — the §13 quarantine class.",
+    "seconds_to_steady uses the §9 VISUAL-steady criterion (~5 plume transits, scaled by domain length). The residual-based settled flag does not fire at sea level on either the uniform or the graded grid — the mildly overexpanded plume keeps breathing above the 1e-3 threshold."
+  ]
+}
