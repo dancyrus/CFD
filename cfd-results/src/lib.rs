@@ -90,7 +90,9 @@ pub fn record_test(suite: &str, t: TestResult) {
 
 /// Record one benchmark row.
 pub fn record_benchmark(suite: &str, b: Benchmark) {
-    let key = format!("{}|{}", b.case, b.setting);
+    // The dedup key must never contain the staging-line separator '|', or the
+    // rebuilt document inherits a stray prefix and stops being JSON.
+    let key = format!("{}::{}", b.case, b.setting).replace('|', "/");
     let json = format!(
         "{{\"case\":{},\"setting\":{},\"cells\":{},\"steps_per_sec\":{},\"seconds_to_steady\":{}}}",
         json_str(&b.case),
@@ -120,6 +122,7 @@ fn record(suite: &str, kind: &str, key: &str, json: &str) {
 
 fn try_record(suite: &str, kind: &str, key: &str, json: &str) -> std::io::Result<()> {
     assert!(!key.contains('\n') && !json.contains('\n'), "records are line-oriented");
+    assert!(!key.contains('|'), "'|' is the staging-line separator; keys must not contain it");
     let root = repo_root();
     let machine = machine_label();
     let commit = git_commit(&root);
@@ -397,7 +400,7 @@ mod tests {
         });
         record_benchmark(suite, Benchmark {
             case: "demo".into(),
-            setting: "graded".into(),
+            setting: "graded | long".into(), // '|' must not corrupt the document
             cells: 42,
             steps_per_sec: 10.5,
             seconds_to_steady: 3.25,
@@ -415,6 +418,10 @@ mod tests {
             .join("docs/results")
             .join(format!("{suite}-{}.json", machine_label()));
         let doc = fs::read_to_string(&path).unwrap();
+        // Structural sanity: balanced braces/brackets and no stray staging
+        // separators outside strings (a leaked '|' prefix broke this once).
+        assert_eq!(doc.matches('{').count(), doc.matches('}').count(), "{doc}");
+        assert!(!doc.contains(")|{"), "staging prefix leaked into the document: {doc}");
         assert_eq!(doc.matches("\"X1\"").count(), 1, "rerun must replace, not append");
         assert!(doc.contains("\"actual\":0.75"), "{doc}");
         assert!(doc.contains("\"steps_per_sec\":10.5"), "{doc}");
