@@ -282,6 +282,7 @@ mod tests {
         let params = CaseParams::default();
         let wall = case::conical_contour(params.area_ratio);
         let setup = case::make_setup(&params, &wall);
+        let solver_grid = setup.grid.clone();
         let solver: Box<dyn Solver> = Box::new(MockSolver::new(setup.clone()).unwrap());
         let initial = make_frame(solver.as_ref(), FRESH_INFO);
         let (buf_in, mut out) = triple_buffer::triple_buffer(&initial);
@@ -355,7 +356,8 @@ mod tests {
 
         // Geometry edits reach the solver: a bigger bell raises exit Mach.
         let wall12 = case::conical_contour(12.0);
-        let solid = case::rasterize_wall(&wall12, &case::grid(&params));
+        // Mid-run geometry edits target the solver's CURRENT grid.
+        let solid = case::rasterize_wall(&wall12, &solver_grid);
         let mach_before = f_high.report.exit_mach;
         send(SolverCommand::SetGeometry(Arc::new(solid)));
         let f_geo = wait_for(&mut out, T, |f| f.report.exit_mach > mach_before + 0.1);
