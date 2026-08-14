@@ -1,0 +1,8 @@
+[package]
+name = "cfd-results"
+version = "0.1.0"
+edition = "2021"
+
+# Zero dependencies on purpose: this is test-harness plumbing shared by every
+# crate's tests, and it must never drag a serde tree into the build.
+[dependencies]

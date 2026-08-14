@@ -5,3 +5,6 @@ edition = "2021"
 
 [dependencies]
 cfd-contract = { workspace = true }
+
+[dev-dependencies]
+cfd-results = { workspace = true }

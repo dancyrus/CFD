@@ -9,18 +9,17 @@ Claude Code sessions working from the briefs in `docs/sessions/`.
 
 ## Download
 
-Prebuilt binaries for Linux, Windows and macOS are on the
+Prebuilt binaries for Windows (x86_64) and Apple Silicon macOS are on the
 [releases page](https://github.com/dancyrus/CFD/releases): unzip and run — the
 app is a single executable, no installer.
 
 - **Windows**: run `cfd-ui.exe`.
-- **Linux**: `chmod +x cfd-ui && ./cfd-ui` (needs an X11 or Wayland desktop).
-- **macOS**: the binary is unsigned, so the first launch needs
-  `chmod +x cfd-ui`, then right-click → Open (or
-  `xattr -d com.apple.quarantine cfd-ui`). Pick the `arm64` zip for Apple
-  Silicon, `x86_64` for Intel.
+- **macOS (Apple Silicon)**: the binary is ad-hoc signed but not notarized,
+  so the first launch needs `chmod +x cfd-ui`, then right-click → Open (or
+  `xattr -d com.apple.quarantine cfd-ui`).
 
-Or build from source: `cargo run --release -p cfd-ui`.
+Everything else (Linux, Intel macOS) builds from source:
+`cargo run --release -p cfd-ui`.
 
 ## What it does
 
