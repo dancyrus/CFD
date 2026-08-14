@@ -1,6 +1,6 @@
 # The Contract
 
-The single artifact that lets four Claude Code sessions build four crates at once without talking to each other. The coordinator session transcribes this into real files during the blocking phase. After that it is **frozen**: no session may edit `cfd-contract/`, `cfd-core/src/lib.rs`, or `cfd-core/src/step.rs`.
+The single artifact that lets four Claude Code sessions build four crates at once without talking to each other. The coordinator session transcribes this into real files during the blocking phase. The parallel-build freeze is over; changes now follow the CLAUDE.md contract-change rule (mirror this file and the physics reference in the same commit, re-run the full acceptance ladder). Applied changes so far: the `P_MIN_ABS` raise, and the graded tensor-product grid (`docs/work-orders/grid-grading.md`) — `Grid` now carries arbitrary per-axis cell-edge lists, and the reconstruction/flux kernels carry stencil geometry and interface pressures.
 
 Signatures below are the agreement. Sessions code against these names, and they are correct today — no session has to wait to find out what a type is called.
 
@@ -13,7 +13,7 @@ Violating one of these is the most likely source of a silent bug at merge.
 - **Non-dimensional everywhere inside the solver.** Chamber-referenced: `L_ref = r_t`, `p_ref = p0`, `rho_ref = rho0`, `u_ref = sqrt(p0/rho0)`, `T_ref = T0`. So `R = 1`, `p = rho*T`, and the chamber state is exactly `(1, 0, 0, 1)`. SI appears only in `Snapshot`, `Report` and the UI. `RefScales` does the conversion and nothing else may.
 - **`f32` in the hot loop** (`pub type Real = f32`). **Every reduction accumulates in `f64`** — mass, momentum, energy, thrust integrals, L1 norms, residuals. An f32 sum over 64k cells contributes more noise than the Sod pass threshold.
 - **Row-major, z contiguous.** Interior index `idx = ir*nz + iz`. Padded index `gidx = (ir+NG)*(nz+2*NG) + (iz+NG)`. Use `Grid::idx` and `Grid::gidx`; never open-code either.
-- **Cell centres at `r = (ir + 0.5)*dr`.** Never zero. The lower face of row 0 is at `r = 0`, which is why it carries zero flux and why the axisymmetric source is finite.
+- **The grid is a tensor product of arbitrary cell-edge lists** (graded or uniform — the solver cannot tell). The lower face of row 0 is at `r = 0` always, which is why it carries zero flux and why the axisymmetric source is finite. `r_center` is the arithmetic mean of the two face radii (row 0: `dr(0)/2`, never zero); `r_centroid_g` is the shell volume centroid. Reconstruction uses the centroid, volumes and areas use `r_center`, and the p/r balance never picks a cell radius at all (physics-reference §1).
 - **Ghost cells are private to `cfd-core`.** Every array crossing a crate boundary is exactly `grid.len()` long, interior only.
 - **Ping-pong.** Read `u_old` immutably, write `u_new` through `par_chunks_mut` over rows. Never mutate in place. This is the difference between working rayon code and forty minutes of borrow-checker errors.
 - **One error type**, `CfdError`, defined here. No crate defines its own and none returns `anyhow::Result` in its public API.
@@ -53,33 +53,76 @@ pub enum CfdError {
 }
 pub type Result<T> = std::result::Result<T, CfdError>;
 
-/// Uniform, anisotropic (dz != dr), axisymmetric (z, r) grid of cell centres.
-/// All lengths non-dimensional, in units of throat radius.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Grid { pub nz: usize, pub nr: usize, pub dz: Real, pub dr: Real }
+/// Tensor-product, anisotropic, axisymmetric (z, r) grid of cell EDGES —
+/// graded or uniform, the solver cannot tell. All lengths non-dimensional, in
+/// units of throat radius. z_edges[0] == 0 and r_edges[0] == 0 (the axis)
+/// always. Clone is cheap (geometry behind one Arc); NOT Copy. PartialEq
+/// compares nz, nr and the edge lists.
+///
+/// Per-cell geometry is precomputed and padded to the ghost layout: ghost
+/// widths mirror the interior, below-axis ghost positions mirror across
+/// r = 0 exactly. `_g` accessors take padded (possibly negative) indices.
+#[derive(Debug, Clone)]
+pub struct Grid { pub nz: usize, pub nr: usize, /* Arc<AxisGeom> */ }
 
 impl Grid {
-    /// Interior cell count. Every slice crossing a crate boundary is this long.
+    /// Uniform grid — the historical special case. Panics on invalid spacing
+    /// (programmer input); user-supplied edges go through `from_edges`.
+    pub fn uniform(nz: usize, nr: usize, dz: Real, dr: Real) -> Grid;
+    /// Arbitrary cell edges, one list per axis: >= 2 entries each, first
+    /// entry exactly 0, strictly increasing, finite.
+    pub fn from_edges(z_edges: Vec<f64>, r_edges: Vec<f64>) -> Result<Grid>;
+
+    // Layout — unchanged from the uniform grid.
     pub fn len(&self) -> usize { self.nz * self.nr }
-    /// Interior index. Row-major, z contiguous.
     pub fn idx(&self, iz: usize, ir: usize) -> usize { ir * self.nz + iz }
-    /// Padded row stride, including ghosts on both sides.
     pub fn snz(&self) -> usize { self.nz + 2 * NG }
     pub fn snr(&self) -> usize { self.nr + 2 * NG }
     pub fn glen(&self) -> usize { self.snz() * self.snr() }
     /// Padded index. Accepts negative interior coordinates for ghost access.
-    pub fn gidx(&self, iz: isize, ir: isize) -> usize {
-        ((ir + NG as isize) as usize) * self.snz() + ((iz + NG as isize) as usize)
-    }
-    /// Cell-centre radius. Row 0 returns dr/2, never 0.
-    pub fn r_center(&self, ir: usize) -> Real { (ir as Real + 0.5) * self.dr }
+    pub fn gidx(&self, iz: isize, ir: isize) -> usize;
+
+    /// The edges themselves (f64, nz+1 / nr+1 long): the source of truth the
+    /// caches derive from; the rasterizer clips against these.
+    pub fn z_edges(&self) -> &[f64];
+    pub fn r_edges(&self) -> &[f64];
+
+    // Per-cell geometry, interior indices.
+    pub fn dz(&self, iz: usize) -> Real;
+    pub fn dr(&self, ir: usize) -> Real;
+    /// Finest spacing per axis — timestep estimates and display resolution
+    /// key on these. NOT a substitute for per-cell widths in flux formulas.
+    pub fn dz_min(&self) -> Real;
+    pub fn dr_min(&self) -> Real;
+    pub fn z_face(&self, iz: usize) -> Real;   // 0..=nz
     /// Lower face radius of row ir. Row 0 returns exactly 0.
-    pub fn r_face(&self, ir: usize) -> Real { ir as Real * self.dr }
-    /// Cell volume / (2*pi): r_c * dr * dz. Exact — r_c is the arithmetic mean
-    /// of the two face radii, so this is the true cylindrical shell volume.
-    pub fn cell_vol(&self, ir: usize) -> f64 {
-        self.r_center(ir) as f64 * self.dr as f64 * self.dz as f64
-    }
+    pub fn r_face(&self, ir: usize) -> Real;   // 0..=nr
+    pub fn z_center(&self, iz: usize) -> Real;
+    /// ARITHMETIC MEAN of the two face radii (the exact volume radius:
+    /// r_center*dr is the true shell area at any grading). Row 0: dr(0)/2,
+    /// never 0. Reconstruction must NOT use this — see r_centroid_g.
+    pub fn r_center(&self, ir: usize) -> Real;
+
+    // Per-cell geometry, padded indices (kernel stencils reach ghosts).
+    pub fn dz_g(&self, iz: isize) -> Real;
+    pub fn dr_g(&self, ir: isize) -> Real;
+    pub fn z_center_g(&self, iz: isize) -> Real;
+    pub fn r_center_g(&self, ir: isize) -> Real;
+    /// Radial VOLUME centroid, (2/3)(r_hi³-r_lo³)/(r_hi²-r_lo²), mirrored
+    /// (negative) below the axis. Where a cell average of a linear-in-r field
+    /// sits; radial reconstruction in axisymmetric mode uses these.
+    pub fn r_centroid_g(&self, ir: isize) -> Real;
+
+    /// Cell volume / (2*pi): r_center*dr*dz, f64 from the exact edges.
+    pub fn cell_vol(&self, iz: usize, ir: usize) -> f64;
+    pub fn lz(&self) -> f64;
+    pub fn lr(&self) -> f64;
+    /// Interior cell containing a coordinate (clamped into range).
+    pub fn z_cell_at(&self, z: f64) -> usize;
+    pub fn r_cell_at(&self, r: f64) -> usize;
+    /// True for `Grid::uniform` grids. Display fast paths only — no numerics
+    /// may branch on this.
+    pub fn is_uniform(&self) -> bool;
 }
 
 // ---- the five abort-plan flags. Every one honoured by the solver from day one.
@@ -257,17 +300,36 @@ pub fn prim_to_cons(w: Prim, gamma: Real) -> Cons;
 pub fn sound_speed(w: Prim, gamma: Real) -> Real;
 
 /// Toro's S_M formulation. Direction-agnostic: caller rotates so the face normal
-/// is +n. Returns Cons in the SAME rotated frame.
-pub fn hllc_flux(ql: Prim, qr: Prim, gamma: Real) -> Cons;
+/// is +n. Returns Cons in the SAME rotated frame, plus the INTERFACE pressure —
+/// the pressure of the state the Riemann solution samples at the face (p_L/p_R
+/// when supersonic, the star pressure otherwise). The axisymmetric source
+/// discretization consumes it (physics-reference §1).
+pub fn hllc_flux_p(ql: Prim, qr: Prim, gamma: Real) -> (Cons, Real);
+pub fn hllc_flux(ql: Prim, qr: Prim, gamma: Real) -> Cons;   // .0 of the above
 
-/// Same contract. Used where the carbuncle sensor fires.
+/// Same contract. Used where the carbuncle sensor fires. Its interface
+/// pressure comes from the HLLC S_M star construction (HLL has none of its
+/// own); it only feeds the source split, never the conservative flux.
+pub fn hll_flux_p(ql: Prim, qr: Prim, gamma: Real) -> (Cons, Real);
 pub fn hll_flux(ql: Prim, qr: Prim, gamma: Real) -> Cons;
 
-/// s = four consecutive cells straddling face i+1/2: [i-1, i, i+1, i+2].
-/// Any true in `solid` drops that side to first order. Returns (left, right)
-/// face states. Reconstruction::FirstOrder returns the cell averages unchanged.
+/// Stencil geometry for face i+1/2 on a (possibly) non-uniform axis:
+/// positions of the four stencil cells and of the face. Cell centres in z;
+/// volume centroids in r under axisymmetry. UNIT is the unit-spacing stencil
+/// (first-order paths never read it).
+pub struct FaceGeom { pub x: [Real; 4], pub xf: Real }
+impl FaceGeom { pub const UNIT: FaceGeom; }
+
+/// s = four consecutive cells straddling face i+1/2: [i-1, i, i+1, i+2];
+/// `fg` carries their positions. Any true in `solid` drops that side to first
+/// order. Returns (left, right) face states. Reconstruction::FirstOrder
+/// returns the cell averages unchanged. On non-uniform spacing the slopes use
+/// the full unequal-spacing formulas (work-order items a-b): one-sided
+/// difference QUOTIENTS limited by minmod (unchanged), the quadratic-fit
+/// gradient for Limiter::None, the weighted harmonic form for VanLeer — all
+/// reduce exactly to the uniform formulas at equal spacing.
 pub fn muscl_face_states(
-    s: [Prim; 4], solid: [bool; 4], recon: Reconstruction, lim: Limiter,
+    s: [Prim; 4], solid: [bool; 4], fg: &FaceGeom, recon: Reconstruction, lim: Limiter,
 ) -> (Prim, Prim);
 ```
 

@@ -14,7 +14,7 @@ use cfd_contract::{FieldKind, SolverCommand};
 use crate::canvas::{colorbar, fmt_value, Canvas, BG};
 use crate::case::{
     self, ambient_nd, atmosphere, conical_contour, ideal_cf, make_setup, rasterize_wall,
-    separation_altitude_m, separation_threshold, CaseParams, ALT_MAX_M, PRESETS,
+    separation_altitude_m, separation_threshold, CaseParams, PlumeLength, ALT_MAX_M, PRESETS,
     R_UNIVERSAL_SI, VACUUM_P_FRAC,
 };
 use crate::editor::{EditorBackend, StubEditor};
@@ -94,6 +94,10 @@ pub struct CfdApp {
     geometry_custom: bool,
     space_panned: bool,
     hover_text: String,
+    /// Cached plume-option time-to-steady estimates and the frame generation
+    /// they were computed at (each estimate re-runs the grading, so it is
+    /// refreshed on a slow cadence rather than per repaint).
+    plume_est: Option<([f64; 3], u64)>,
     /// ANALYTIC PREVIEW overlay — true only for MockSolver builds.
     watermark: bool,
 }
@@ -110,6 +114,11 @@ impl CfdApp {
         let mut locked = [(0.0f32, 1.0f32); 8];
         for k in FieldKind::ALL {
             locked[k as usize] = lock_range(k, initial.snapshot.range(k));
+        }
+        let mut editor = StubEditor::new(wall.clone());
+        {
+            let (lz, lr) = case::domain(&params);
+            editor.set_domain(lz, lr);
         }
         CfdApp {
             out,
@@ -130,12 +139,13 @@ impl CfdApp {
             locked,
             smooth: false,
             canvas: Canvas::new(),
-            editor: StubEditor::new(wall.clone()),
+            editor,
             editor_on: false,
             committed_wall: wall,
             geometry_custom: false,
             space_panned: false,
             hover_text: String::new(),
+            plume_est: None,
             watermark,
         }
     }
@@ -153,7 +163,11 @@ impl CfdApp {
         self.committed_wall = self.editor.points().to_vec();
         self.geometry_custom = true;
         self.preset = None; // hand-drawn walls are no named engine
-        let solid = rasterize_wall(&self.committed_wall, &case::grid(&self.params));
+        // Mid-run edits rasterize onto the solver's CURRENT (graded) grid —
+        // that is the cheap-to-overwrite-mask property the sandbox rests on.
+        // The grading itself is only recomputed on a rebuild (preset, p0 or
+        // plume-length change), where the field restarts anyway.
+        let solid = rasterize_wall(&self.committed_wall, &self.latest.snapshot.grid);
         self.cmd(SolverCommand::SetGeometry(Arc::new(solid)));
     }
 
@@ -168,7 +182,7 @@ impl CfdApp {
         self.editor.set_points(wall.clone());
         self.committed_wall = wall;
         self.geometry_custom = false;
-        let solid = rasterize_wall(&self.committed_wall, &case::grid(&self.params));
+        let solid = rasterize_wall(&self.committed_wall, &self.latest.snapshot.grid);
         self.cmd(SolverCommand::SetGeometry(Arc::new(solid)));
     }
 
@@ -202,7 +216,8 @@ impl CfdApp {
         self.ui_area_ratio = self.params.area_ratio;
         self.ui_p0_mpa = self.params.p0_pa / 1e6;
         let wall = conical_contour(self.params.area_ratio);
-        self.editor.set_domain(self.params.lz_rt, self.params.lr_rt);
+        let (lz, lr) = case::domain(&self.params);
+        self.editor.set_domain(lz, lr);
         self.editor.set_points(wall.clone());
         self.committed_wall = wall;
         self.geometry_custom = false;
@@ -210,6 +225,71 @@ impl CfdApp {
         let _ = self.tx.send(UiCommand::Rebuild(Box::new(setup)));
         self.relock_pending = true;
         self.canvas.request_fit(); // the domain just changed size
+    }
+
+    /// Plume length control (grid-grading work order, item 3): Compact /
+    /// Standard / Long with an estimated time to steady state per option.
+    /// Switching rebuilds the solver on the re-graded grid (the domain
+    /// changes, so the field restarts).
+    fn plume_selector(&mut self, ui: &mut egui::Ui) {
+        // Refresh the estimates at ~1 Hz: each one re-runs the grading and
+        // rasterization for its candidate domain.
+        let stale = match self.plume_est {
+            None => true,
+            Some((_, gen)) => self.frame_gen.saturating_sub(gen) > 60,
+        };
+        if stale {
+            let measured = (self.latest.steps_per_sec > 1.0).then(|| {
+                (self.latest.steps_per_sec, self.latest.snapshot.grid.len())
+            });
+            let mut est = [0.0f64; 3];
+            for (k, opt) in PlumeLength::ALL.iter().enumerate() {
+                est[k] = case::estimate_steady_seconds(
+                    &self.params, *opt, &self.committed_wall, measured,
+                );
+            }
+            self.plume_est = Some((est, self.frame_gen));
+        }
+        let est = self.plume_est.map(|(e, _)| e).unwrap_or_default();
+        let mut clicked: Option<PlumeLength> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Plume");
+            for (k, opt) in PlumeLength::ALL.iter().enumerate() {
+                let label = format!("{} · ~{}", opt.label(), fmt_duration(est[k]));
+                let tip = match opt {
+                    PlumeLength::Compact => "The historic domain: Mach disk plus half a shock cell.",
+                    PlumeLength::Standard => "~20 exit radii of plume: Mach disk plus ~2 shock cells.",
+                    PlumeLength::Long => "~40 exit radii of plume: 4-5 shock cells.",
+                };
+                let r = ui
+                    .selectable_label(self.params.plume == *opt, label)
+                    .on_hover_text(format!(
+                        "{tip}\nEstimated time to visual steady state on this machine. \
+                         Switching re-grades the grid and restarts the field."
+                    ));
+                if r.clicked() && self.params.plume != *opt {
+                    clicked = Some(*opt);
+                }
+            }
+        });
+        ui.label(
+            RichText::new(
+                "graded grid: base cells across the geometry, 1.05 growth beyond \
+                 — dt is unchanged, only the tail cells are added",
+            )
+            .weak()
+            .small(),
+        );
+        if let Some(opt) = clicked {
+            self.params.plume = opt;
+            self.plume_est = None;
+            let (lz, lr) = case::domain(&self.params);
+            self.editor.set_domain(lz, lr);
+            let setup = make_setup(&self.params, &self.committed_wall);
+            let _ = self.tx.send(UiCommand::Rebuild(Box::new(setup)));
+            self.relock_pending = true;
+            self.canvas.request_fit();
+        }
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -405,15 +485,21 @@ impl CfdApp {
              for the propellant class, and every readout inherits that \
              approximation.",
         );
-        let g = case::grid(&self.params);
+        // Domain and cell counts from the frame's own grid — the truth about
+        // what is being solved, including the graded plume tail.
+        let g = &self.latest.snapshot.grid;
         ui.label(
             RichText::new(format!(
-                "domain {:.0} × {:.0} r_t · {} × {} cells",
-                self.params.lz_rt, self.params.lr_rt, g.nz, g.nr
+                "domain {:.0} × {:.0} r_t · {} × {} cells (graded)",
+                g.lz(),
+                g.lr(),
+                g.nz,
+                g.nr
             ))
             .weak()
             .small(),
         );
+        self.plume_selector(ui);
     }
 
     fn operating_point(&mut self, ui: &mut egui::Ui) {
@@ -934,6 +1020,16 @@ fn fmt_or_dash(v: f64, unit: &str) -> String {
         }
     } else {
         "—".into()
+    }
+}
+
+fn fmt_duration(secs: f64) -> String {
+    if !secs.is_finite() || secs <= 0.0 {
+        "—".into()
+    } else if secs < 90.0 {
+        format!("{secs:.0} s")
+    } else {
+        format!("{:.1} min", secs / 60.0)
     }
 }
 

@@ -41,7 +41,11 @@ exactly this — constant, both docs, and T1–T8 re-run with floors = 0.
 ## Conventions that cause silent bugs if broken
 
 - Row-major, z contiguous: `idx = ir*nz + iz`. Use `Grid::idx`, never open-code it.
-- Cell centres at `r = (ir + 0.5)*dr`. Never zero. Never change this.
+- The grid is a tensor product of arbitrary cell-edge lists (graded or uniform —
+  see docs/work-orders/grid-grading.md). The lower face of row 0 is at `r = 0`;
+  `r_center` (arithmetic mean of face radii) is never zero. Reconstruction uses
+  `r_centroid_g`; the p/r balance uses face pressures and no cell radius at all.
+  Never index-scale a coordinate (`i*dz`): go through `Grid`'s accessors.
 - Ghost cells are private to `cfd-core`. Every array crossing a crate boundary is
   exactly `grid.len()` long, interior only.
 - All solver state is non-dimensional, chamber-referenced. `R = 1`, `p = rho*T`,

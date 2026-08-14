@@ -1,4 +1,4 @@
-//! Pure, stateless flux and reconstruction kernels. **Frozen.**
+//! Pure, stateless flux and reconstruction kernels.
 //!
 //! These live here, not in the solver crate, so both solver sessions share a
 //! compiled artifact rather than an agreement about behaviour. Contracts by
@@ -7,6 +7,9 @@
 //! Everything operates on `Prim = [rho, u_n, u_t, p]` rotated so the face
 //! normal is +n. `hllc_flux`/`hll_flux` return a `Cons` in that same rotated
 //! frame: `[mass, n-momentum, t-momentum, energy]`. The caller rotates back.
+//! The `_p` variants additionally return the interface pressure (the pressure
+//! of the state the Riemann solution samples at the face) — the axisymmetric
+//! source discretization needs it (docs/physics-reference.md §1).
 
 use crate::{Cons, Limiter, Prim, Real, Reconstruction};
 
@@ -42,11 +45,13 @@ fn analytic_flux(w: Prim, gamma: Real) -> Cons {
     [rho * un, rho * un * un + p, rho * un * ut, un * (e + p)]
 }
 
-/// Toro's S_M formulation with Davis wave-speed estimates. Direction-agnostic:
-/// caller rotates so the face normal is +n. Returns Cons in the SAME rotated
-/// frame. Resolves an isolated contact exactly — that property is what keeps
-/// the plume boundary sharp, and it is what the Sod-star-state test asserts.
-pub fn hllc_flux(ql: Prim, qr: Prim, gamma: Real) -> Cons {
+/// Toro's S_M formulation with Davis wave-speed estimates, plus the interface
+/// pressure: p_L / p_R when the face is supersonic left/right, the star
+/// pressure otherwise. Direction-agnostic: caller rotates so the face normal
+/// is +n. Returns Cons in the SAME rotated frame. Resolves an isolated
+/// contact exactly — that property is what keeps the plume boundary sharp,
+/// and it is what the Sod-star-state test asserts.
+pub fn hllc_flux_p(ql: Prim, qr: Prim, gamma: Real) -> (Cons, Real) {
     let [rl, ul, vl, pl] = ql;
     let [rr, ur, vr, pr] = qr;
     let al = sound_speed(ql, gamma);
@@ -56,8 +61,8 @@ pub fn hllc_flux(ql: Prim, qr: Prim, gamma: Real) -> Cons {
     let sl = (ul - al).min(ur - ar);
     let sr = (ul + al).max(ur + ar);
 
-    if sl >= 0.0 { return analytic_flux(ql, gamma); }
-    if sr <= 0.0 { return analytic_flux(qr, gamma); }
+    if sl >= 0.0 { return (analytic_flux(ql, gamma), pl); }
+    if sr <= 0.0 { return (analytic_flux(qr, gamma), pr); }
 
     // Contact/star speed, Toro (10.37).
     let ml = rl * (sl - ul); // rho_L * (S_L - u_L), negative
@@ -65,67 +70,123 @@ pub fn hllc_flux(ql: Prim, qr: Prim, gamma: Real) -> Cons {
     let sm = (pr - pl + ul * ml - ur * mr) / (ml - mr);
 
     if sm >= 0.0 {
+        let ps = (pl + ml * (sm - ul)).max(0.0); // star pressure, left algebra
         let el = pl / (gamma - 1.0) + 0.5 * rl * (ul * ul + vl * vl);
         let rs = ml / (sl - sm); // star density
         let es = rs * (el / rl + (sm - ul) * (sm + pl / ml));
         let us = [rs, rs * sm, rs * vl, es];
         let ul_c = [rl, rl * ul, rl * vl, el];
         let f = analytic_flux(ql, gamma);
-        [f[0] + sl * (us[0] - ul_c[0]), f[1] + sl * (us[1] - ul_c[1]),
-         f[2] + sl * (us[2] - ul_c[2]), f[3] + sl * (us[3] - ul_c[3])]
+        ([f[0] + sl * (us[0] - ul_c[0]), f[1] + sl * (us[1] - ul_c[1]),
+          f[2] + sl * (us[2] - ul_c[2]), f[3] + sl * (us[3] - ul_c[3])], ps)
     } else {
+        let ps = (pr + mr * (sm - ur)).max(0.0); // star pressure, right algebra
         let er = pr / (gamma - 1.0) + 0.5 * rr * (ur * ur + vr * vr);
         let rs = mr / (sr - sm);
         let es = rs * (er / rr + (sm - ur) * (sm + pr / mr));
         let us = [rs, rs * sm, rs * vr, es];
         let ur_c = [rr, rr * ur, rr * vr, er];
         let f = analytic_flux(qr, gamma);
-        [f[0] + sr * (us[0] - ur_c[0]), f[1] + sr * (us[1] - ur_c[1]),
-         f[2] + sr * (us[2] - ur_c[2]), f[3] + sr * (us[3] - ur_c[3])]
+        ([f[0] + sr * (us[0] - ur_c[0]), f[1] + sr * (us[1] - ur_c[1]),
+          f[2] + sr * (us[2] - ur_c[2]), f[3] + sr * (us[3] - ur_c[3])], ps)
     }
 }
 
-/// Same contract as `hllc_flux`. Used where the carbuncle sensor fires.
-pub fn hll_flux(ql: Prim, qr: Prim, gamma: Real) -> Cons {
+pub fn hllc_flux(ql: Prim, qr: Prim, gamma: Real) -> Cons {
+    hllc_flux_p(ql, qr, gamma).0
+}
+
+/// Same contract as `hllc_flux_p`. Used where the carbuncle sensor fires. The
+/// interface pressure comes from the same S_M star-pressure construction as
+/// HLLC — HLL has no star pressure of its own, and the value only feeds the
+/// axisymmetric source split, never the conservative flux.
+pub fn hll_flux_p(ql: Prim, qr: Prim, gamma: Real) -> (Cons, Real) {
     let al = sound_speed(ql, gamma);
     let ar = sound_speed(qr, gamma);
     let sl = (ql[1] - al).min(qr[1] - ar);
     let sr = (ql[1] + al).max(qr[1] + ar);
 
-    if sl >= 0.0 { return analytic_flux(ql, gamma); }
-    if sr <= 0.0 { return analytic_flux(qr, gamma); }
+    if sl >= 0.0 { return (analytic_flux(ql, gamma), ql[3]); }
+    if sr <= 0.0 { return (analytic_flux(qr, gamma), qr[3]); }
+
+    let ml = ql[0] * (sl - ql[1]);
+    let mr = qr[0] * (sr - qr[1]);
+    let sm = (qr[3] - ql[3] + ql[1] * ml - qr[1] * mr) / (ml - mr);
+    let ps = if sm >= 0.0 {
+        (ql[3] + ml * (sm - ql[1])).max(0.0)
+    } else {
+        (qr[3] + mr * (sm - qr[1])).max(0.0)
+    };
 
     let ul = prim_to_cons(ql, gamma);
     let ur = prim_to_cons(qr, gamma);
     let fl = analytic_flux(ql, gamma);
     let fr = analytic_flux(qr, gamma);
     let inv = 1.0 / (sr - sl);
-    [(sr * fl[0] - sl * fr[0] + sl * sr * (ur[0] - ul[0])) * inv,
-     (sr * fl[1] - sl * fr[1] + sl * sr * (ur[1] - ul[1])) * inv,
-     (sr * fl[2] - sl * fr[2] + sl * sr * (ur[2] - ul[2])) * inv,
-     (sr * fl[3] - sl * fr[3] + sl * sr * (ur[3] - ul[3])) * inv]
+    ([(sr * fl[0] - sl * fr[0] + sl * sr * (ur[0] - ul[0])) * inv,
+      (sr * fl[1] - sl * fr[1] + sl * sr * (ur[1] - ul[1])) * inv,
+      (sr * fl[2] - sl * fr[2] + sl * sr * (ur[2] - ul[2])) * inv,
+      (sr * fl[3] - sl * fr[3] + sl * sr * (ur[3] - ul[3])) * inv], ps)
 }
 
+pub fn hll_flux(ql: Prim, qr: Prim, gamma: Real) -> Cons {
+    hll_flux_p(ql, qr, gamma).0
+}
+
+/// Stencil geometry for the face i+1/2 on a (possibly) non-uniform axis:
+/// positions of the four stencil cells [i-1, i, i+1, i+2] and of the face
+/// itself. Positions are cell centres in z, VOLUME CENTROIDS in r under
+/// axisymmetry (docs/physics-reference.md §1) — the caller supplies whichever
+/// applies; this module only does arithmetic on them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FaceGeom {
+    pub x: [Real; 4],
+    pub xf: Real,
+}
+
+impl FaceGeom {
+    /// Unit-spacing stencil: the uniform-grid case in index coordinates.
+    /// First-order paths may pass this — the geometry is never read there.
+    pub const UNIT: FaceGeom = FaceGeom { x: [-1.5, -0.5, 0.5, 1.5], xf: 0.0 };
+}
+
+/// Limited slope (per unit length) from the two one-sided difference
+/// QUOTIENTS `dm = (W_i - W_{i-1})/hl`, `dp = (W_{i+1} - W_i)/hr` with
+/// `hl = x_i - x_{i-1}`, `hr = x_{i+1} - x_i`.
+///
+/// Non-uniform grids need care (grid-grading work order, items a-b):
+/// - `None` is the full unequal-spacing quadratic-fit gradient INCLUDING the
+///   cell's own value term, `(hl*dp + hr*dm)/(hl + hr)`. The naive average
+///   `(dm + dp)/2` (or plain distance-weighting `(W_{i+1} - W_{i-1})/(hl+hr)`)
+///   is only first order off-uniform and injects O(ratio-1) upwind
+///   dissipation.
+/// - `Minmod` needs no change: the one-sided quotients are already exact for
+///   linear data at any spacing.
+/// - `VanLeer` needs the weighted harmonic form `dm*dp*(hl+hr)/(hl*dm+hr*dp)`
+///   — the classic `2*dm*dp/(dm+dp)` is first order off-uniform.
+///
+/// All three reduce exactly to the uniform-grid formulas at hl == hr.
 #[inline]
-fn slope(dm: Real, dp: Real, lim: Limiter) -> Real {
+fn slope(dm: Real, dp: Real, hl: Real, hr: Real, lim: Limiter) -> Real {
     match lim {
-        Limiter::None => 0.5 * (dm + dp),
+        Limiter::None => (hl * dp + hr * dm) / (hl + hr),
         Limiter::Minmod => minmod(dm, dp),
         Limiter::VanLeer => {
-            if dm * dp > 0.0 { 2.0 * dm * dp / (dm + dp) } else { 0.0 }
+            if dm * dp > 0.0 { dm * dp * (hl + hr) / (hl * dm + hr * dp) } else { 0.0 }
         }
     }
 }
 
-/// s = four consecutive cells straddling face i+1/2: [i-1, i, i+1, i+2].
-/// Any true in `solid` drops that side to first order. Returns (left, right)
-/// face states. Reconstruction::FirstOrder returns the cell averages unchanged.
+/// s = four consecutive cells straddling face i+1/2: [i-1, i, i+1, i+2];
+/// `fg` carries their positions and the face position. Any true in `solid`
+/// drops that side to first order. Returns (left, right) face states.
+/// Reconstruction::FirstOrder returns the cell averages unchanged.
 ///
 /// A fluid cell touching a wall becomes piecewise-constant in the wall-normal
 /// direction — that is the entire stencil degradation. See
 /// docs/physics-reference.md §3.
 pub fn muscl_face_states(
-    s: [Prim; 4], solid: [bool; 4], recon: Reconstruction, lim: Limiter,
+    s: [Prim; 4], solid: [bool; 4], fg: &FaceGeom, recon: Reconstruction, lim: Limiter,
 ) -> (Prim, Prim) {
     if recon == Reconstruction::FirstOrder {
         return (s[1], s[2]);
@@ -134,12 +195,22 @@ pub fn muscl_face_states(
     let mut right = s[2];
     let l_solid = solid[0] || solid[2];
     let r_solid = solid[1] || solid[3];
+    // Left cell i: hl = x_i - x_{i-1}, hr = x_{i+1} - x_i, extrapolate by
+    // (xf - x_i). Right cell i+1 mirrors with its own spacings; the face sits
+    // below its centre, so the same `+ slope * (xf - x)` form subtracts.
+    let (l_hl, l_hr) = (fg.x[1] - fg.x[0], fg.x[2] - fg.x[1]);
+    let (r_hl, r_hr) = (fg.x[2] - fg.x[1], fg.x[3] - fg.x[2]);
+    let (l_d, r_d) = (fg.xf - fg.x[1], fg.xf - fg.x[2]);
     for k in 0..4 {
         if !l_solid {
-            left[k] += 0.5 * slope(s[1][k] - s[0][k], s[2][k] - s[1][k], lim);
+            let dm = (s[1][k] - s[0][k]) / l_hl;
+            let dp = (s[2][k] - s[1][k]) / l_hr;
+            left[k] += slope(dm, dp, l_hl, l_hr, lim) * l_d;
         }
         if !r_solid {
-            right[k] -= 0.5 * slope(s[2][k] - s[1][k], s[3][k] - s[2][k], lim);
+            let dm = (s[2][k] - s[1][k]) / r_hl;
+            let dp = (s[3][k] - s[2][k]) / r_hr;
+            right[k] += slope(dm, dp, r_hl, r_hr, lim) * r_d;
         }
     }
     (left, right)
@@ -206,13 +277,14 @@ mod tests {
     /// hllc_flux across the Sod interface — the contact discontinuity between
     /// the two exact star states — reproduces the exact star state: HLLC's
     /// contact resolution must return exactly the upwind analytic flux
-    /// rho*_L·u*, rho*_L·u*² + p*, u*(E*+p*).
+    /// rho*_L·u*, rho*_L·u*² + p*, u*(E*+p*). The interface pressure must be
+    /// the star pressure.
     #[test]
     fn hllc_resolves_sod_star_contact_exactly() {
         let g: Real = 1.4;
         let ql: Prim = [RHO_STAR_L as Real, U_STAR as Real, 0.0, P_STAR as Real];
         let qr: Prim = [RHO_STAR_R as Real, U_STAR as Real, 0.0, P_STAR as Real];
-        let f = hllc_flux(ql, qr, g);
+        let (f, ps) = hllc_flux_p(ql, qr, g);
         // u* > 0, so the exact interface flux is the analytic flux of the
         // left star state.
         let e = P_STAR / 0.4 + 0.5 * RHO_STAR_L * U_STAR * U_STAR;
@@ -224,6 +296,7 @@ mod tests {
             assert!((f[k] as f64 - expect[k]).abs() <= 1e-5 * expect[k].abs().max(1.0),
                     "component {k}: got {}, want {}", f[k], expect[k]);
         }
+        assert!((ps as f64 - P_STAR).abs() <= 1e-5, "interface pressure {ps}");
     }
 
     #[test]
@@ -231,10 +304,12 @@ mod tests {
         let g: Real = 1.4;
         for q in [[1.0, 0.0, 0.0, 1.0], [0.7, 2.0, -0.3, 0.4], [2.0, -1.5, 0.2, 3.0]] {
             let fa = analytic_flux(q, g);
-            for f in [hllc_flux(q, q, g), hll_flux(q, q, g)] {
+            for (f, ps) in [hllc_flux_p(q, q, g), hll_flux_p(q, q, g)] {
                 for k in 0..4 {
                     assert!((f[k] - fa[k]).abs() <= 1e-6 * fa[k].abs().max(1.0));
                 }
+                // Identical states: the interface pressure is the state's own.
+                assert!((ps - q[3]).abs() <= 1e-6 * q[3], "p_hat = {ps} vs {}", q[3]);
             }
         }
     }
@@ -244,9 +319,10 @@ mod tests {
         let g: Real = 1.4;
         let ql: Prim = [1.0, 3.0, 0.1, 1.0]; // M ~ 2.5 rightward
         let qr: Prim = [0.5, 3.0, 0.0, 0.5];
-        let f = hllc_flux(ql, qr, g);
+        let (f, ps) = hllc_flux_p(ql, qr, g);
         let fa = analytic_flux(ql, g);
         for k in 0..4 { assert_eq!(f[k], fa[k]); }
+        assert_eq!(ps, ql[3]);
     }
 
     #[test]
@@ -257,7 +333,8 @@ mod tests {
             for (i, c) in s.iter_mut().enumerate() {
                 for k in 0..4 { c[k] = 1.0 + 0.25 * i as Real + 0.5 * k as Real; }
             }
-            let (l, r) = muscl_face_states(s, [false; 4], Reconstruction::Muscl, lim);
+            let (l, r) =
+                muscl_face_states(s, [false; 4], &FaceGeom::UNIT, Reconstruction::Muscl, lim);
             for k in 0..4 {
                 let face = 0.5 * (s[1][k] + s[2][k]);
                 assert_eq!(l[k], face, "{lim:?} left k={k}");
@@ -266,21 +343,59 @@ mod tests {
         }
     }
 
+    /// The non-uniform guard (work-order items a-b): on a graded stencil a
+    /// linear field must still reconstruct exactly under every limiter —
+    /// that is precisely the property the naive uniform-weight formulas lose.
+    #[test]
+    fn muscl_reproduces_linear_field_exactly_on_graded_stencil() {
+        // Growth-ratio-1.5 spacing, exactly representable positions.
+        let fg = FaceGeom { x: [0.0, 1.0, 2.5, 4.75], xf: 1.75 };
+        let slope_true: Real = 0.5;
+        for lim in [Limiter::Minmod, Limiter::VanLeer, Limiter::None] {
+            let mut s = [[0.0 as Real; 4]; 4];
+            for (i, c) in s.iter_mut().enumerate() {
+                for k in 0..4 { c[k] = 2.0 + slope_true * fg.x[i] + 0.25 * k as Real; }
+            }
+            let (l, r) = muscl_face_states(s, [false; 4], &fg, Reconstruction::Muscl, lim);
+            for k in 0..4 {
+                let face = 2.0 + slope_true * fg.xf + 0.25 * k as Real;
+                assert!((l[k] - face).abs() <= 1e-6, "{lim:?} left k={k}: {} vs {face}", l[k]);
+                assert!((r[k] - face).abs() <= 1e-6, "{lim:?} right k={k}: {} vs {face}", r[k]);
+            }
+        }
+    }
+
+    /// The unlimited slope must be the quadratic-fit gradient on non-uniform
+    /// spacing: exact for parabolas at the cell's own point. The naive
+    /// (dm+dp)/2 average fails this by O(hr - hl).
+    #[test]
+    fn unlimited_slope_is_second_order_on_graded_stencil() {
+        let (hl, hr) = (1.0 as Real, 2.0 as Real);
+        let x = [-1.0, 0.0, 2.0]; // spacings hl, hr around the centre cell
+        let f = |x: Real| 3.0 + 2.0 * x + 5.0 * x * x; // f'(0) = 2
+        let dm = (f(x[1]) - f(x[0])) / hl;
+        let dp = (f(x[2]) - f(x[1])) / hr;
+        let s = super::slope(dm, dp, hl, hr, Limiter::None);
+        assert!((s - 2.0).abs() <= 1e-4, "quadratic-fit slope {s} vs exact 2");
+        let naive = 0.5 * (dm + dp);
+        assert!((naive - 2.0).abs() > 1.0, "naive average {naive} should be badly off");
+    }
+
     #[test]
     fn muscl_degrades_to_first_order_at_walls() {
         let s = [[1.0, 0.0, 0.0, 1.0], [2.0, 1.0, 0.0, 2.0],
                  [3.0, 2.0, 0.0, 3.0], [4.0, 3.0, 0.0, 4.0]];
         // Solid at i-1: the left state must be the bare cell average.
-        let (l, _) = muscl_face_states(s, [true, false, false, false],
+        let (l, _) = muscl_face_states(s, [true, false, false, false], &FaceGeom::UNIT,
                                        Reconstruction::Muscl, Limiter::Minmod);
         assert_eq!(l, s[1]);
         // Solid at i+2: the right state must be the bare cell average.
-        let (_, r) = muscl_face_states(s, [false, false, false, true],
+        let (_, r) = muscl_face_states(s, [false, false, false, true], &FaceGeom::UNIT,
                                        Reconstruction::Muscl, Limiter::Minmod);
         assert_eq!(r, s[2]);
         // FirstOrder returns cell averages regardless.
-        let (l, r) = muscl_face_states(s, [false; 4], Reconstruction::FirstOrder,
-                                       Limiter::Minmod);
+        let (l, r) = muscl_face_states(s, [false; 4], &FaceGeom::UNIT,
+                                       Reconstruction::FirstOrder, Limiter::Minmod);
         assert_eq!(l, s[1]);
         assert_eq!(r, s[2]);
     }

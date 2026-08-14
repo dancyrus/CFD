@@ -14,7 +14,7 @@ use eframe::egui::{
     Vec2,
 };
 
-use cfd_contract::{FieldKind, Snapshot};
+use cfd_contract::{FieldKind, Grid, Snapshot};
 
 use crate::colormap::{lut_for, SOLID_RGBA};
 use crate::editor::EditorBackend;
@@ -93,6 +93,13 @@ pub struct Canvas {
     uploaded: Option<UploadKey>,
     drag_point: Option<usize>,
     hover_point: Option<usize>,
+    /// Display-resample LUTs for graded grids: the texture is uniform in
+    /// WORLD coordinates (so the image is geometrically true), each texel
+    /// gathering its containing cell. Rebuilt when the grid changes; on a
+    /// uniform grid the mapping is the identity (one texel per cell).
+    lut_grid: Option<Grid>,
+    lut_cols: Vec<u32>,
+    lut_rows: Vec<u32>,
 }
 
 impl Canvas {
@@ -104,7 +111,35 @@ impl Canvas {
             uploaded: None,
             drag_point: None,
             hover_point: None,
+            lut_grid: None,
+            lut_cols: Vec::new(),
+            lut_rows: Vec::new(),
         }
+    }
+
+    /// (nx, ny) of the display image; refreshes the cell LUTs if needed.
+    fn ensure_luts(&mut self, g: &Grid) -> (usize, usize) {
+        if self.lut_grid.as_ref() != Some(g) {
+            let (nx, ny) = if g.is_uniform() {
+                (g.nz, g.nr) // identity: one texel per cell
+            } else {
+                // ~1 texel per finest cell, capped to keep uploads bounded.
+                (
+                    ((g.lz() / g.dz_min() as f64).ceil() as usize).clamp(g.nz, 2048),
+                    ((g.lr() / g.dr_min() as f64).ceil() as usize).clamp(g.nr, 1024),
+                )
+            };
+            let lz = g.lz();
+            let lr = g.lr();
+            self.lut_cols = (0..nx)
+                .map(|x| g.z_cell_at((x as f64 + 0.5) * lz / nx as f64) as u32)
+                .collect();
+            self.lut_rows = (0..ny)
+                .map(|y| g.r_cell_at((y as f64 + 0.5) * lr / ny as f64) as u32)
+                .collect();
+            self.lut_grid = Some(g.clone());
+        }
+        (self.lut_cols.len(), self.lut_rows.len())
     }
 
     pub fn request_fit(&mut self) {
@@ -128,8 +163,8 @@ impl Canvas {
         let mut out = CanvasOutput::default();
         // Domain extents come from the snapshot's own grid: presets resize
         // the domain, and the frame is the truth about what is being solved.
-        let g = frame.snapshot.grid;
-        let (lz, lr) = (g.nz as f64 * g.dz as f64, g.nr as f64 * g.dr as f64);
+        let g = frame.snapshot.grid.clone();
+        let (lz, lr) = (g.lz(), g.lr());
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         let mut view = *self.view.get_or_insert_with(|| View::fit(rect, lz, lr));
 
@@ -281,8 +316,8 @@ impl Canvas {
             let w = view.s2w(rect, pos);
             let (z, r) = (w[0], w[1].abs());
             if (0.0..lz).contains(&z) && r < lr {
-                let iz = ((z / g.dz as f64) as usize).min(g.nz - 1);
-                let ir = ((r / g.dr as f64) as usize).min(g.nr - 1);
+                let iz = g.z_cell_at(z);
+                let ir = g.r_cell_at(r);
                 let solid = frame.snapshot.solid.is_solid(g.idx(iz, ir));
                 out.hover = Some(HoverInfo {
                     z_nd: z,
@@ -305,8 +340,11 @@ impl Canvas {
         range: (f32, f32),
         smooth: bool,
     ) {
-        let g = snap.grid;
-        let (nx, ny) = (g.nz, g.nr);
+        let g = snap.grid.clone();
+        // Uniform-in-world display texels gathered through the cell LUTs: a
+        // graded cell occupies exactly its world extent on screen (a plain
+        // one-texel-per-cell image would squash the graded tail).
+        let (nx, ny) = self.ensure_luts(&g);
         self.rgba.resize(nx * ny * 4, 0);
         let lut = lut_for(field);
         let data = snap.field(field);
@@ -314,14 +352,16 @@ impl Canvas {
         let (lo, hi) = range;
         let inv = 255.0 / (hi - lo).max(1e-12);
         for j in 0..ny {
-            let ir = ny - 1 - j; // image row 0 is the largest r; only cfd-ui flips
-            let src = &data[ir * nx..(ir + 1) * nx];
+            // Image row 0 is the largest r; only cfd-ui flips.
+            let ir = self.lut_rows[ny - 1 - j] as usize;
+            let src = &data[ir * g.nz..(ir + 1) * g.nz];
             let row = &mut self.rgba[j * nx * 4..(j + 1) * nx * 4];
             for i in 0..nx {
-                let rgba = if solid.is_solid(ir * nx + i) {
+                let iz = self.lut_cols[i] as usize;
+                let rgba = if solid.is_solid(ir * g.nz + iz) {
                     SOLID_RGBA
                 } else {
-                    let k = ((src[i] - lo) * inv).clamp(0.0, 255.0) as usize;
+                    let k = ((src[iz] - lo) * inv).clamp(0.0, 255.0) as usize;
                     lut[k]
                 };
                 row[4 * i..4 * i + 4].copy_from_slice(&rgba);

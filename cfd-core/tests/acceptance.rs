@@ -43,7 +43,7 @@ const SHOCK_SPEED: f64 = 1.7521557320;
 #[ignore = "needs kernel.rs + physics.rs (sessions A and B)"]
 fn t1_freestream() {
     let gamma = 1.4f64;
-    let grid = Grid { nz: 64, nr: 8, dz: 0.05, dr: 0.05 };
+    let grid = Grid::uniform(64, 8, 0.05, 0.05);
     let (rho, u, p) = (1.0f64, 2.0f64, 1.0f64);
     // Stagnation state of the stream: T0 = T*(1 + (g-1)/2 M^2), isentropic p0.
     let t = p / rho;
@@ -51,8 +51,8 @@ fn t1_freestream() {
     let t0 = t * (1.0 + 0.5 * (gamma - 1.0) * m2);
     let p0 = p * (t0 / t).powf(gamma / (gamma - 1.0));
     let setup = SolveSetup {
-        grid,
-        solid: Arc::new(SolidField::empty(grid)),
+        grid: grid.clone(),
+        solid: Arc::new(SolidField::empty(grid.clone())),
         gas: GasModel { gamma: gamma as f32, r_specific_si: 287.0 },
         chamber: Chamber { p0: p0 as f32, t0: t0 as f32 },
         ambient: Ambient { p: p as f32, t: t as f32 },
@@ -111,15 +111,15 @@ fn sod_exact_rho(x: f64, t: f64) -> f64 {
 #[ignore = "needs kernel.rs + physics.rs (sessions A and B)"]
 fn t4_sod() {
     let n = 200usize;
-    let grid = Grid { nz: n, nr: 2, dz: 1.0 / n as f32, dr: 1.0 / n as f32 };
+    let grid = Grid::uniform(n, 2, 1.0 / n as f32, 1.0 / n as f32);
     // Row 1 is solid: the strip is one fluid cell tall, radially inert.
     // (This is why Geometry::Planar and the grid types must allow it.)
-    let mut solid = SolidField::empty(grid);
+    let mut solid = SolidField::empty(grid.clone());
     for iz in 0..n { solid.fraction[grid.idx(iz, 1)] = 1.0; }
     // Sod-left (1, 0, 1) at rest IS the chamber state, so the stagnation
     // inlet reproduces it exactly; the right state is ambient at p = 0.1.
     let setup = SolveSetup {
-        grid,
+        grid: grid.clone(),
         solid: Arc::new(solid),
         gas: GasModel { gamma: 1.4, r_specific_si: 287.0 },
         chamber: Chamber { p0: 1.0, t0: 1.0 },
@@ -145,14 +145,14 @@ fn t4_sod() {
     for iz in 0..n {
         let x = (iz as f64 + 0.5) / n as f64;
         let rho = snap.sample(FieldKind::Density, iz, 0) as f64;
-        l1 += (rho - sod_exact_rho(x, t)).abs() * grid.dz as f64;
+        l1 += (rho - sod_exact_rho(x, t)).abs() * grid.dz(0) as f64;
         rho_max = rho_max.max(rho);
         rv_max = rv_max.max((rho * snap.sample(FieldKind::VelocityR, iz, 0) as f64).abs());
         if rho > mid { shock_x = x; } // last cell still above the mid-density
     }
     let shock_exact = 0.5 + SHOCK_SPEED * t;
     assert!(l1 <= 6.0e-3, "L1(rho) = {l1:.4e} (2nd order: 2.4-4.1e-3, 1st: 1.32e-2)");
-    assert!((shock_x - shock_exact).abs() <= 1.5 * grid.dz as f64,
+    assert!((shock_x - shock_exact).abs() <= 1.5 * grid.dz(0) as f64,
             "shock at {shock_x}, exact {shock_exact}");
     assert!(rho_max <= 1.001, "max rho = {rho_max}");
     assert!(rv_max <= 1e-8, "max|rho*v| = {rv_max} — transverse flux leakage");
@@ -166,17 +166,17 @@ fn t4_sod() {
 #[test]
 #[ignore = "needs kernel.rs + physics.rs (sessions A and B)"]
 fn well_balanced() {
-    let grid = Grid { nz: 32, nr: 32, dz: 0.1, dr: 0.1 };
+    let grid = Grid::uniform(32, 32, 0.1, 0.1);
     // Solid walls on both z ends and the outer radius: no open boundaries,
     // so any drift is the interior discretization's own.
-    let mut solid = SolidField::empty(grid);
+    let mut solid = SolidField::empty(grid.clone());
     for ir in 0..grid.nr {
         solid.fraction[grid.idx(0, ir)] = 1.0;
         solid.fraction[grid.idx(grid.nz - 1, ir)] = 1.0;
     }
     for iz in 0..grid.nz { solid.fraction[grid.idx(iz, grid.nr - 1)] = 1.0; }
     let setup = SolveSetup {
-        grid,
+        grid: grid.clone(),
         solid: Arc::new(solid),
         gas: GasModel { gamma: 1.4, r_specific_si: 287.0 },
         chamber: Chamber { p0: 1.0, t0: 1.0 },
@@ -203,4 +203,159 @@ fn well_balanced() {
 
 fn solid_at(snap: &cfd_contract::Snapshot, iz: usize, ir: usize) -> bool {
     snap.solid.is_solid(snap.grid.idx(iz, ir))
+}
+
+// ---------------------------------------------------------------------------
+// Graded-grid guards (grid-grading work order, item d). Free-stream
+// preservation is not structurally at risk on a tensor-product grid — that
+// concern belongs to mapped curvilinear grids — but T1 on a deliberately
+// graded grid is cheap and pins it down. The well-balance guard is the one
+// with teeth: the face-pressure source form must cancel bit-exactly at ANY
+// radial spacing.
+
+/// Geometric edge list: `n` cells over [0, len], each `ratio` times the last.
+fn graded_edges(n: usize, len: f64, ratio: f64) -> Vec<f64> {
+    let mut w = 1.0;
+    let mut widths = Vec::with_capacity(n);
+    for _ in 0..n {
+        widths.push(w);
+        w *= ratio;
+    }
+    let sum: f64 = widths.iter().sum();
+    let mut edges = Vec::with_capacity(n + 1);
+    let mut acc = 0.0;
+    edges.push(0.0);
+    for w in widths {
+        acc += w * len / sum;
+        edges.push(acc);
+    }
+    edges[n] = len; // exact endpoint
+    edges
+}
+
+/// T1 on a deliberately graded grid: growth ratio 1.15 in z, 1.2 in r. A
+/// naive non-uniform stencil injects O(ratio-1) upwind dissipation and fails
+/// the 1e-5 uniformity band; the weighted stencil passes it identically.
+#[test]
+#[ignore = "ladder: run with --include-ignored"]
+fn t1_freestream_graded() {
+    let gamma = 1.4f64;
+    let grid = Grid::from_edges(graded_edges(64, 3.2, 1.15), graded_edges(12, 0.6, 1.2)).unwrap();
+    let (rho, u, p) = (1.0f64, 2.0f64, 1.0f64);
+    let t = p / rho;
+    let m2 = u * u / (gamma * t);
+    let t0 = t * (1.0 + 0.5 * (gamma - 1.0) * m2);
+    let p0 = p * (t0 / t).powf(gamma / (gamma - 1.0));
+    let setup = SolveSetup {
+        grid: grid.clone(),
+        solid: Arc::new(SolidField::empty(grid.clone())),
+        gas: GasModel { gamma: gamma as f32, r_specific_si: 287.0 },
+        chamber: Chamber { p0: p0 as f32, t0: t0 as f32 },
+        ambient: Ambient { p: p as f32, t: t as f32 },
+        numerics: numerics_for_tests(Geometry::Planar),
+        refs: identity_refs(),
+    };
+    let mut s = EulerSolver::new(setup).unwrap();
+    s.set_initial(|_, _| [rho as f32, u as f32, 0.0, p as f32]);
+    for _ in 0..200 { s.step().unwrap(); }
+    let snap = s.snapshot();
+    let (mut e_rho, mut e_u, mut e_p, mut e_rv) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for ir in 0..grid.nr {
+        for iz in 0..grid.nz {
+            let d = snap.sample(FieldKind::Density, iz, ir) as f64;
+            e_rho = e_rho.max((d - rho).abs());
+            e_u = e_u.max((snap.sample(FieldKind::VelocityZ, iz, ir) as f64 - u).abs());
+            e_p = e_p.max((snap.sample(FieldKind::Pressure, iz, ir) as f64 - p).abs());
+            e_rv = e_rv.max((d * snap.sample(FieldKind::VelocityR, iz, ir) as f64).abs());
+        }
+    }
+    println!("T1-graded: |rho-1| {e_rho:.2e}, |u-2| {e_u:.2e}, |p-1| {e_p:.2e}, |rho*v| {e_rv:.2e}");
+    assert!(e_rho <= 1e-5, "max|rho-1| = {e_rho}");
+    assert!(e_u <= 1e-5, "max|u-2| = {e_u}");
+    assert!(e_p <= 1e-5, "max|p-1| = {e_p}");
+    assert!(e_rv <= 1e-6, "max|rho*v| = {e_rv}");
+}
+
+/// Well-balanced on a graded radial grid: quiescent uniform-pressure gas in
+/// axisymmetric mode must stay at machine zero at ANY radial spacing. This is
+/// what the face-pressure source form buys (work-order item c): the p/r
+/// balance never picks a cell radius, so there is nothing to mis-pick.
+#[test]
+#[ignore = "ladder: run with --include-ignored"]
+fn well_balanced_graded() {
+    let grid = Grid::from_edges(graded_edges(32, 3.2, 1.1), graded_edges(32, 3.2, 1.2)).unwrap();
+    let mut solid = SolidField::empty(grid.clone());
+    for ir in 0..grid.nr {
+        solid.fraction[grid.idx(0, ir)] = 1.0;
+        solid.fraction[grid.idx(grid.nz - 1, ir)] = 1.0;
+    }
+    for iz in 0..grid.nz { solid.fraction[grid.idx(iz, grid.nr - 1)] = 1.0; }
+    let setup = SolveSetup {
+        grid: grid.clone(),
+        solid: Arc::new(solid),
+        gas: GasModel { gamma: 1.4, r_specific_si: 287.0 },
+        chamber: Chamber { p0: 1.0, t0: 1.0 },
+        ambient: Ambient { p: 1.0, t: 1.0 },
+        numerics: numerics_for_tests(Geometry::Axisymmetric),
+        refs: identity_refs(),
+    };
+    let mut s = EulerSolver::new(setup).unwrap();
+    s.set_initial(|_, _| [1.0, 0.0, 0.0, 1.0]);
+    for _ in 0..100 { s.step().unwrap(); }
+    let snap = s.snapshot();
+    let mut err = 0.0f64;
+    for ir in 0..grid.nr {
+        for iz in 0..grid.nz {
+            if solid_at(&snap, iz, ir) { continue; }
+            err = err.max((snap.sample(FieldKind::Density, iz, ir) as f64 - 1.0).abs());
+            err = err.max((snap.sample(FieldKind::Pressure, iz, ir) as f64 - 1.0).abs());
+            err = err.max((snap.sample(FieldKind::VelocityZ, iz, ir) as f64).abs());
+            err = err.max((snap.sample(FieldKind::VelocityR, iz, ir) as f64).abs());
+        }
+    }
+    println!("well-balanced (graded r): max drift {err:.3e}");
+    assert!(err <= 1e-7, "quiescent uniform state drifted by {err:.3e} on the graded grid");
+}
+
+/// Sod on a graded strip: 240 cells growing 1.01 per cell (ratio ~11x across
+/// the domain, comparable mean resolution to the N = 200 uniform T4). The
+/// weighted stencil keeps second-order accuracy; the naive one degrades to
+/// first order (1.3e-2). Recorded and gated below the first-order figure.
+#[test]
+#[ignore = "ladder: run with --include-ignored"]
+fn t4_sod_graded() {
+    let n = 240usize;
+    let grid = Grid::from_edges(graded_edges(n, 1.0, 1.01), vec![0.0, 0.005, 0.01]).unwrap();
+    let mut solid = SolidField::empty(grid.clone());
+    for iz in 0..n { solid.fraction[grid.idx(iz, 1)] = 1.0; }
+    let setup = SolveSetup {
+        grid: grid.clone(),
+        solid: Arc::new(solid),
+        gas: GasModel { gamma: 1.4, r_specific_si: 287.0 },
+        chamber: Chamber { p0: 1.0, t0: 1.0 },
+        ambient: Ambient { p: 0.1, t: 0.8 },
+        numerics: numerics_for_tests(Geometry::Planar),
+        refs: identity_refs(),
+    };
+    let mut s = EulerSolver::new(setup).unwrap();
+    s.set_initial(|iz, _| {
+        let x = grid.z_center(iz);
+        if x < 0.5 { [1.0, 0.0, 0.0, 1.0] } else { [0.125, 0.0, 0.0, 0.1] }
+    });
+    let mut info = s.step().unwrap();
+    while info.time < 0.2 { info = s.step().unwrap(); }
+    let t = info.time;
+    let snap = s.snapshot();
+    let mut l1 = 0.0f64;
+    let mut rv_max = 0.0f64;
+    for iz in 0..n {
+        let x = grid.z_center(iz) as f64;
+        let rho = snap.sample(FieldKind::Density, iz, 0) as f64;
+        l1 += (rho - sod_exact_rho(x, t)).abs() * grid.dz(iz) as f64;
+        rv_max = rv_max.max((rho * snap.sample(FieldKind::VelocityR, iz, 0) as f64).abs());
+    }
+    println!("T4-graded: L1(rho) = {l1:.4e} (uniform 2nd order: 2.4-4.1e-3, 1st: 1.32e-2)");
+    assert!(l1 <= 8.0e-3, "L1(rho) = {l1:.4e} on the graded strip");
+    assert!(rv_max <= 1e-8, "max|rho*v| = {rv_max}");
+    assert_eq!(info.floor_activations, 0);
 }

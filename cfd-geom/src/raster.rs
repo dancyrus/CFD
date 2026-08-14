@@ -54,7 +54,6 @@ fn polygon_area(poly: &[[f64; 2]]) -> f64 {
 /// and is public so closed drawn shapes and the T0 disk test can use it
 /// directly. Vertex order does not matter.
 pub fn rasterize_solid_polygon(poly: &[[f64; 2]], g: &Grid) -> Result<SolidField> {
-    check_grid(g)?;
     if poly.len() < 3 {
         return Err(CfdError::Geometry(format!(
             "polygon needs at least 3 vertices, has {}",
@@ -69,11 +68,13 @@ pub fn rasterize_solid_polygon(poly: &[[f64; 2]], g: &Grid) -> Result<SolidField
         }
     }
 
-    let (dz, dr) = (g.dz as f64, g.dr as f64);
-    let cell_area = dz * dr;
+    let z_edges = g.z_edges();
+    let r_edges = g.r_edges();
     let mut fraction = vec![0.0f32; g.len()];
 
-    // Grid-overlapping part of the polygon bounding box.
+    // Grid-overlapping part of the polygon bounding box. Edge lists are
+    // strictly increasing, so cells come from a binary search — the grid may
+    // be graded and index arithmetic on a single spacing would be wrong.
     let (mut zmin, mut zmax, mut rmin, mut rmax) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
     for p in poly {
         zmin = zmin.min(p[0]);
@@ -81,18 +82,23 @@ pub fn rasterize_solid_polygon(poly: &[[f64; 2]], g: &Grid) -> Result<SolidField
         rmin = rmin.min(p[1]);
         rmax = rmax.max(p[1]);
     }
-    let iz0 = ((zmin / dz).floor().max(0.0) as usize).min(g.nz);
-    let iz1 = ((zmax / dz).ceil().max(0.0) as usize).min(g.nz);
-    let ir0 = ((rmin / dr).floor().max(0.0) as usize).min(g.nr);
-    let ir1 = ((rmax / dr).ceil().max(0.0) as usize).min(g.nr);
+    if zmax <= z_edges[0] || zmin >= z_edges[g.nz] || rmax <= r_edges[0] || rmin >= r_edges[g.nr] {
+        return Ok(SolidField { grid: g.clone(), fraction });
+    }
+    // First cell whose upper edge exceeds the bound; last cell whose lower
+    // edge is below it.
+    let iz0 = z_edges[1..=g.nz].partition_point(|&e| e <= zmin);
+    let iz1 = z_edges[..g.nz].partition_point(|&e| e < zmax);
+    let ir0 = r_edges[1..=g.nr].partition_point(|&e| e <= rmin);
+    let ir1 = r_edges[..g.nr].partition_point(|&e| e < rmax);
 
     let mut strip: Vec<[f64; 2]> = Vec::with_capacity(poly.len() + 4);
     let mut tmp: Vec<[f64; 2]> = Vec::with_capacity(poly.len() + 4);
     let mut cell: Vec<[f64; 2]> = Vec::new();
 
     for iz in iz0..iz1 {
-        let za = iz as f64 * dz;
-        let zb = za + dz;
+        let za = z_edges[iz];
+        let zb = z_edges[iz + 1];
         // Pre-clip the whole polygon to this column's z-strip.
         clip_half(poly, &mut tmp, |p| p[0] - za);
         clip_half(&tmp, &mut strip, |p| zb - p[0]);
@@ -105,20 +111,21 @@ pub fn rasterize_solid_polygon(poly: &[[f64; 2]], g: &Grid) -> Result<SolidField
             prmin = prmin.min(p[1]);
             prmax = prmax.max(p[1]);
         }
-        let jr0 = ((prmin / dr).floor().max(0.0) as usize).clamp(ir0, ir1);
-        let jr1 = (((prmax / dr).ceil().max(0.0) as usize).min(g.nr)).clamp(jr0, ir1);
+        let jr0 = r_edges[1..=g.nr].partition_point(|&e| e <= prmin).clamp(ir0, ir1);
+        let jr1 = r_edges[..g.nr].partition_point(|&e| e < prmax).clamp(jr0, ir1);
         for ir in jr0..jr1 {
-            let ra = ir as f64 * dr;
-            let rb = ra + dr;
+            let ra = r_edges[ir];
+            let rb = r_edges[ir + 1];
             clip_half(&strip, &mut tmp, |p| p[1] - ra);
             clip_half(&tmp, &mut cell, |p| rb - p[1]);
             let a = polygon_area(&cell);
             if a > 0.0 {
+                let cell_area = (zb - za) * (rb - ra);
                 fraction[g.idx(iz, ir)] = ((a / cell_area).clamp(0.0, 1.0)) as f32;
             }
         }
     }
-    Ok(SolidField { grid: *g, fraction })
+    Ok(SolidField { grid: g.clone(), fraction })
 }
 
 /// Rasterize a wall profile (SI metres) into exact solid area fractions on the
@@ -130,14 +137,13 @@ pub fn rasterize_solid_polygon(poly: &[[f64; 2]], g: &Grid) -> Result<SolidField
 /// cannot tell them apart.
 pub fn rasterize(p: &WallProfile, g: &Grid, refs: &RefScales) -> Result<SolidField> {
     p.validate()?;
-    check_grid(g)?;
     if !(refs.l_m.is_finite() && refs.l_m > 0.0) {
         return Err(CfdError::Parameter(format!("RefScales.l_m = {}", refs.l_m)));
     }
     let inv = 1.0 / refs.l_m;
     let mut poly: Vec<[f64; 2]> = p.points.iter().map(|q| [q[0] * inv, q[1] * inv]).collect();
     // Close the solid region above the wall, past the top of the grid.
-    let mut r_top = g.nr as f64 * g.dr as f64;
+    let mut r_top = g.lr();
     for q in &poly {
         r_top = r_top.max(q[1]);
     }
@@ -149,18 +155,8 @@ pub fn rasterize(p: &WallProfile, g: &Grid, refs: &RefScales) -> Result<SolidFie
     rasterize_solid_polygon(&poly, g)
 }
 
-fn check_grid(g: &Grid) -> Result<()> {
-    let ok =
-        g.nz > 0 && g.nr > 0 && g.dz.is_finite() && g.dr.is_finite() && g.dz > 0.0 && g.dr > 0.0;
-    if ok {
-        Ok(())
-    } else {
-        Err(CfdError::Grid(format!(
-            "nz={} nr={} dz={} dr={}",
-            g.nz, g.nr, g.dz, g.dr
-        )))
-    }
-}
+// Grid validity (positive counts, strictly increasing edges) is enforced by
+// `Grid`'s own constructors, so the rasterizer no longer re-checks it.
 
 #[cfg(test)]
 mod tests {
@@ -181,12 +177,7 @@ mod tests {
     /// cut row exactly half solid, rows above fully solid.
     #[test]
     fn flat_wall_gives_exact_half_fraction() {
-        let g = Grid {
-            nz: 8,
-            nr: 8,
-            dz: 1.0,
-            dr: 0.5,
-        };
+        let g = Grid::uniform(8, 8, 1.0, 0.5);
         let l_m = 0.05; // r_t; profile in metres
         let p = WallProfile {
             points: vec![[0.0, 2.25 * l_m], [8.0 * l_m, 2.25 * l_m]],
@@ -208,12 +199,7 @@ mod tests {
     /// area above the line.
     #[test]
     fn sloped_wall_column_sums_are_exact() {
-        let g = Grid {
-            nz: 10,
-            nr: 12,
-            dz: 1.0,
-            dr: 1.0,
-        };
+        let g = Grid::uniform(10, 12, 1.0, 1.0);
         let l_m = 1.0;
         let p = WallProfile {
             points: vec![[0.0, 2.0], [10.0, 7.0]], // r_w(z) = 2 + 0.5 z
@@ -238,12 +224,7 @@ mod tests {
     /// z outside the profile extent is fluid.
     #[test]
     fn beyond_profile_extent_is_fluid() {
-        let g = Grid {
-            nz: 10,
-            nr: 4,
-            dz: 1.0,
-            dr: 1.0,
-        };
+        let g = Grid::uniform(10, 4, 1.0, 1.0);
         let p = WallProfile {
             points: vec![[2.0, 1.5], [6.0, 1.5]],
             throat_index: 0,
@@ -261,19 +242,10 @@ mod tests {
 
     #[test]
     fn degenerate_inputs_are_rejected() {
-        let g = Grid {
-            nz: 0,
-            nr: 4,
-            dz: 1.0,
-            dr: 1.0,
-        };
-        assert!(rasterize_solid_polygon(&[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], &g).is_err());
-        let g = Grid {
-            nz: 4,
-            nr: 4,
-            dz: 1.0,
-            dr: 1.0,
-        };
+        // A zero-cell or non-monotone grid can no longer be constructed at
+        // all — Grid::from_edges rejects it before the rasterizer runs.
+        assert!(Grid::from_edges(vec![0.0], vec![0.0, 1.0]).is_err());
+        let g = Grid::uniform(4, 4, 1.0, 1.0);
         assert!(rasterize_solid_polygon(&[[0.0, 0.0], [1.0, 0.0]], &g).is_err());
         assert!(rasterize_solid_polygon(&[[0.0, 0.0], [1.0, 0.0], [f64::NAN, 1.0]], &g).is_err());
     }

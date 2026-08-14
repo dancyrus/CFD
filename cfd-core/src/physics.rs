@@ -196,8 +196,12 @@ pub fn apply_sponge(u: &mut [Cons], g: &Grid, dt: Real, ambient: &Ambient,
     let rho_a = ambient.p / ambient.t;
     let ua = prim_to_cons([rho_a, 0.0, 0.0, ambient.p], gm);
     let a_amb = (gm * ambient.t).sqrt(); // a² = gamma*p/rho = gamma*T
-    let sigma_max = 12.0 * a_amb / (cells as Real * g.dr); // 1/time
     let ir0 = g.nr - cells;
+    // L_sponge is the PHYSICAL depth of the outer `cells` rows — on a graded
+    // far field those rows are wide, and an index-based depth would misplace
+    // the profile and mis-scale sigma_max.
+    let l_sponge = (g.lr() as Real) - g.r_face(ir0);
+    let sigma_max = 12.0 * a_amb / l_sponge; // 1/time
 
     // Diagnostic (once): the plume reaching the sponge entry means the far
     // field is too small and the damping is corrupting physics.
@@ -217,7 +221,7 @@ pub fn apply_sponge(u: &mut [Cons], g: &Grid, dt: Real, ambient: &Ambient,
     }
 
     for ir in ir0..g.nr {
-        let s = ((ir - ir0) as Real + 0.5) / cells as Real;
+        let s = (g.r_center(ir) - g.r_face(ir0)) / l_sponge;
         // .min(1.0) is a stability guard beyond the reference: an explicit
         // relaxation step must not overshoot past ambient. At CFL 0.4 the
         // coefficient is ~0.2, so the clamp never engages in normal runs.
@@ -279,8 +283,8 @@ fn isentropic_state(m: f64, chamber: &Chamber, g: f64) -> [f64; 3] {
 }
 
 /// Quasi-1D isentropic in the nozzle, ambient elsewhere, blended over 4 cells
-/// at the exit plane. Open radius per column: r_w(i) = sqrt(2*dr*sum_j
-/// (1-frac[i][j])*r_j) — r-weighted, with the square root. If the area has no
+/// at the exit plane. Open radius per column: r_w(i) = sqrt(2*sum_j
+/// (1-frac[i][j])*r_j*dr_j) — r-weighted, with the square root. If the area has no
 /// interior minimum (arbitrary drawn blob), fall back to ambient everywhere;
 /// do not crash.
 pub fn quasi1d_init(u: &mut [Cons], g: &Grid, solid: &SolidField,
@@ -306,10 +310,12 @@ pub fn quasi1d_init(u: &mut [Cons], g: &Grid, solid: &SolidField,
         let mut any_solid = false;
         for ir in 0..g.nr {
             let idx = g.idx(iz, ir);
-            acc += (1.0 - solid.fraction[idx] as f64) * g.r_center(ir) as f64;
+            acc += (1.0 - solid.fraction[idx] as f64)
+                * g.r_center(ir) as f64
+                * g.dr(ir) as f64;
             any_solid |= solid.is_solid(idx);
         }
-        *r_w = (2.0 * g.dr as f64 * acc).sqrt();
+        *r_w = (2.0 * acc).sqrt();
         if any_solid {
             lip = Some(iz);
         }
@@ -444,7 +450,7 @@ pub fn apply_geometry_change(u: &mut [Cons], g: &Grid, old: &SolidField,
             match (old.is_solid(idx), new.is_solid(idx)) {
                 (false, true) => {
                     // fluid -> solid: its mass and energy leave the ledger.
-                    let vol = g.cell_vol(ir);
+                    let vol = g.cell_vol(iz, ir);
                     ledger.mass -= u[gi][0] as f64 * vol;
                     ledger.energy -= u[gi][3] as f64 * vol;
                     // Frozen from now on; ambient keeps primitives finite.
@@ -498,7 +504,7 @@ pub fn apply_geometry_change(u: &mut [Cons], g: &Grid, old: &SolidField,
             let ir = idx / nz;
             u[g.gidx(iz as isize, ir as isize)] = prim_to_cons([rho, 0.0, 0.0, p], gm);
             valid[idx] = true;
-            let vol = g.cell_vol(ir);
+            let vol = g.cell_vol(iz, ir);
             ledger.mass += rho as f64 * vol;
             ledger.energy += (p / (gm - 1.0)) as f64 * vol;
         }
@@ -510,7 +516,7 @@ pub fn apply_geometry_change(u: &mut [Cons], g: &Grid, old: &SolidField,
         let iz = idx % nz;
         let ir = idx / nz;
         u[g.gidx(iz as isize, ir as isize)] = ua;
-        let vol = g.cell_vol(ir);
+        let vol = g.cell_vol(iz, ir);
         ledger.mass += rho_a as f64 * vol;
         ledger.energy += ua[3] as f64 * vol;
     }
@@ -601,7 +607,7 @@ mod tests {
 
     #[test]
     fn ghosts_axis_mirror_negates_radial_momentum() {
-        let g = Grid { nz: 8, nr: 6, dz: 0.1, dr: 0.05 };
+        let g = Grid::uniform(8, 6, 0.1, 0.05);
         let gm = 1.4f32;
         let mut u = filled_grid(&g, |iz, ir| {
             [1.0 + 0.1 * ir as f32, 0.3, 0.2 + 0.05 * iz as f32, 1.0 + 0.02 * iz as f32]
@@ -621,7 +627,7 @@ mod tests {
 
     #[test]
     fn ghosts_inlet_matches_stagnation_construction() {
-        let g = Grid { nz: 8, nr: 4, dz: 0.1, dr: 0.05 };
+        let g = Grid::uniform(8, 4, 0.1, 0.05);
         let gm = 1.4f32;
         let wi: Prim = [0.9, 0.3, 0.05, 0.85];
         let mut u = filled_grid(&g, |_, _| wi, gm);
@@ -652,7 +658,7 @@ mod tests {
         // Interior at the chamber state (1, 0, 0, 1): the BC must hand back
         // (1, 0, 0, 1) to f32 roundoff. This is what makes T4's left state
         // exact at the inlet.
-        let g = Grid { nz: 8, nr: 2, dz: 0.1, dr: 0.05 };
+        let g = Grid::uniform(8, 2, 0.1, 0.05);
         let gm = 1.4f32;
         let mut u = filled_grid(&g, |_, _| [1.0, 0.0, 0.0, 1.0], gm);
         fill_ghosts(&mut u, &g, &no_solid(&g), &gas(), &chamber(),
@@ -665,7 +671,7 @@ mod tests {
 
     #[test]
     fn ghosts_inlet_no_nan_under_reverse_flow() {
-        let g = Grid { nz: 8, nr: 2, dz: 0.1, dr: 0.05 };
+        let g = Grid::uniform(8, 2, 0.1, 0.05);
         let gm = 1.4f32;
         for i in 0..50 {
             let ui = -5.0 + 0.1 * i as f32; // strong reverse flow sweep
@@ -680,7 +686,7 @@ mod tests {
 
     #[test]
     fn ghosts_outflow_supersonic_copies_interior_exactly() {
-        let g = Grid { nz: 8, nr: 4, dz: 0.1, dr: 0.05 };
+        let g = Grid::uniform(8, 4, 0.1, 0.05);
         let gm = 1.4f32;
         let wi: Prim = [0.5, 2.5, 0.3, 0.4]; // a ~ 1.06, u > a
         let mut u = filled_grid(&g, |_, _| wi, gm);
@@ -692,7 +698,7 @@ mod tests {
 
     #[test]
     fn ghosts_outflow_subsonic_imposes_ambient_pressure() {
-        let g = Grid { nz: 8, nr: 4, dz: 0.1, dr: 0.05 };
+        let g = Grid::uniform(8, 4, 0.1, 0.05);
         let gm = 1.4f32;
         let amb = Ambient { p: 0.7, t: 0.9 };
         let wi: Prim = [1.0, 0.3, 0.1, 0.9];
@@ -711,7 +717,7 @@ mod tests {
 
     #[test]
     fn ghosts_farfield_inflow_uses_ambient_reservoir() {
-        let g = Grid { nz: 8, nr: 4, dz: 0.1, dr: 0.05 };
+        let g = Grid::uniform(8, 4, 0.1, 0.05);
         let gm = 1.4f32;
         let amb = ambient();
         // v < 0: entering. Ghost is the ambient reservoir at rest.
@@ -741,7 +747,7 @@ mod tests {
         // Sum of sigma*dr/a over the 24 rows must be ~4: e^-4 = 1.8% one-way
         // transmission, the docs/physics-reference.md §4 target. The per-step
         // form this replaces accumulates only ~0.9.
-        let g = Grid { nz: 4, nr: 30, dz: 0.1, dr: 0.05 };
+        let g = Grid::uniform(4, 30, 0.1, 0.05);
         let gm = 1.4f32;
         let amb = ambient();
         let ua = ambient_cons(&amb, gm);
@@ -768,7 +774,7 @@ mod tests {
             } else {
                 assert!(decrement > prev, "sigma must grow with depth");
                 prev = decrement;
-                total += decrement / dt as f64 * (g.dr as f64 / a_amb);
+                total += decrement / dt as f64 * (g.dr(ir) as f64 / a_amb);
             }
         }
         assert!((total - 4.0).abs() < 0.1, "integrated sponge strength = {total}");
@@ -776,7 +782,7 @@ mod tests {
 
     #[test]
     fn sponge_zero_cells_is_a_no_op() {
-        let g = Grid { nz: 4, nr: 8, dz: 0.1, dr: 0.05 };
+        let g = Grid::uniform(4, 8, 0.1, 0.05);
         let gm = 1.4f32;
         let mut u = filled_grid(&g, |iz, ir| [1.0 + 0.1 * ir as f32, 0.5, 0.2, 1.0 + 0.01 * iz as f32], gm);
         let before = u.clone();
@@ -788,7 +794,7 @@ mod tests {
 
     #[test]
     fn carbuncle_mask_fires_three_cells_around_a_shock_only() {
-        let g = Grid { nz: 30, nr: 3, dz: 0.1, dr: 0.05 };
+        let g = Grid::uniform(30, 3, 0.1, 0.05);
         let mut w = vec![[1.0f32, 2.0, 0.0, 1.0]; g.glen()];
         // Shock-like jump at iz = 10, row 1 only: pressure 1.0 -> 0.5 with
         // DECELERATING axial velocity (the compression gate requires it; a
@@ -809,7 +815,7 @@ mod tests {
 
     #[test]
     fn carbuncle_mask_quiet_on_steep_smooth_expansion() {
-        let g = Grid { nz: 30, nr: 3, dz: 0.1, dr: 0.05 };
+        let g = Grid::uniform(30, 3, 0.1, 0.05);
         let mut w = vec![[1.0f32, 0.5, 0.0, 1.0]; g.glen()];
         // Nozzle-like expansion: over 5 cells p falls by 2x (Omega = 0.5
         // < 0.7 — the old sensor fired) while u RISES. Must stay unmasked.
@@ -827,7 +833,7 @@ mod tests {
 
     #[test]
     fn carbuncle_mask_quiet_on_smooth_pressure() {
-        let g = Grid { nz: 20, nr: 3, dz: 0.1, dr: 0.05 };
+        let g = Grid::uniform(20, 3, 0.1, 0.05);
         let mut w = vec![[1.0f32, 0.0, 0.0, 1.0]; g.glen()];
         // 5% ripple: Omega ~ 0.9 > 0.7 everywhere.
         for ir in -2..(g.nr as isize + 2) {
@@ -878,7 +884,7 @@ mod tests {
     /// Converging-diverging test nozzle: wall row per column, solid above.
     /// r_open(iz) = wall*dr exactly, so area ratios are exact by construction.
     fn cd_nozzle(g: &Grid, wall: impl Fn(usize) -> Option<usize>) -> SolidField {
-        let mut s = SolidField::empty(*g);
+        let mut s = SolidField::empty(g.clone());
         for iz in 0..g.nz {
             if let Some(w) = wall(iz) {
                 for ir in w..g.nr {
@@ -901,7 +907,7 @@ mod tests {
 
     #[test]
     fn quasi1d_fills_a_cd_nozzle_isentropically() {
-        let g = Grid { nz: 60, nr: 24, dz: 0.1, dr: 0.05 };
+        let g = Grid::uniform(60, 24, 0.1, 0.05);
         let gm = 1.4f32;
         let amb = ambient();
         let solid = cd_nozzle(&g, cd_wall);
@@ -948,7 +954,7 @@ mod tests {
 
     #[test]
     fn quasi1d_falls_back_to_ambient_without_interior_throat() {
-        let g = Grid { nz: 60, nr: 24, dz: 0.1, dr: 0.05 };
+        let g = Grid::uniform(60, 24, 0.1, 0.05);
         let gm = 1.4f32;
         let amb = ambient();
         let ua = ambient_cons(&amb, gm);
@@ -964,7 +970,7 @@ mod tests {
             }
         }
         // No geometry at all: also ambient, no crash.
-        let empty = SolidField::empty(g);
+        let empty = SolidField::empty(g.clone());
         let mut u = vec![[0.0f32; 4]; g.glen()];
         quasi1d_init(&mut u, &g, &empty, &gas(), &chamber(), &amb);
         assert_eq!(u[g.gidx(30, 10)], ua);
@@ -982,7 +988,7 @@ mod tests {
                     continue;
                 }
                 let c = u[g.gidx(iz as isize, ir as isize)];
-                let vol = g.cell_vol(ir);
+                let vol = g.cell_vol(iz, ir);
                 mass += c[0] as f64 * vol;
                 energy += c[3] as f64 * vol;
             }
@@ -991,7 +997,7 @@ mod tests {
     }
 
     fn block_solid(g: &Grid, iz0: usize, iz1: usize, ir0: usize, ir1: usize) -> SolidField {
-        let mut s = SolidField::empty(*g);
+        let mut s = SolidField::empty(g.clone());
         for ir in ir0..=ir1 {
             for iz in iz0..=iz1 {
                 s.fraction[g.idx(iz, ir)] = 1.0;
@@ -1002,9 +1008,9 @@ mod tests {
 
     #[test]
     fn geometry_close_books_removed_mass_on_the_ledger() {
-        let g = Grid { nz: 10, nr: 6, dz: 0.1, dr: 0.05 };
+        let g = Grid::uniform(10, 6, 0.1, 0.05);
         let gm = 1.4f32;
-        let old = SolidField::empty(g);
+        let old = SolidField::empty(g.clone());
         let new = block_solid(&g, 4, 6, 2, 3);
         let mut u = filled_grid(&g, |iz, ir| {
             [1.0 + 0.01 * (ir * 10 + iz) as f32, 0.2, -0.1, 1.0 + 0.005 * iz as f32]
@@ -1020,10 +1026,10 @@ mod tests {
 
     #[test]
     fn geometry_open_fills_at_rest_from_neighbour_means() {
-        let g = Grid { nz: 10, nr: 6, dz: 0.1, dr: 0.05 };
+        let g = Grid::uniform(10, 6, 0.1, 0.05);
         let gm = 1.4f32;
         let old = block_solid(&g, 4, 6, 2, 3);
-        let new = SolidField::empty(g);
+        let new = SolidField::empty(g.clone());
         let amb = ambient();
         let mut u = filled_grid(&g, |iz, ir| {
             [1.0 + 0.01 * (ir * 10 + iz) as f32, 0.4, -0.2, 1.0 + 0.005 * iz as f32]
@@ -1060,7 +1066,7 @@ mod tests {
 
     #[test]
     fn geometry_open_sealed_cavity_gets_ambient() {
-        let g = Grid { nz: 10, nr: 8, dz: 0.1, dr: 0.05 };
+        let g = Grid::uniform(10, 8, 0.1, 0.05);
         let gm = 1.4f32;
         let amb = ambient();
         let old = block_solid(&g, 3, 5, 2, 4); // 3x3 solid block
@@ -1070,7 +1076,7 @@ mod tests {
         let mut ledger = FlipLedger::default();
         apply_geometry_change(&mut u, &g, &old, &new, &gas(), &amb, &mut ledger);
         assert_eq!(u[g.gidx(4, 3)], ambient_cons(&amb, gm));
-        let vol = g.cell_vol(3);
+        let vol = g.cell_vol(4, 3);
         let rho_a = (amb.p / amb.t) as f64;
         assert!((ledger.mass - rho_a * vol).abs() <= 1e-12, "cavity mass on the ledger");
     }

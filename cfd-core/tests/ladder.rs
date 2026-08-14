@@ -44,10 +44,10 @@ fn run_to_time(s: &mut EulerSolver, t_end: f64, max_steps: u64) -> cfd_contract:
 /// identity reference scales (fields are non-dimensional). Solid cells carry
 /// zeros in every field, so they contribute nothing.
 fn totals(snap: &Snapshot, gamma: f64) -> (f64, f64) {
-    let g = snap.grid;
+    let g = &snap.grid;
     let (mut mass, mut energy) = (0.0f64, 0.0f64);
     for ir in 0..g.nr {
-        let vol = g.cell_vol(ir);
+        let vol = g.cell_vol(0, ir);
         for iz in 0..g.nz {
             let rho = snap.sample(FieldKind::Density, iz, ir) as f64;
             let p = snap.sample(FieldKind::Pressure, iz, ir) as f64;
@@ -71,8 +71,8 @@ fn totals(snap: &Snapshot, gamma: f64) -> (f64, f64) {
 #[ignore = "ladder: run with --include-ignored"]
 fn t2_conservation_drift() {
     let gamma = 1.4f64;
-    let grid = Grid { nz: 48, nr: 48, dz: 0.1, dr: 0.1 };
-    let mut solid = SolidField::empty(grid);
+    let grid = Grid::uniform(48, 48, 0.1, 0.1);
+    let mut solid = SolidField::empty(grid.clone());
     for ir in 0..grid.nr {
         solid.fraction[grid.idx(0, ir)] = 1.0;
         solid.fraction[grid.idx(grid.nz - 1, ir)] = 1.0;
@@ -81,7 +81,7 @@ fn t2_conservation_drift() {
         solid.fraction[grid.idx(iz, grid.nr - 1)] = 1.0;
     }
     let setup = SolveSetup {
-        grid,
+        grid: grid.clone(),
         solid: Arc::new(solid),
         gas: GasModel { gamma: gamma as f32, r_specific_si: 287.0 },
         chamber: Chamber { p0: 1.0, t0: 1.0 },
@@ -116,15 +116,15 @@ fn t2_conservation_drift() {
 /// exactly shifted profile at the run's own final time.
 fn t3_error(n: usize, limiter: cfd_contract::Limiter) -> f64 {
     let gamma = 1.4f64;
-    let grid = Grid { nz: n, nr: 2, dz: 1.0 / n as f32, dr: 1.0 / n as f32 };
-    let mut solid = SolidField::empty(grid);
+    let grid = Grid::uniform(n, 2, 1.0 / n as f32, 1.0 / n as f32);
+    let mut solid = SolidField::empty(grid.clone());
     for iz in 0..n {
         solid.fraction[grid.idx(iz, 1)] = 1.0;
     }
     let bump = |x: f64| 1.0 + 0.2 * (-((x - 0.35) / 0.08).powi(2)).exp();
     let m = 2.0 / (gamma).sqrt(); // u = 2 stream of the (1, 2, 1) state
     let setup = SolveSetup {
-        grid,
+        grid: grid.clone(),
         solid: Arc::new(solid),
         gas: GasModel { gamma: gamma as f32, r_specific_si: 287.0 },
         chamber: freestream_chamber(m, gamma),
@@ -176,13 +176,13 @@ fn t3_order_of_accuracy() {
 #[ignore = "ladder: run with --include-ignored"]
 fn t5_positivity_toro2() {
     let n = 200usize;
-    let grid = Grid { nz: n, nr: 2, dz: 1.0 / n as f32, dr: 1.0 / n as f32 };
-    let mut solid = SolidField::empty(grid);
+    let grid = Grid::uniform(n, 2, 1.0 / n as f32, 1.0 / n as f32);
+    let mut solid = SolidField::empty(grid.clone());
     for iz in 0..n {
         solid.fraction[grid.idx(iz, 1)] = 1.0;
     }
     let setup = SolveSetup {
-        grid,
+        grid: grid.clone(),
         solid: Arc::new(solid),
         gas: GasModel { gamma: 1.4, r_specific_si: 287.0 },
         chamber: Chamber { p0: 1.0, t0: 1.0 },
@@ -211,7 +211,7 @@ fn t5_positivity_toro2() {
 fn nozzle_setup(ambient_p_pa: f64, ambient_t_k: f64) -> SolveSetup {
     let gas = GasModel { gamma: 1.24, r_specific_si: 378.0 };
     let refs = RefScales::from_chamber(0.05, 5.0e6, 3200.0, &gas);
-    let grid = Grid { nz: 320, nr: 200, dz: 0.1449, dr: 0.05 };
+    let grid = Grid::uniform(320, 200, 0.1449, 0.05);
     let spec = cfd_geom::NozzleSpec {
         throat_radius_m: 0.05,
         area_ratio: 8.0,
@@ -224,7 +224,7 @@ fn nozzle_setup(ambient_p_pa: f64, ambient_t_k: f64) -> SolveSetup {
     let wall = cfd_geom::generate_contour(&spec, 512).unwrap();
     let solid = cfd_geom::rasterize(&wall, &grid, &refs).unwrap();
     SolveSetup {
-        grid,
+        grid: grid.clone(),
         solid: Arc::new(solid),
         gas,
         chamber: Chamber { p0: 1.0, t0: 1.0 },
@@ -259,7 +259,7 @@ fn t5_positivity_vacuum_nozzle() {
 fn fitted_shock_angle_deg(
     snap: &Snapshot, iz_lo: usize, iz_hi: usize, threshold: f64,
 ) -> f64 {
-    let g = snap.grid;
+    let g = &snap.grid;
     let mut pts: Vec<(f64, f64)> = Vec::new();
     for iz in iz_lo..=iz_hi {
         let mut crossing = None;
@@ -268,12 +268,12 @@ fn fitted_shock_angle_deg(
             let p_lo = snap.sample(FieldKind::Pressure, iz, ir - 1) as f64;
             if p_hi < threshold && p_lo >= threshold {
                 let t = (threshold - p_hi) / (p_lo - p_hi);
-                crossing = Some(g.r_center(ir) as f64 - t * g.dr as f64);
+                crossing = Some(g.r_center(ir) as f64 - t * g.dr(0) as f64);
                 break;
             }
         }
         if let Some(r) = crossing {
-            pts.push(((iz as f64 + 0.5) * g.dz as f64, r));
+            pts.push(((iz as f64 + 0.5) * g.dz(0) as f64, r));
         }
     }
     assert!(pts.len() > (iz_hi - iz_lo) / 2, "shock not found in the fit window");
@@ -295,12 +295,12 @@ fn fitted_shock_angle_deg(
 fn t6_wedge_theta_beta_m() {
     let gamma = 1.4f64;
     let m_inf = 2.0f64;
-    let grid = Grid { nz: 300, nr: 220, dz: 0.01, dr: 0.01 };
+    let grid = Grid::uniform(300, 220, 0.01, 0.01);
     let z0 = 0.5f64; // wedge tip
     let tan_w = 15.0f64.to_radians().tan();
-    let mut solid = SolidField::empty(grid);
+    let mut solid = SolidField::empty(grid.clone());
     for iz in 0..grid.nz {
-        let z = (iz as f64 + 0.5) * grid.dz as f64;
+        let z = (iz as f64 + 0.5) * grid.dz(0) as f64;
         if z <= z0 { continue; }
         for ir in 0..grid.nr {
             let r = grid.r_center(ir) as f64;
@@ -314,7 +314,7 @@ fn t6_wedge_theta_beta_m() {
     }
     let u_inf = m_inf * gamma.sqrt();
     let setup = SolveSetup {
-        grid,
+        grid: grid.clone(),
         solid: Arc::new(solid),
         gas: GasModel { gamma: gamma as f32, r_specific_si: 287.0 },
         chamber: freestream_chamber(m_inf, gamma),
@@ -327,15 +327,15 @@ fn t6_wedge_theta_beta_m() {
     run_to_time(&mut s, 4.0, 20_000);
     let snap = s.snapshot();
     // p2/p1 = 2.1946; threshold midway between states.
-    let iz_lo = (z0 / grid.dz as f64) as usize + 60;
-    let iz_hi = (z0 / grid.dz as f64) as usize + 150;
+    let iz_lo = (z0 / grid.dz(0) as f64) as usize + 60;
+    let iz_hi = (z0 / grid.dz(0) as f64) as usize + 150;
     let beta = fitted_shock_angle_deg(&snap, iz_lo, iz_hi, 1.5);
     // Post-shock pressure, sampled just above the wedge surface mid-window.
     let mut p2 = 0.0f64;
     let mut np = 0usize;
     for iz in iz_lo..=iz_hi {
-        let z = (iz as f64 + 0.5) * grid.dz as f64;
-        let ir_surf = ((z - z0) * tan_w / grid.dr as f64).ceil() as usize + 1;
+        let z = (iz as f64 + 0.5) * grid.dz(0) as f64;
+        let ir_surf = ((z - z0) * tan_w / grid.dr(0) as f64).ceil() as usize + 1;
         p2 += snap.sample(FieldKind::Pressure, iz, ir_surf) as f64;
         np += 1;
     }
@@ -357,12 +357,12 @@ fn t6_wedge_theta_beta_m() {
 fn t7_cone_taylor_maccoll() {
     let gamma = 1.4f64;
     let m_inf = 2.35f64;
-    let grid = Grid { nz: 300, nr: 220, dz: 0.01, dr: 0.01 };
+    let grid = Grid::uniform(300, 220, 0.01, 0.01);
     let z0 = 0.5f64; // cone apex, on the axis
     let tan_c = 10.0f64.to_radians().tan();
-    let mut solid = SolidField::empty(grid);
+    let mut solid = SolidField::empty(grid.clone());
     for iz in 0..grid.nz {
-        let z = (iz as f64 + 0.5) * grid.dz as f64;
+        let z = (iz as f64 + 0.5) * grid.dz(0) as f64;
         if z <= z0 { continue; }
         for ir in 0..grid.nr {
             if (grid.r_center(ir) as f64) < (z - z0) * tan_c {
@@ -372,7 +372,7 @@ fn t7_cone_taylor_maccoll() {
     }
     let u_inf = m_inf * gamma.sqrt();
     let setup = SolveSetup {
-        grid,
+        grid: grid.clone(),
         solid: Arc::new(solid),
         gas: GasModel { gamma: gamma as f32, r_specific_si: 287.0 },
         chamber: freestream_chamber(m_inf, gamma),
@@ -387,8 +387,8 @@ fn t7_cone_taylor_maccoll() {
 
     // Conical shock is weak: immediately behind it p/p_inf ~ 1.14. Threshold
     // sits between the freestream and that jump.
-    let iz_lo = (z0 / grid.dz as f64) as usize + 60;
-    let iz_hi = (z0 / grid.dz as f64) as usize + 150;
+    let iz_lo = (z0 / grid.dz(0) as f64) as usize + 60;
+    let iz_hi = (z0 / grid.dz(0) as f64) as usize + 150;
     let beta = fitted_shock_angle_deg(&snap, iz_lo, iz_hi, 1.05);
 
     // Surface values. Pressure is sampled at the first fluid cell — it is
@@ -402,8 +402,8 @@ fn t7_cone_taylor_maccoll() {
     let (mut p_surf, mut m_surf) = (0.0f64, 0.0f64);
     let mut np = 0usize;
     for iz in iz_lo..=iz_hi {
-        let z = (iz as f64 + 0.5) * grid.dz as f64;
-        let ir_surf = ((z - z0) * tan_c / grid.dr as f64).ceil() as usize + 1;
+        let z = (iz as f64 + 0.5) * grid.dz(0) as f64;
+        let ir_surf = ((z - z0) * tan_c / grid.dr(0) as f64).ceil() as usize + 1;
         p_surf += snap.sample(FieldKind::Pressure, iz, ir_surf) as f64;
         m_surf += snap.sample(FieldKind::Mach, iz, ir_surf + 7) as f64;
         np += 1;
@@ -413,7 +413,7 @@ fn t7_cone_taylor_maccoll() {
 
     // Axis cleanliness upstream of the apex: rows 0 and 1, z < z0.
     let mut v_max = 0.0f64;
-    for iz in 0..(z0 / grid.dz as f64) as usize {
+    for iz in 0..(z0 / grid.dz(0) as f64) as usize {
         for ir in 0..2 {
             v_max = v_max.max((snap.sample(FieldKind::VelocityR, iz, ir) as f64).abs());
         }
@@ -442,7 +442,7 @@ fn nozzle_wall_layer(n_throat: usize, steps: u64) -> (f64, f64, f64, u64) {
     let refs = RefScales::from_chamber(0.05, 5.0e6, 3200.0, &gas);
     let dr = 1.0f32 / n_throat as f32;
     let dz = 2.898 * dr; // the interactive grid's anisotropy
-    let grid = Grid { nz: (12.6 / dz).ceil() as usize, nr: (4.0 / dr) as usize, dz, dr };
+    let grid = Grid::uniform((12.6 / dz).ceil() as usize, (4.0 / dr) as usize, dz, dr);
     let spec = cfd_geom::NozzleSpec {
         throat_radius_m: 0.05, area_ratio: 8.0, contraction_ratio: 4.0,
         converge_half_angle_deg: 30.0, throat_arc_up: 1.5, throat_arc_down: 0.382,
@@ -454,7 +454,7 @@ fn nozzle_wall_layer(n_throat: usize, steps: u64) -> (f64, f64, f64, u64) {
         .filter(|&iz| (0..grid.nr).any(|ir| s_field.is_solid(grid.idx(iz, ir))))
         .max().unwrap();
     let setup = SolveSetup {
-        grid, solid: Arc::new(s_field.clone()), gas,
+        grid: grid.clone(), solid: Arc::new(s_field.clone()), gas,
         chamber: Chamber { p0: 1.0, t0: 1.0 },
         ambient: Ambient { p: (101_325.0 / refs.p_pa) as f32, t: (288.15 / refs.t_k) as f32 },
         numerics: Numerics { sponge_cells: 0, ..Numerics::default() },
@@ -487,7 +487,7 @@ fn nozzle_wall_layer(n_throat: usize, steps: u64) -> (f64, f64, f64, u64) {
         if m >= 0.5 * core {
             let m_above = snap.sample(FieldKind::Mach, iz, (ir + 1).min(b - 1)) as f64;
             let t = if m > m_above { (0.5 * core - m_above) / (m - m_above) } else { 1.0 };
-            let r_cross = grid.r_center(ir + 1) as f64 - t.clamp(0.0, 1.0) * grid.dr as f64;
+            let r_cross = grid.r_center(ir + 1) as f64 - t.clamp(0.0, 1.0) * grid.dr(0) as f64;
             delta = grid.r_face(b) as f64 - r_cross;
             break;
         }
@@ -495,7 +495,7 @@ fn nozzle_wall_layer(n_throat: usize, steps: u64) -> (f64, f64, f64, u64) {
     // Exit-plane integrals at the same column, f64.
     let (mut mdot, mut mach_a, mut area) = (0.0f64, 0.0f64, 0.0f64);
     for ir in 0..b {
-        let da = 2.0 * std::f64::consts::PI * grid.r_center(ir) as f64 * grid.dr as f64;
+        let da = 2.0 * std::f64::consts::PI * grid.r_center(ir) as f64 * grid.dr(0) as f64;
         mdot += snap.sample(FieldKind::Density, iz, ir) as f64
             * snap.sample(FieldKind::VelocityZ, iz, ir) as f64 * da * refs.l_m * refs.l_m;
         mach_a += snap.sample(FieldKind::Mach, iz, ir) as f64 * da;

@@ -54,11 +54,11 @@ impl MockSolver {
     }
 
     fn recompute_profile(&mut self) {
-        let g = self.setup.grid;
+        let g = self.setup.grid.clone();
         let solid = &self.setup.solid;
         self.r_open = (0..g.nz).map(|iz| {
             (0..g.nr).find(|&ir| solid.is_solid(g.idx(iz, ir)))
-                .map(|ir| (g.r_face(ir) as f64).max(g.dr as f64))
+                .map(|ir| (g.r_face(ir) as f64).max(g.dr(0) as f64))
                 .unwrap_or(f64::INFINITY)
         }).collect();
         self.lip = (0..g.nz).filter(|&iz| self.r_open[iz].is_finite()).max();
@@ -86,17 +86,17 @@ impl MockSolver {
 
     /// The analytic field: canonical primitives at cell (iz, ir).
     fn prim_at(&self, iz: usize, ir: usize) -> Prim {
-        let g = self.setup.grid;
+        let g = self.setup.grid.clone();
         let gam = self.setup.gas.gamma as f64;
         let idx = g.idx(iz, ir);
         if self.setup.solid.is_solid(idx) { return [0.0; 4]; }
         let ambient = self.ambient_prim();
         let Some(lip) = self.lip else { return ambient; };
 
-        let z = (iz as f64 + 0.5) * g.dz as f64;
+        let z = g.z_center(iz) as f64;
         let r = g.r_center(ir) as f64;
-        let z_lip = (lip as f64 + 1.0) * g.dz as f64;
-        let r_e = self.r_open[lip].min(g.nr as f64 * g.dr as f64).max(self.r_throat);
+        let z_lip = g.z_face(lip + 1) as f64;
+        let r_e = self.r_open[lip].min(g.lr()).max(self.r_throat);
         let p_a = (self.setup.ambient.p as f64).max(1e-9);
 
         // Exit conditions from the quasi-1D area ratio.
@@ -120,7 +120,7 @@ impl MockSolver {
             // Radial velocity follows the local wall slope, linear in r.
             let iz2 = (iz + 1).min(lip);
             let r_w2 = if self.r_open[iz2].is_finite() { self.r_open[iz2] } else { r_w };
-            let slope = (r_w2.max(self.r_throat) - r_w) / g.dz as f64;
+            let slope = (r_w2.max(self.r_throat) - r_w) / g.dz(iz) as f64;
             let v = u * slope * (r / r_w).clamp(0.0, 1.0);
             return [rho as Real, u as Real, v as Real, p as Real];
         }
@@ -133,7 +133,7 @@ impl MockSolver {
         // exit, clamped inside the domain. Plausible, not physical.
         let npr = (p_e / p_a).clamp(0.05, 400.0);
         let z_m = (0.67 * (1.0 / p_a).sqrt() * 2.0 * r_e).clamp(2.0 * r_e, 0.9
-            * (g.nz as f64 * g.dz as f64 - z_lip));
+            * (g.lz() - z_lip));
         let t_disk = (s / z_m).clamp(0.0, 1.0);
 
         // Barrel-shaped plume boundary; fatter when under-expanded.
@@ -190,7 +190,7 @@ impl Solver for MockSolver {
     }
 
     fn snapshot(&self) -> Snapshot {
-        let g = self.setup.grid;
+        let g = self.setup.grid.clone();
         let prims: Vec<Prim> = (0..g.nr)
             .flat_map(|ir| (0..g.nz).map(move |iz| (iz, ir)))
             .map(|(iz, ir)| self.prim_at(iz, ir))
@@ -211,9 +211,9 @@ impl Solver for MockSolver {
             converged: self.info.converged, confidence: Confidence::NotConverged,
         };
         let Some(lip) = self.lip else { return empty; };
-        let g_grid = self.setup.grid;
+        let g_grid = &self.setup.grid;
         let r_t = self.r_throat;
-        let r_e = self.r_open[lip].min(g_grid.nr as f64 * g_grid.dr as f64).max(r_t);
+        let r_e = self.r_open[lip].min(g_grid.lr()).max(r_t);
         let ar = (r_e / r_t).powi(2).max(1.0);
         let m_e = mach_from_area_ratio_mock(ar, g, true);
         let (_, p_e, a_e) = self.isentropic(m_e);
@@ -239,7 +239,7 @@ impl Solver for MockSolver {
             exit_pressure_pa: p_e * refs.p_pa,
             exit_pressure_ratio: pr,
             ideal_exit_mach: m_e,
-            cells_per_throat_radius: r_t / self.setup.grid.dr as f64,
+            cells_per_throat_radius: r_t / self.setup.grid.dr_min() as f64,
             converged: self.info.converged,
             confidence: if !self.info.converged { Confidence::NotConverged }
                         else if pr < sep { Confidence::SeparationLikely }
@@ -295,10 +295,10 @@ mod tests {
 
     fn demo_setup() -> SolveSetup {
         // The demo case: gamma 1.24, R 378, p0 5 MPa, T0 3200 K, r_t 50 mm.
-        let grid = Grid { nz: 80, nr: 50, dz: 0.29, dr: 0.1 };
+        let grid = Grid::uniform(80, 50, 0.29, 0.1);
         let gas = GasModel { gamma: 1.24, r_specific_si: 378.0 };
         // A crude converging-diverging wall: solid above a V-shaped contour.
-        let mut solid = SolidField::empty(grid);
+        let mut solid = SolidField::empty(grid.clone());
         let lip = 30usize;
         for iz in 0..=lip {
             let r_wall = if iz < 10 { 2.0 } else if iz < 15 { 2.0 - 0.2 * (iz - 10) as f32 }
@@ -354,8 +354,8 @@ mod tests {
         assert!(r.converged);
         // c* x mdot = p0 x A_t by construction.
         let a_t_si = std::f64::consts::PI * r.cells_per_throat_radius
-            * m.setup.grid.dr as f64 * m.setup.refs.l_m
-            * (r.cells_per_throat_radius * m.setup.grid.dr as f64 * m.setup.refs.l_m);
+            * m.setup.grid.dr(0) as f64 * m.setup.refs.l_m
+            * (r.cells_per_throat_radius * m.setup.grid.dr(0) as f64 * m.setup.refs.l_m);
         assert!((r.c_star_m_s * r.mass_flow_kg_s / (5.0e6 * a_t_si) - 1.0).abs() < 1e-9);
         assert_eq!(r.discharge_coefficient, 1.0);
         assert!(r.exit_mach > 1.0 && r.ideal_exit_mach == r.exit_mach);
