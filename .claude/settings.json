@@ -19,7 +19,6 @@
     "deny": [
       "Bash(cargo update:*)",
       "Bash(cargo add:*)",
-      "Bash(git merge:*)",
       "Bash(git rebase:*)"
     ]
   }
