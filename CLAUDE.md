@@ -63,6 +63,20 @@ exactly this — constant, both docs, and T1–T8 re-run with floors = 0.
   bracket**. The f32 cancellation depends on it.
 - Image row 0 is the largest r, the opposite of `Grid`. Only `cfd-ui` flips.
 
+## Results get committed, not reported in chat
+
+Numbers that only live in a chat transcript are lost. The acceptance ladder
+and every benchmark write their measured results to
+`docs/results/<suite>-<machine>.json` through the `cfd-results` crate —
+automatically, from inside each test **before its own asserts**, so emission
+cannot be skipped, forgotten, or lost to a failure. The machine label is
+derived from the hardware (CPU brand + core count), never from a flag, so the
+same machine always writes the same file and results are diffable across
+time. The schema is documented in `docs/results/README.md`; extend that
+schema, never invent a second format. `docs/results/` must never be
+gitignored. Commit the updated result files together with the change that
+produced them.
+
 ## Testing
 
 - `cargo test -p <crate>`. Never a bare workspace build — it serializes on the

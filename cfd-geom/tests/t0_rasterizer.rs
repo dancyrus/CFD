@@ -11,7 +11,17 @@ use cfd_geom::{
     generate_contour, quantize_dr_to_throat, rasterize, rasterize_solid_polygon, ContourKind,
     NozzleSpec,
 };
+use cfd_results::{record_test, TestResult, Value};
 use std::f64::consts::PI;
+
+/// Results get committed, not reported in chat (CLAUDE.md).
+fn record(id: &str, name: &str, expected: impl Into<Value>, actual: impl Into<Value>,
+          units: &str, pass: bool) {
+    record_test("ladder", TestResult {
+        id: id.into(), name: name.into(), expected: expected.into(),
+        actual: actual.into(), units: units.into(), pass,
+    });
+}
 
 /// Regular n-gon whose AREA is exactly pi*R^2 (circumradius slightly above R),
 /// so the comparison isolates the rasterizer instead of polygonization error.
@@ -29,6 +39,7 @@ fn disk(center: [f64; 2], radius: f64, n: usize) -> Vec<[f64; 2]> {
 #[test]
 fn t0_disk_area_is_exact() {
     let g = Grid::uniform(72, 72, 1.0, 1.0);
+    let mut worst = 0.0f64;
     for radius in [3.0, 4.0, 6.0, 8.0, 12.0, 20.0] {
         let poly = disk([32.0, 32.0], radius, 2048); // centred on a cell corner
         let s = rasterize_solid_polygon(&poly, &g).unwrap();
@@ -39,6 +50,7 @@ fn t0_disk_area_is_exact() {
         }
         let exact = PI * radius * radius;
         let rel = (area - exact).abs() / exact; // SIGNED error -> abs()
+        worst = worst.max(rel);
         assert!(
             rel <= 5e-3,
             "R={radius}: area {area}, exact {exact}, rel {rel}"
@@ -50,6 +62,8 @@ fn t0_disk_area_is_exact() {
             "R={radius}: rel {rel} — rasterizer is not exact"
         );
     }
+    record("T0-disk", "rasterizer disk area, R in {3..20} cells", "<= 5e-3",
+           worst, "worst relative area error", worst <= 5e-3);
 }
 
 /// Point sampling is the documented failure mode: keep a record of how wrong it
@@ -73,6 +87,7 @@ fn t0_point_sampling_is_disqualified() {
 
 #[test]
 fn t0_nozzle_throat_area_within_half_percent() {
+    let mut worst = 0.0f64;
     // Demo-case reference scales: r_t = 50 mm, p0 = 5 MPa, T0 = 3200 K.
     let gas = GasModel {
         gamma: 1.24,
@@ -141,9 +156,12 @@ fn t0_nozzle_throat_area_within_half_percent() {
         }
         // Analytic throat area is pi * r_t^2, i.e. r_w^2 = 1 non-dimensionally.
         let rel = (min_rw2 - 1.0).abs();
+        worst = worst.max(rel);
         assert!(
             rel <= 5e-3,
             "{contour:?} eps={area_ratio}: recovered A/A_t = {min_rw2:.5}, rel err {rel:.2e}"
         );
     }
+    record("T0-throat", "rasterized nozzle throat area, 5 slider settings", "<= 5e-3",
+           worst, "worst relative area error", worst <= 5e-3);
 }

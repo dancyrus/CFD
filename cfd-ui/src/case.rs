@@ -882,6 +882,17 @@ mod grading_bench {
 
     /// Runs to visual steady (or projects from measured steps/s when
     /// `project` is set — the uniform Long case exists only to be priced).
+    fn record_bench(setting: &str, cells: usize, sps: f64, secs: f64) {
+        // Results get committed, not reported in chat (CLAUDE.md).
+        cfd_results::record_benchmark("grading-bench", cfd_results::Benchmark {
+            case: "demo nozzle (gamma 1.24, eps 8, sea level)".into(),
+            setting: setting.into(),
+            cells: cells as u64,
+            steps_per_sec: sps,
+            seconds_to_steady: secs,
+        });
+    }
+
     fn run_case(name: &str, setup: SolveSetup, project: bool) {
         let g = setup.grid.clone();
         let target = steps_to_visual_steady(&g);
@@ -916,6 +927,12 @@ mod grading_bench {
              (step {target}) in {:.0} s wall ({how}) | floors {floors} (last at step {last_floor})",
             g.nz, g.nr, g.len(), sps, wall_s
         );
+        record_bench(name, g.len(), sps, wall_s);
+        if floors > 0 {
+            cfd_results::record_note("grading-bench", name, &format!(
+                "{name}: {floors} positivity-floor activations, all during the cold-start \
+                 front (last at step {last_floor}, zero after) — the §13 quarantine class."));
+        }
         // Floor contact must have the §13 cold-start shape: confined to the
         // startup front and quiet ever after (the report quarantine covers
         // it). Steady-state floor contact is a hard failure. Measured here:
@@ -959,6 +976,11 @@ mod grading_bench {
         let ps = CaseParams::default(); // Standard is the default
         run_case("graded Standard (default)", make_setup(&ps, &wall), false);
         run_case("graded Long", make_setup(&pl, &wall), false);
+        cfd_results::record_note("grading-bench", "criterion",
+            "seconds_to_steady uses the §9 VISUAL-steady criterion (~5 plume transits, \
+             scaled by domain length). The residual-based settled flag does not fire at \
+             sea level on either the uniform or the graded grid — the mildly overexpanded \
+             plume keeps breathing above the 1e-3 threshold.");
     }
 }
 

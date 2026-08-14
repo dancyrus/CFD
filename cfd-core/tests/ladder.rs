@@ -13,6 +13,17 @@ use cfd_contract::{
     SolidField, SolveSetup, Solver,
 };
 use cfd_core::{physics, EulerSolver};
+use cfd_results::{record_test, TestResult, Value};
+
+/// Results get committed, not reported in chat (CLAUDE.md): every rung
+/// records its measured numbers BEFORE its own asserts.
+fn record(id: &str, name: &str, expected: impl Into<Value>, actual: impl Into<Value>,
+          units: &str, pass: bool) {
+    record_test("ladder", TestResult {
+        id: id.into(), name: name.into(), expected: expected.into(),
+        actual: actual.into(), units: units.into(), pass,
+    });
+}
 
 fn identity_refs() -> RefScales {
     RefScales { l_m: 1.0, p_pa: 1.0, rho_kg_m3: 1.0, u_m_s: 1.0, t_k: 1.0, time_s: 1.0 }
@@ -106,6 +117,9 @@ fn t2_conservation_drift() {
     let de = ((e1 - e0) / e0).abs();
     println!("T2: mass drift {dm:.3e}, energy drift {de:.3e} (pass <= 2e-6), floors {}",
              info.floor_activations);
+    record("T2", "conservation drift, closed axisymmetric box, 1000 steps",
+           "<= 2e-6", dm.max(de), "relative drift",
+           dm <= 2e-6 && de <= 2e-6 && info.floor_activations == 0);
     assert!(dm <= 2e-6, "mass drift {dm:.3e}");
     assert!(de <= 2e-6, "energy drift {de:.3e}");
     assert_eq!(info.floor_activations, 0);
@@ -165,6 +179,10 @@ fn t3_order_of_accuracy() {
     let order_limited = (e200 / e400).log2();
     println!("T3: order unlimited {order_unlimited:.3} (pass >= 1.90), \
               limited {order_limited:.3} (pass >= 1.50)");
+    record("T3-unlimited", "order of accuracy, smooth advection, unlimited slope",
+           ">= 1.90", order_unlimited, "convergence order", order_unlimited >= 1.90);
+    record("T3-limited", "order of accuracy, smooth advection, minmod",
+           ">= 1.50", order_limited, "convergence order", order_limited >= 1.50);
     assert!(order_unlimited >= 1.90, "unlimited order {order_unlimited:.3}");
     assert!(order_limited >= 1.50, "limited order {order_limited:.3}");
 }
@@ -202,6 +220,9 @@ fn t5_positivity_toro2() {
         .fold(f64::INFINITY, f64::min);
     println!("T5 (Toro 2): floors {} (pass = 0), min p {p_min:.4e} (exact p* 1.894e-3)",
              info.floor_activations);
+    record("T5-toro2", "positivity: Toro test 2 double rarefaction",
+           0.0, info.floor_activations as f64, "floor activations",
+           info.floor_activations == 0);
     assert_eq!(info.floor_activations, 0, "floor activations must be exactly zero");
     assert!(p_min > 0.0 && p_min.is_finite());
 }
@@ -250,6 +271,9 @@ fn t5_positivity_vacuum_nozzle() {
         info = s.step().unwrap();
     }
     println!("T5 (vacuum nozzle, 1500 steps): floors {} (pass = 0)", info.floor_activations);
+    record("T5-vacuum", "positivity: demo nozzle starting into 50 km ambient",
+           0.0, info.floor_activations as f64, "floor activations",
+           info.floor_activations == 0);
     assert_eq!(info.floor_activations, 0, "floor activations must be exactly zero");
 }
 
@@ -341,6 +365,8 @@ fn t6_wedge_theta_beta_m() {
     }
     p2 /= np as f64;
     println!("T6: beta {beta:.3} deg (ref 45.344 +/- 1.5), p2/p1 {p2:.4} (ref 2.1947)");
+    record("T6", "oblique shock, 15 deg wedge at M 2", "45.344 +/- 1.5", beta,
+           "deg", (beta - 45.34362).abs() <= 1.5);
     assert!((beta - 45.34362).abs() <= 1.5, "beta = {beta:.3} deg");
 }
 
@@ -421,6 +447,13 @@ fn t7_cone_taylor_maccoll() {
     println!("T7: beta {beta:.3} deg (ref 26.737 +/- 1.5), surface p/p_inf {p_surf:.4} \
               (ref 1.3739 +/- 8%), surface M {m_surf:.4} (ref 2.1468 +/- 5%), \
               upstream axis |v|/u_inf {:.2e} (pass <= 1e-3)", v_max / u_inf);
+    record("T7-beta", "cone vs Taylor-Maccoll: shock angle", "26.737 +/- 1.5", beta,
+           "deg", (beta - 26.736718).abs() <= 1.5);
+    record("T7-p", "cone vs Taylor-Maccoll: surface pressure ratio",
+           "1.3739 +/- 8%", p_surf, "p/p_inf",
+           (p_surf - 1.373936).abs() / 1.373936 <= 0.08);
+    record("T7-mach", "cone vs Taylor-Maccoll: surface Mach", "2.1468 +/- 5%", m_surf,
+           "Mach", (m_surf - 2.146831).abs() / 2.146831 <= 0.05);
     assert!((beta - 26.736718).abs() <= 1.5, "beta = {beta:.3} deg");
     assert!((p_surf - 1.373936).abs() / 1.373936 <= 0.08, "surface p/p_inf = {p_surf:.4}");
     assert!((m_surf - 2.146831).abs() / 2.146831 <= 0.05, "surface M = {m_surf:.4}");
@@ -540,6 +573,13 @@ fn t8_nozzle_measurement_and_convergence() {
               area-avg M {m40:.3}");
     println!("T8 (asserted): thickness ratio 40/20 = {ratio:.3} (pass 0.35-0.70 — \
               the layer must roughly halve), floors {floors20}/{floors40} (pass 0)");
+    record("T8", "staircase wall-layer grid convergence, delta50 ratio 40/20",
+           "0.35-0.70", ratio, "thickness ratio",
+           (0.35..=0.70).contains(&ratio) && floors20 == 0 && floors40 == 0);
+    cfd_results::record_note("ladder", "t8-recorded", &format!(
+        "T8 recorded (mid-divergent column): N20 delta50 {d20:.3} r_t, mdot/ideal {mdot20:.4}, \
+         area-avg M {m20:.3}; N40 delta50 {d40:.3} r_t, mdot/ideal {mdot40:.4}, area-avg M {m40:.3}. \
+         Body-fitted quasi-1D bands do not apply to the immersed staircase wall (see test doc)."));
     assert_eq!(floors20, 0, "floors nonzero at N_throat 20");
     assert_eq!(floors40, 0, "floors nonzero at N_throat 40");
     assert!(d20.is_finite() && d40.is_finite(), "wall layer not found");

@@ -1,7 +1,13 @@
-# Build cfd-ui for the three desktop platforms and attach the binaries to a
-# GitHub Release. Fires on version tags (v*), or run it by hand from the
+# Build cfd-ui for the two supported desktop targets and attach the binaries
+# to a GitHub Release. Fires on version tags (v*), or run it by hand from the
 # Actions tab with a tag name — the release step then creates that tag at the
 # built commit (useful because some clients cannot push tags directly).
+#
+# Targets are deliberately just these two:
+#   - Windows x86_64 (x86_64-pc-windows-msvc, the runner default toolchain)
+#   - Apple Silicon macOS (aarch64-apple-darwin)
+# Intel macOS cross-compilation and the Linux build were dropped on purpose;
+# Linux users build from source (see README).
 name: release
 
 on:
@@ -23,50 +29,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            artifact: cfd-sandbox-linux-x86_64
-            bin: cfd-ui
           - os: windows-latest
             artifact: cfd-sandbox-windows-x86_64
             bin: cfd-ui.exe
           - os: macos-latest
             artifact: cfd-sandbox-macos-arm64
             bin: cfd-ui
-          # Intel macOS is cross-compiled from the arm64 runner: macos-13
-          # (the last Intel runner image) is retired and jobs queue forever.
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact: cfd-sandbox-macos-x86_64
-            bin: cfd-ui
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Linux system libraries (eframe/winit)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev \
-            libxcb-xfixes0-dev libxkbcommon-dev libwayland-dev libssl-dev
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        shell: bash
-        run: |
-          if [ -n "${{ matrix.target }}" ]; then
-            rustup target add "${{ matrix.target }}"
-            cargo build --release -p cfd-ui --target "${{ matrix.target }}"
-          else
-            cargo build --release -p cfd-ui
-          fi
+        run: cargo build --release -p cfd-ui
+      # Apple Silicon REQUIRES a code signature (ad-hoc is enough) or the
+      # binary is killed on launch. Dropping the Intel build does not remove
+      # this requirement — keep the step.
+      - name: Ad-hoc sign (Apple Silicon)
+        if: runner.os == 'macOS'
+        run: codesign --force -s - "target/release/${{ matrix.bin }}"
       - name: Package
         shell: bash
         run: |
           mkdir dist
-          if [ -n "${{ matrix.target }}" ]; then
-            cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" dist/
-          else
-            cp "target/release/${{ matrix.bin }}" dist/
-          fi
+          cp "target/release/${{ matrix.bin }}" dist/
           cd dist
           if [ "$RUNNER_OS" = "Windows" ]; then
             7z a "../${{ matrix.artifact }}.zip" "${{ matrix.bin }}"
