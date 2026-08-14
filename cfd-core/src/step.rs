@@ -38,7 +38,7 @@ pub struct EulerSolver {
 
 impl EulerSolver {
     pub fn new(setup: SolveSetup) -> Result<Self> {
-        let g = setup.grid;
+        let g = setup.grid.clone();
         if g.nz < 4 || g.nr < 1 {
             return Err(CfdError::Grid(format!("grid too small: {}x{}", g.nz, g.nr)));
         }
@@ -69,7 +69,7 @@ impl EulerSolver {
 
     /// Ambient everywhere, then the quasi-1D overlay if enabled.
     fn reset_field(&mut self) {
-        let g = self.setup.grid;
+        let g = self.setup.grid.clone();
         let a = self.setup.ambient;
         let rho_a = a.p / a.t; // p = rho*T, R = 1
         let ua = prim_to_cons([rho_a, 0.0, 0.0, a.p], self.setup.gas.gamma);
@@ -85,7 +85,7 @@ impl EulerSolver {
     /// Init hook for the acceptance tests (Sod strips, free streams); not part
     /// of the `Solver` trait.
     pub fn set_initial(&mut self, f: impl Fn(usize, usize) -> Prim) {
-        let g = self.setup.grid;
+        let g = self.setup.grid.clone();
         for ir in 0..g.nr {
             for iz in 0..g.nz {
                 let u = prim_to_cons(f(iz, ir), self.setup.gas.gamma);
@@ -103,7 +103,7 @@ impl EulerSolver {
 
 impl Solver for EulerSolver {
     fn step(&mut self) -> Result<StepInfo> {
-        let g = self.setup.grid;
+        let g = self.setup.grid.clone();
         let gas = self.setup.gas;
         let num = self.setup.numerics;
 
@@ -192,7 +192,7 @@ impl Solver for EulerSolver {
     }
 
     fn snapshot(&self) -> Snapshot {
-        let g = self.setup.grid;
+        let g = self.setup.grid.clone();
         let gamma = self.setup.gas.gamma;
         let prims: Vec<Prim> = (0..g.nr)
             .flat_map(|ir| (0..g.nz).map(move |iz| (iz, ir)))
@@ -202,7 +202,7 @@ impl Solver for EulerSolver {
     }
 
     fn report(&self) -> Report {
-        let g = self.setup.grid;
+        let g = self.setup.grid.clone();
         let gamma = self.setup.gas.gamma as f64;
         let refs = self.setup.refs;
         let solid = &self.setup.solid;
@@ -216,10 +216,12 @@ impl Solver for EulerSolver {
             let mut any_solid = false;
             for ir in 0..g.nr {
                 let idx = g.idx(iz, ir);
-                acc += (1.0 - solid.fraction[idx] as f64) * g.r_center(ir) as f64;
+                acc += (1.0 - solid.fraction[idx] as f64)
+                    * g.r_center(ir) as f64
+                    * g.dr(ir) as f64;
                 any_solid |= solid.is_solid(idx);
             }
-            r_open[iz] = (2.0 * g.dr as f64 * acc).sqrt();
+            r_open[iz] = (2.0 * acc).sqrt();
             if any_solid { lip = Some(iz); }
         }
         let empty = Report {
@@ -245,7 +247,7 @@ impl Solver for EulerSolver {
             if solid.is_solid(idx) { continue; }
             let w = cons_to_prim(self.state.u_old[g.gidx(lip as isize, ir as isize)],
                                  gamma as Real);
-            let da = 2.0 * std::f64::consts::PI * g.r_center(ir) as f64 * g.dr as f64;
+            let da = 2.0 * std::f64::consts::PI * g.r_center(ir) as f64 * g.dr(ir) as f64;
             let (rho, uz, p) = (w[0] as f64, w[1] as f64, w[3] as f64);
             mdot += rho * uz * da;
             thrust += (rho * uz * uz + p - p_a) * da;
@@ -268,7 +270,9 @@ impl Solver for EulerSolver {
             / (gm * (2.0 / (gm + 1.0)).powf((gm + 1.0) / (2.0 * (gm - 1.0))));
         let pr = exit_p / p_a;
         let sep_threshold = (1.88 * exit_mach - 1.0).powf(-0.64).max(0.40);
-        let n_throat = r_t / g.dr as f64;
+        // Grading holds base resolution across the geometry, so the finest dr
+        // is the one resolving the throat.
+        let n_throat = r_t / g.dr_min() as f64;
         let confidence = if !self.info.converged { Confidence::NotConverged }
             else if pr < sep_threshold { Confidence::SeparationLikely }
             else if n_throat < 20.0 { Confidence::Underresolved }
@@ -342,7 +346,7 @@ fn copy_ghost_band(src: &[Cons], dst: &mut [Cons], g: &cfd_contract::Grid) {
 /// `MockSolver`. `prims` is interior-only, `grid.len()` long, canonical
 /// `[rho, u_z, u_r, p]`.
 pub(crate) fn snapshot_from_prims(setup: &SolveSetup, prims: &[Prim], info: StepInfo) -> Snapshot {
-    let g = setup.grid;
+    let g = setup.grid.clone();
     let refs = setup.refs;
     let gamma = setup.gas.gamma;
     let n = g.len();
@@ -370,10 +374,15 @@ pub(crate) fn snapshot_from_prims(setup: &SolveSetup, prims: &[Prim], info: Step
                 let j = g.idx(jz, jr);
                 if setup.solid.is_solid(j) { prims[i][0] } else { prims[j][0] }
             };
-            let dz = (rho_at((iz + 1).min(g.nz - 1), ir) - rho_at(iz.saturating_sub(1), ir))
-                / (2.0 * g.dz);
-            let dr = (rho_at(iz, (ir + 1).min(g.nr - 1)) - rho_at(iz, ir.saturating_sub(1)))
-                / (2.0 * g.dr);
+            // Central differences over the actual centre positions (graded
+            // grids have unequal spacing; a fixed 2*dz would tilt the
+            // schlieren toward the fine zone). Degenerate 1-cell axes get 0.
+            let (izp, izm) = ((iz + 1).min(g.nz - 1), iz.saturating_sub(1));
+            let (irp, irm) = ((ir + 1).min(g.nr - 1), ir.saturating_sub(1));
+            let span_z = g.z_center(izp) - g.z_center(izm);
+            let span_r = g.r_center(irp) - g.r_center(irm);
+            let dz = if span_z > 0.0 { (rho_at(izp, ir) - rho_at(izm, ir)) / span_z } else { 0.0 };
+            let dr = if span_r > 0.0 { (rho_at(iz, irp) - rho_at(iz, irm)) / span_r } else { 0.0 };
             let s = (dz * dz + dr * dr).sqrt();
             fields[FieldKind::Schlieren as usize][i] = s;
             smax = smax.max(s);

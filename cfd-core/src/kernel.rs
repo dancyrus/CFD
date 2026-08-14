@@ -14,12 +14,45 @@
 //! - Every reduction accumulates in f64. Ping-pong: read immutably, write
 //!   through `par_chunks_mut` over rows. Never mutate in place.
 
-use cfd_contract::kernels::{cons_to_prim, hll_flux, hllc_flux, muscl_face_states};
+use cfd_contract::kernels::{cons_to_prim, hll_flux_p, hllc_flux_p, muscl_face_states, FaceGeom};
 use cfd_contract::{
     Cons, FluxMode, GasModel, Geometry, Grid, Numerics, Prim, Real, Reconstruction, WallMode,
     NG, P_MIN_ABS, RHO_MIN,
 };
 use rayon::prelude::*;
+
+/// Stencil geometry for every z face (0..=nz): positions are cell centres,
+/// ghost cells mirroring the interior widths. Built once per sweep — the
+/// tensor-product grid shares one table across all rows.
+fn z_face_geom(g: &Grid) -> Vec<FaceGeom> {
+    (0..=g.nz)
+        .map(|f| {
+            let f = f as isize;
+            FaceGeom {
+                x: [g.z_center_g(f - 2), g.z_center_g(f - 1),
+                    g.z_center_g(f), g.z_center_g(f + 1)],
+                xf: g.z_face(f as usize),
+            }
+        })
+        .collect()
+}
+
+/// Stencil geometry for every r face (0..=nr). Reconstruction positions are
+/// the shell VOLUME CENTROIDS under axisymmetry — that is where a cell
+/// average of a linear-in-r field sits — and plain midpoints in planar mode
+/// (docs/physics-reference.md §1; grid-grading work order, item c).
+fn r_face_geom(g: &Grid, axisym: bool) -> Vec<FaceGeom> {
+    let pos = |ir: isize| if axisym { g.r_centroid_g(ir) } else { g.r_center_g(ir) };
+    (0..=g.nr)
+        .map(|f| {
+            let f = f as isize;
+            FaceGeom {
+                x: [pos(f - 2), pos(f - 1), pos(f), pos(f + 1)],
+                xf: g.r_face(f as usize),
+            }
+        })
+        .collect()
+}
 
 /// Canonical unrotated primitives for every padded cell (ghosts included —
 /// `fill_ghosts` ran first).
@@ -29,14 +62,16 @@ pub fn compute_primitives(u: &[Cons], w: &mut [Prim], gamma: Real) {
         .for_each(|(wc, uc)| *wc = cons_to_prim(*uc, gamma));
 }
 
-/// max over FLUID interior cells of (|u|+a)/dz + (|v|+a)/dr. f64 accumulator.
+/// max over FLUID interior cells of (|u|+a)/dz(iz) + (|v|+a)/dr(ir), the
+/// LOCAL cell widths — on a graded grid the constraint is per cell. f64
+/// accumulator.
 pub fn max_wave_speed(w: &[Prim], solid: &[bool], g: &Grid, gamma: Real) -> Real {
-    let inv_dz = 1.0 / g.dz as f64;
-    let inv_dr = 1.0 / g.dr as f64;
+    let inv_dz: Vec<f64> = (0..g.nz).map(|iz| 1.0 / g.dz(iz) as f64).collect();
     let gamma = gamma as f64;
     let wmax = (0..g.nr)
         .into_par_iter()
         .map(|ir| {
+            let inv_dr = 1.0 / g.dr(ir) as f64;
             let mut mx = 0.0f64;
             for iz in 0..g.nz {
                 let i = g.gidx(iz as isize, ir as isize);
@@ -45,7 +80,7 @@ pub fn max_wave_speed(w: &[Prim], solid: &[bool], g: &Grid, gamma: Real) -> Real
                 }
                 let [rho, uz, ur, p] = w[i];
                 let a = (gamma * p as f64 / rho as f64).sqrt();
-                let s = ((uz as f64).abs() + a) * inv_dz + ((ur as f64).abs() + a) * inv_dr;
+                let s = ((uz as f64).abs() + a) * inv_dz[iz] + ((ur as f64).abs() + a) * inv_dr;
                 if s > mx {
                     mx = s;
                 }
@@ -84,27 +119,29 @@ fn nonphysical(q: &Prim) -> bool {
 /// altitude range) fires it transiently by design. Counting it here blanked
 /// every readout of a valid vacuum-nozzle run under the product rule.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn fluid_face_flux(
     s: [Prim; 4],
     sol: [bool; 4],
+    fg: &FaceGeom,
     use_hll: bool,
     n: &Numerics,
     gamma: Real,
     floors: &mut u64,
-) -> Cons {
-    let _ = floors; // kept: the sweep signatures are contract-frozen
-    let (mut ql, mut qr) = muscl_face_states(s, sol, n.reconstruction, n.limiter);
+) -> (Cons, Real) {
+    let _ = floors; // kept: the sweep signatures predate the fallback decision
+    let (mut ql, mut qr) = muscl_face_states(s, sol, fg, n.reconstruction, n.limiter);
     if n.reconstruction == Reconstruction::Muscl && (nonphysical(&ql) || nonphysical(&qr)) {
         ql = s[1];
         qr = s[2];
     }
     if ql == qr {
-        return analytic_flux(ql, gamma);
+        return (analytic_flux(ql, gamma), ql[3]);
     }
     if use_hll {
-        hll_flux(ql, qr, gamma)
+        hll_flux_p(ql, qr, gamma)
     } else {
-        hllc_flux(ql, qr, gamma)
+        hllc_flux_p(ql, qr, gamma)
     }
 }
 
@@ -129,7 +166,8 @@ pub fn sweep_z(w: &[Prim], solid: &[bool], mask: &[bool], g: &Grid,
     let _ = mask; // carbuncle switch applies to radial fluxes only (§2)
     let snz = g.snz();
     let gamma = gas.gamma;
-    let inv_dz = 1.0 / g.dz;
+    let inv_dz: Vec<Real> = (0..g.nz).map(|iz| 1.0 / g.dz(iz)).collect();
+    let zg = z_face_geom(g);
     let use_hll = n.flux_mode == FluxMode::Hll;
     let new_floors: u64 = rhs
         .par_chunks_mut(snz)
@@ -158,7 +196,7 @@ pub fn sweep_z(w: &[Prim], solid: &[bool], mask: &[bool], g: &Grid,
                 let flux: Cons = if !ls && !rs {
                     let s = [w[g.gidx(lc - 1, ir)], w[li], w[ri], w[g.gidx(rc + 1, ir)]];
                     let sol = [solid[g.gidx(lc - 1, ir)], ls, rs, solid[g.gidx(rc + 1, ir)]];
-                    fluid_face_flux(s, sol, use_hll, n, gamma, &mut local)
+                    fluid_face_flux(s, sol, &zg[f], use_hll, n, gamma, &mut local).0
                 } else if !ls {
                     oriented(crate::physics::wall_flux_z(w[li], 1.0, gamma), 1.0)
                 } else {
@@ -167,13 +205,13 @@ pub fn sweep_z(w: &[Prim], solid: &[bool], mask: &[bool], g: &Grid,
                 if lc >= 0 && !ls {
                     let c = &mut row[NG + lc as usize];
                     for k in 0..4 {
-                        c[k] -= flux[k] * inv_dz;
+                        c[k] -= flux[k] * inv_dz[lc as usize];
                     }
                 }
                 if (rc as usize) < g.nz && !rs {
                     let c = &mut row[NG + rc as usize];
                     for k in 0..4 {
-                        c[k] += flux[k] * inv_dz;
+                        c[k] += flux[k] * inv_dz[rc as usize];
                     }
                 }
             }
@@ -184,7 +222,11 @@ pub fn sweep_z(w: &[Prim], solid: &[bool], mask: &[bool], g: &Grid,
 }
 
 /// Flux through the radial face between rows `j_low` and `j_low + 1` at
-/// column `iz`, returned in the CANONICAL frame [mass, z-mom, r-mom, energy].
+/// column `iz`, returned in the CANONICAL frame [mass, z-mom, r-mom, energy],
+/// together with the interface pressure the Riemann solution samples there
+/// (a wall face's star pressure; the cell's own p when both states match).
+/// The axisymmetric source discretization consumes the pressure — see
+/// `sweep_r`.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn radial_face_flux(
@@ -192,18 +234,21 @@ fn radial_face_flux(
     solid: &[bool],
     mask: &[bool],
     g: &Grid,
+    rg: &[FaceGeom],
     n: &Numerics,
     hll_mode: bool,
     gamma: Real,
     iz: isize,
     j_low: isize,
     floors: &mut u64,
-) -> Cons {
+) -> (Cons, Real) {
     let li = g.gidx(iz, j_low);
     let ri = g.gidx(iz, j_low + 1);
     let (ls, rs) = (solid[li], solid[ri]);
     if ls && rs {
-        return [0.0; 4];
+        // Unreachable from a fluid centre cell; the zero pressure never
+        // enters a fluid cell's source.
+        return ([0.0; 4], 0.0);
     }
     if (!ls && !rs) || n.wall_mode == WallMode::ColumnReflect {
         // ColumnReflect: solid cells hold mirror-filled states, wall faces
@@ -218,12 +263,15 @@ fn radial_face_flux(
         ];
         let sol = [solid[g.gidx(iz, j_low - 1)], ls, rs, solid[g.gidx(iz, j_low + 2)]];
         let use_hll = hll_mode || mask[li] || mask[ri];
-        let f = fluid_face_flux(s, sol, use_hll, n, gamma, floors);
-        [f[0], f[2], f[1], f[3]] // rotate back
+        let (f, ps) =
+            fluid_face_flux(s, sol, &rg[(j_low + 1) as usize], use_hll, n, gamma, floors);
+        ([f[0], f[2], f[1], f[3]], ps) // rotate back
     } else if !ls {
-        oriented(crate::physics::wall_flux_r(w[li], 1.0, gamma), 1.0)
+        let f = oriented(crate::physics::wall_flux_r(w[li], 1.0, gamma), 1.0);
+        (f, f[2])
     } else {
-        oriented(crate::physics::wall_flux_r(w[ri], -1.0, gamma), -1.0)
+        let f = oriented(crate::physics::wall_flux_r(w[ri], -1.0, gamma), -1.0);
+        (f, f[2])
     }
 }
 
@@ -231,22 +279,41 @@ fn radial_face_flux(
 /// flux difference AND the axisymmetric pressure source, written inside a
 /// SINGLE bracket:
 ///
-///   rhs_r[j] -= [ (r_{j+1/2}*G_{j+1/2} - r_{j-1/2}*G_{j-1/2}) - p_j*dr ] / (dr * r_j)
+///   rhs_r[j] -= [ r_{j+1/2}*(G_{j+1/2} - S_j) - r_{j-1/2}*(G_{j-1/2} - S_j) ] / (dr_j * r_j)
 ///
-/// In f32 the separated form leaves a residue that accumulates into a faint
-/// axis artifact; inside one bracket the identical operands cancel bit-exactly.
-/// See docs/physics-reference.md §1. Under `Geometry::Planar` drop the
-/// r-weighting and the source entirely. Radial faces use HLL where `mask` is
-/// set (or under `FluxMode::Hll`/`HllRadial`), HLLC otherwise. The ±1 axial
-/// widening of the carbuncle switch (§2) lives inside `physics::carbuncle_mask`
-/// — its declaration sets the mask on cells i-1..=i+1 — so this caller only
-/// tests the two cells adjacent to each radial face.
+///   S_j = [0, 0, (p̂_{j-1/2} + p̂_{j+1/2})/2, 0],   r_j = (r_{j-1/2} + r_{j+1/2})/2
+///
+/// where p̂ are the INTERFACE pressures the Riemann solver sampled at the two
+/// faces and r_j is the ARITHMETIC MEAN of the face radii (the exact volume
+/// radius — r_j*dr_j is the true shell area at any grading). With the face-
+/// pressure source this bracket is algebraically identical to
+///
+///   (1/(r_j dr_j)) Δ(r G_advective)  +  (p̂_hi - p̂_lo)/dr_j
+///
+/// — the advective part in conservative r-weighted form plus the pressure
+/// part as a PLAIN GRADIENT, using the identity (1/r)d(rp)/dr - p/r ≡ dp/dr.
+/// That kills the cell-centre-radius ambiguity (volume centroid vs face mean
+/// differ ~4%): no cell radius enters the pressure balance at all, and a
+/// hydrostatic-in-r pressure field is differenced exactly on ANY radial grid
+/// (grid-grading work order, item c; ref arXiv 1701.04834). For uniform p the
+/// operands of the bracket cancel bit-exactly — including at row 0, whose
+/// lower face has r_lo = 0 exactly: the axis carries zero flux by
+/// construction. In f32 a separated flux-difference-plus-source form leaves a
+/// residue that accumulates into a faint axis artifact; the bracket does not.
+///
+/// Under `Geometry::Planar` drop the r-weighting and the source entirely.
+/// Radial faces use HLL where `mask` is set (or under
+/// `FluxMode::Hll`/`HllRadial`), HLLC otherwise. The ±1 axial widening of the
+/// carbuncle switch (§2) lives inside `physics::carbuncle_mask` — its
+/// declaration sets the mask on cells i-1..=i+1 — so this caller only tests
+/// the two cells adjacent to each radial face.
 #[allow(clippy::too_many_arguments)] // frozen signature
 pub fn sweep_r(w: &[Prim], solid: &[bool], mask: &[bool], g: &Grid,
                n: &Numerics, gas: &GasModel, rhs: &mut [Cons], floors: &mut u64) {
     let snz = g.snz();
     let gamma = gas.gamma;
-    let inv_dr = 1.0 / g.dr;
+    let axisym = n.geometry == Geometry::Axisymmetric;
+    let rg = r_face_geom(g, axisym);
     let hll_mode = matches!(n.flux_mode, FluxMode::Hll | FluxMode::HllRadial);
     // Each row recomputes both of its face fluxes, so every interior face is
     // evaluated twice on identical inputs — bit-identical results, hence still
@@ -260,51 +327,39 @@ pub fn sweep_r(w: &[Prim], solid: &[bool], mask: &[bool], g: &Grid,
                 return 0u64;
             }
             let mut local = 0u64;
-            let axisym = n.geometry == Geometry::Axisymmetric;
+            let inv_dr = 1.0 / g.dr(ir as usize);
             for iz in 0..g.nz {
                 let izs = iz as isize;
                 let ci = g.gidx(izs, ir);
                 if solid[ci] {
                     continue;
                 }
-                // Row 0's lower face is the axis: r_face(0) = 0 exactly, so in
-                // axisymmetric mode its flux is weighted by zero regardless of
-                // value. Skip the Riemann solve instead of multiplying it away.
-                let g_lo = if axisym && ir == 0 {
-                    [0.0; 4]
-                } else {
-                    radial_face_flux(w, solid, mask, g, n, hll_mode, gamma, izs,
-                                     ir - 1, &mut local)
-                };
-                let g_hi = radial_face_flux(w, solid, mask, g, n, hll_mode, gamma, izs,
-                                            ir, &mut local);
+                // Row 0's lower face is the axis: r_face(0) = 0 exactly, so
+                // its FLUX is weighted by zero — but its interface pressure
+                // still anchors the source. The mirrored Riemann problem
+                // reconstructs both sides to r = 0 and its star pressure is
+                // the symmetry-plane pressure; substituting the cell-centre
+                // value here mis-differences a linear dp/dr by a factor 3 at
+                // the axis row.
+                let (g_lo, p_lo) = radial_face_flux(w, solid, mask, g, &rg, n, hll_mode,
+                                                    gamma, izs, ir - 1, &mut local);
+                let (g_hi, p_hi) = radial_face_flux(w, solid, mask, g, &rg, n, hll_mode,
+                                                    gamma, izs, ir, &mut local);
                 let c = &mut row[NG + iz];
-                match n.geometry {
-                    Geometry::Planar => {
-                        for k in 0..4 {
-                            c[k] -= (g_hi[k] - g_lo[k]) * inv_dr;
-                        }
+                if axisym {
+                    // The single bracket with the face-pressure source (see
+                    // the doc comment). r_hi - r_lo = dr and
+                    // (r_hi + r_lo)/2 = r_center make it exact.
+                    let sj: Cons = [0.0, 0.0, 0.5 * (p_lo + p_hi), 0.0];
+                    let r_lo = g.r_face(ir as usize);
+                    let r_hi = g.r_face(ir as usize + 1);
+                    let inv = inv_dr / g.r_center(ir as usize);
+                    for k in 0..4 {
+                        c[k] -= (r_hi * (g_hi[k] - sj[k]) - r_lo * (g_lo[k] - sj[k])) * inv;
                     }
-                    Geometry::Axisymmetric => {
-                        // The single bracket, with the source entering as
-                        // S_j = [0, 0, p_j, 0] subtracted from each face flux
-                        // before the r-weighting:
-                        //
-                        //   [ r_hi*(G_hi - S_j) - r_lo*(G_lo - S_j) ] / (dr*r_j)
-                        //
-                        // Algebraically identical (r_hi - r_lo = dr), and it
-                        // makes the uniform-p cancellation bit-exact even
-                        // though fl((ir+1)*dr) - fl(ir*dr) need not round to
-                        // dr in f32. Row 0's lower face has r_lo = 0 exactly:
-                        // the axis carries zero flux by construction.
-                        let pj = w[ci][3];
-                        let sj: Cons = [0.0, 0.0, pj, 0.0];
-                        let r_lo = g.r_face(ir as usize);
-                        let r_hi = g.r_face(ir as usize + 1);
-                        let inv = 1.0 / (g.dr * g.r_center(ir as usize));
-                        for k in 0..4 {
-                            c[k] -= (r_hi * (g_hi[k] - sj[k]) - r_lo * (g_lo[k] - sj[k])) * inv;
-                        }
+                } else {
+                    for k in 0..4 {
+                        c[k] -= (g_hi[k] - g_lo[k]) * inv_dr;
                     }
                 }
             }
@@ -376,10 +431,14 @@ pub fn redo_first_order(out: &mut [Cons], u0: &[Cons], u1: Option<&[Cons]>,
     let hll_mode_r = matches!(n.flux_mode, FluxMode::Hll | FluxMode::HllRadial);
     let axisym = n.geometry == Geometry::Axisymmetric;
     let gm1 = gamma - 1.0;
-    let (inv_dz, inv_dr) = (1.0 / g.dz, 1.0 / g.dr);
+    // First-order reconstruction never reads the stencil geometry; UNIT
+    // stands in for every face.
+    let rg_unit = vec![FaceGeom::UNIT; g.nr + 1];
     let mut unused = 0u64;
     for ir in 0..g.nr as isize {
+        let inv_dr = 1.0 / g.dr(ir as usize);
         for iz in 0..g.nz as isize {
+            let inv_dz = 1.0 / g.dz(iz as usize);
             let ci = g.gidx(iz, ir);
             if solid[ci] {
                 continue;
@@ -403,7 +462,8 @@ pub fn redo_first_order(out: &mut [Cons], u0: &[Cons], u1: Option<&[Cons]>,
                     let s = [w[g.gidx(lc - 1, ir)], w[li], w[ri], w[g.gidx(rc + 1, ir)]];
                     let sol =
                         [solid[g.gidx(lc - 1, ir)], ls, rs, solid[g.gidx(rc + 1, ir)]];
-                    fluid_face_flux(s, sol, use_hll_z, &n_fo, gamma, &mut unused)
+                    fluid_face_flux(s, sol, &FaceGeom::UNIT, use_hll_z, &n_fo, gamma,
+                                    &mut unused).0
                 } else if !ls {
                     oriented(crate::physics::wall_flux_z(w[li], 1.0, gamma), 1.0)
                 } else {
@@ -412,34 +472,28 @@ pub fn redo_first_order(out: &mut [Cons], u0: &[Cons], u1: Option<&[Cons]>,
             };
             let f_lo = fz(iz - 1, iz);
             let f_hi = fz(iz, iz + 1);
-            let g_lo = if axisym && ir == 0 {
-                [0.0; 4]
-            } else {
-                radial_face_flux(w, solid, mask, g, &n_fo, hll_mode_r, gamma, iz,
-                                 ir - 1, &mut unused)
-            };
-            let g_hi = radial_face_flux(w, solid, mask, g, &n_fo, hll_mode_r, gamma, iz,
-                                        ir, &mut unused);
+            let (g_lo, p_lo) = radial_face_flux(w, solid, mask, g, &rg_unit, &n_fo,
+                                                hll_mode_r, gamma, iz, ir - 1, &mut unused);
+            let (g_hi, p_hi) = radial_face_flux(w, solid, mask, g, &rg_unit, &n_fo,
+                                                hll_mode_r, gamma, iz, ir, &mut unused);
             let mut rhs_c: Cons = [0.0; 4];
             for k in 0..4 {
                 rhs_c[k] = -(f_hi[k] - f_lo[k]) * inv_dz;
             }
-            match n.geometry {
-                Geometry::Planar => {
-                    for k in 0..4 {
-                        rhs_c[k] -= (g_hi[k] - g_lo[k]) * inv_dr;
-                    }
+            if axisym {
+                // The single bracket with the face-pressure source,
+                // identical to sweep_r (§1).
+                let sj: Cons = [0.0, 0.0, 0.5 * (p_lo + p_hi), 0.0];
+                let r_lo = g.r_face(ir as usize);
+                let r_hi = g.r_face(ir as usize + 1);
+                let inv = inv_dr / g.r_center(ir as usize);
+                for k in 0..4 {
+                    rhs_c[k] -=
+                        (r_hi * (g_hi[k] - sj[k]) - r_lo * (g_lo[k] - sj[k])) * inv;
                 }
-                Geometry::Axisymmetric => {
-                    // The single bracket, identical to sweep_r (§1).
-                    let sj: Cons = [0.0, 0.0, w[ci][3], 0.0];
-                    let r_lo = g.r_face(ir as usize);
-                    let r_hi = g.r_face(ir as usize + 1);
-                    let inv = 1.0 / (g.dr * g.r_center(ir as usize));
-                    for k in 0..4 {
-                        rhs_c[k] -=
-                            (r_hi * (g_hi[k] - sj[k]) - r_lo * (g_lo[k] - sj[k])) * inv;
-                    }
+            } else {
+                for k in 0..4 {
+                    rhs_c[k] -= (g_hi[k] - g_lo[k]) * inv_dr;
                 }
             }
             let a = u0[ci];
@@ -579,7 +633,7 @@ mod tests {
 
     #[test]
     fn primitives_round_trip() {
-        let g = Grid { nz: 4, nr: 3, dz: 0.1, dr: 0.1 };
+        let g = Grid::uniform(4, 3, 0.1, 0.1);
         let prim: Prim = [0.7, 1.3, -0.4, 0.9];
         let u = uniform_state(&g, prim);
         let mut w = vec![[0.0; 4]; g.glen()];
@@ -593,7 +647,7 @@ mod tests {
 
     #[test]
     fn wave_speed_matches_hand_value() {
-        let g = Grid { nz: 4, nr: 3, dz: 0.5, dr: 0.25 };
+        let g = Grid::uniform(4, 3, 0.5, 0.25);
         let prim: Prim = [1.0, 2.0, -1.0, 1.0];
         let u = uniform_state(&g, prim);
         let mut w = vec![[0.0; 4]; g.glen()];
@@ -607,7 +661,7 @@ mod tests {
 
     #[test]
     fn wave_speed_skips_solid_cells() {
-        let g = Grid { nz: 4, nr: 3, dz: 0.5, dr: 0.25 };
+        let g = Grid::uniform(4, 3, 0.5, 0.25);
         let prim: Prim = [1.0, 2.0, -1.0, 1.0];
         let u = uniform_state(&g, prim);
         let mut w = vec![[0.0; 4]; g.glen()];
@@ -628,7 +682,7 @@ mod tests {
     /// identical analytic flux and the differences cancel exactly.
     #[test]
     fn uniform_stream_gives_zero_rhs_planar() {
-        let g = Grid { nz: 8, nr: 6, dz: 0.1, dr: 0.07 };
+        let g = Grid::uniform(8, 6, 0.1, 0.07);
         let u = uniform_state(&g, [1.0, 0.3, 0.2, 1.0]);
         let (rhs, floors) = sweep_both(&u, &g, &numerics(Geometry::Planar));
         assert_eq!(floors, 0);
@@ -646,7 +700,7 @@ mod tests {
     /// including at row 0 where r_face = 0.
     #[test]
     fn quiescent_axisymmetric_rhs_is_bitwise_zero() {
-        let g = Grid { nz: 8, nr: 6, dz: 0.1, dr: 0.1 };
+        let g = Grid::uniform(8, 6, 0.1, 0.1);
         let u = uniform_state(&g, [1.0, 0.0, 0.0, 1.0]);
         let (rhs, floors) = sweep_both(&u, &g, &numerics(Geometry::Axisymmetric));
         assert_eq!(floors, 0);
@@ -662,7 +716,7 @@ mod tests {
     /// state: radial fluxes reduce to pressure only and the bracket cancels.
     #[test]
     fn uniform_axial_flow_axisymmetric_rhs_is_bitwise_zero() {
-        let g = Grid { nz: 8, nr: 6, dz: 0.1, dr: 0.1 };
+        let g = Grid::uniform(8, 6, 0.1, 0.1);
         let u = uniform_state(&g, [1.0, 2.0, 0.0, 1.0]);
         let (rhs, _) = sweep_both(&u, &g, &numerics(Geometry::Axisymmetric));
         for ir in 0..g.nr {
@@ -675,7 +729,7 @@ mod tests {
 
     #[test]
     fn accumulate_and_accumulate2_respect_solid_and_ghosts() {
-        let g = Grid { nz: 4, nr: 3, dz: 0.1, dr: 0.1 };
+        let g = Grid::uniform(4, 3, 0.1, 0.1);
         let u0 = uniform_state(&g, [1.0, 1.0, 0.0, 1.0]);
         let mut rhs = vec![[0.0; 4]; g.glen()];
         let mut solid = vec![false; g.glen()];
@@ -702,7 +756,7 @@ mod tests {
 
     #[test]
     fn positivity_clamps_and_counts() {
-        let g = Grid { nz: 4, nr: 2, dz: 0.1, dr: 0.1 };
+        let g = Grid::uniform(4, 2, 0.1, 0.1);
         let gas = GasModel { gamma: GAMMA, r_specific_si: 287.0 };
         let mut u = uniform_state(&g, [1.0, 0.5, 0.0, 1.0]);
         let healthy = u[g.gidx(0, 0)];
@@ -728,7 +782,7 @@ mod tests {
 
     #[test]
     fn residual_is_f64_and_skips_solid() {
-        let g = Grid { nz: 3, nr: 2, dz: 0.1, dr: 0.1 };
+        let g = Grid::uniform(3, 2, 0.1, 0.1);
         let u0 = uniform_state(&g, [1.0, 0.0, 0.0, 1.0]);
         let mut u1 = u0.clone();
         let mut solid = vec![false; g.glen()];
@@ -774,7 +828,7 @@ mod tests {
     /// Run Sod to t >= 0.2 with the given numerics; return (L1(rho), time).
     fn run_sod(n: &Numerics) -> (f64, f64) {
         let nz = 200usize;
-        let g = Grid { nz, nr: 1, dz: 1.0 / nz as f32, dr: 1.0 / nz as f32 };
+        let g = Grid::uniform(nz, 1, 1.0 / nz as f32, 1.0 / nz as f32);
         let gas = GasModel { gamma: GAMMA, r_specific_si: 287.0 };
         let solid = vec![false; g.glen()];
         let mask = vec![false; g.glen()];
@@ -814,7 +868,7 @@ mod tests {
         for iz in 0..nz {
             let x = (iz as f64 + 0.5) / nz as f64;
             let wc = cons_to_prim(u_old[g.gidx(iz as isize, 0)], GAMMA);
-            l1 += (wc[0] as f64 - sod_exact_rho(x, t)).abs() * g.dz as f64;
+            l1 += (wc[0] as f64 - sod_exact_rho(x, t)).abs() * g.dz(0) as f64;
             rho_max = rho_max.max(wc[0] as f64);
             rv_max = rv_max.max((wc[0] as f64 * wc[2] as f64).abs());
         }
@@ -859,7 +913,7 @@ mod tests {
     fn sod_unlimited_survives() {
         let n = Numerics { limiter: Limiter::None, ..numerics(Geometry::Planar) };
         let nz = 200usize;
-        let g = Grid { nz, nr: 1, dz: 1.0 / nz as f32, dr: 1.0 / nz as f32 };
+        let g = Grid::uniform(nz, 1, 1.0 / nz as f32, 1.0 / nz as f32);
         let gas = GasModel { gamma: GAMMA, r_specific_si: 287.0 };
         let solid = vec![false; g.glen()];
         let mask = vec![false; g.glen()];
