@@ -17,7 +17,7 @@ use cfd_contract::{Solver, SolverKind, StepInfo};
 
 fn main() -> eframe::Result {
     let params = case::CaseParams::default();
-    let wall = case::conical_contour(params.area_ratio);
+    let wall = case::nozzle_contour(&params);
     let setup = case::make_setup(&params, &wall);
 
     // EulerSolver by default; CFD_SOLVER=mock flips back to the analytic

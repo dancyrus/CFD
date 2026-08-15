@@ -62,6 +62,13 @@ exactly this — constant, both docs, and T1–T8 re-run with floors = 0.
 - The radial flux difference and the axisymmetric pressure source go inside **one
   bracket**. The f32 cancellation depends on it.
 - Image row 0 is the largest r, the opposite of `Grid`. Only `cfd-ui` flips.
+- Any stand-in written because another session's crate has not landed yet must
+  carry an **"until X lands" marker in the code**, greppable, at the stand-in
+  itself. The band rasterizer and the stub editor carried one and both got
+  swapped; `cfd-ui`'s conical contour did not, and it survived as the app's
+  only wall generator for the life of the project while the real (tested)
+  `cfd_geom::generate_contour` sat unused — every engine preset drew as a 15°
+  cone. A stand-in without a marker doesn't read as debt, so nobody collects it.
 
 ## Results get committed, not reported in chat
 

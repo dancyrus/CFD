@@ -13,9 +13,9 @@ use cfd_contract::{FieldKind, SolverCommand};
 
 use crate::canvas::{colorbar, fmt_value, Canvas, BG};
 use crate::case::{
-    self, ambient_nd, atmosphere, conical_contour, ideal_cf, make_setup, rasterize_wall,
-    separation_altitude_m, separation_threshold, CaseParams, PlumeLength, ALT_MAX_M, PRESETS,
-    R_UNIVERSAL_SI, VACUUM_P_FRAC,
+    self, ambient_nd, atmosphere, ideal_cf, make_setup, nozzle_contour, rasterize_wall,
+    separation_altitude_m, separation_threshold, CaseParams, ContourKind, PlumeLength, ALT_MAX_M,
+    PRESETS, R_UNIVERSAL_SI, VACUUM_P_FRAC,
 };
 use crate::editor::{EditorBackend, StubEditor};
 use crate::worker::{UiCommand, UiFrame};
@@ -178,7 +178,7 @@ impl CfdApp {
             self.preset = None; // partial change: no longer the named engine
         }
         self.params.area_ratio = self.ui_area_ratio;
-        let wall = conical_contour(self.params.area_ratio);
+        let wall = nozzle_contour(&self.params);
         self.editor.set_points(wall.clone());
         self.committed_wall = wall;
         self.geometry_custom = false;
@@ -215,7 +215,7 @@ impl CfdApp {
         };
         self.ui_area_ratio = self.params.area_ratio;
         self.ui_p0_mpa = self.params.p0_pa / 1e6;
-        let wall = conical_contour(self.params.area_ratio);
+        let wall = nozzle_contour(&self.params);
         let (lz, lr) = case::domain(&self.params);
         self.editor.set_domain(lz, lr);
         self.editor.set_points(wall.clone());
@@ -462,15 +462,49 @@ impl CfdApp {
             Some(i) => format!("{} · {}", PRESETS[i].name, PRESETS[i].propellant),
             None => "custom gas".to_string(),
         };
+        let contour_desc = match self.params.contour_kind {
+            ContourKind::Conical => "15° cone".to_string(),
+            ContourKind::ParabolicBell => match self.preset {
+                Some(i) => format!(
+                    "{:.0}% bell — {}",
+                    PRESETS[i].bell_percent * 100.0,
+                    PRESETS[i].bell_source
+                ),
+                None => format!("{:.0}% bell", self.params.bell_percent * 100.0),
+            },
+        };
         ui.label(
             RichText::new(format!(
-                "{head} · r_t {:.0} mm · ε {:.1}",
+                "{head} · r_t {:.0} mm · ε {:.1} · {contour_desc}",
                 self.params.r_throat_m * 1e3,
                 self.params.area_ratio
             ))
             .weak()
             .small(),
         );
+        // Honesty flag: the digitised Rao table stops at ε = 100, and
+        // rao_angles clamps rather than extrapolates — past the end the bell
+        // is the ε = 100 bell's angles stretched to this exit radius. Merlin
+        // Vac (ε = 165) lives here.
+        if self.params.contour_kind == ContourKind::ParabolicBell
+            && self.params.area_ratio > 100.0
+        {
+            ui.label(
+                RichText::new(format!(
+                    "bell angles clamped: Rao table ends at ε = 100 (this nozzle is ε {:.0})",
+                    self.params.area_ratio
+                ))
+                .small()
+                .color(AMBER),
+            )
+            .on_hover_text(
+                "θ_n and θ_e come from the digitised Rao table, which stops at \
+                 ε = 100; beyond it the angles clamp to the ε = 100 row instead \
+                 of extrapolating (the published data does not support \
+                 extrapolation). The wall shown is that bell continued to this \
+                 exit radius — plausible, but not a tabulated Rao contour.",
+            );
+        }
         ui.label(
             RichText::new(format!(
                 "γ {} · T₀ {:.0} K · MW {:.1} g/mol — propellant class, not measured",
@@ -1058,13 +1092,26 @@ fn warning_box(ui: &mut egui::Ui, color: Color32, title: &str, body: &str) {
 
 fn preset_tooltip(p: &case::EnginePreset) -> String {
     let mut s = format!(
-        "{} · ε {} · p₀ {:.0} bar · r_t {:.0} mm\n≈{:.1}× Merlin 1D run time",
+        "{} · ε {} · p₀ {:.0} bar · r_t {:.0} mm\n{:.0}% parabolic bell — {}\n≈{:.1}× Merlin 1D run time",
         p.propellant,
         p.area_ratio,
         p.p0_pa / 1e5,
         p.r_throat_m * 1e3,
+        p.bell_percent * 100.0,
+        p.bell_source,
         p.relative_cost()
     );
+    // The Rao θ_n/θ_e table is digitised at γ ≈ 1.23–1.25
+    // (docs/physics-reference.md §6, §10); an engine running well outside
+    // that band inherits the mismatch in its wall shape. Raptor 2 (γ 1.16)
+    // and RS-25 (γ 1.20) qualify; the LOX/RP-1 engines at 1.24 do not.
+    if p.gamma < 1.23 || p.gamma > 1.25 {
+        s.push_str(&format!(
+            "\nBell angles from the Rao table, digitised at γ 1.23–1.25; this \
+             engine runs γ {} — the wall shape inherits that mismatch.",
+            p.gamma
+        ));
+    }
     if !p.note.is_empty() {
         s.push('\n');
         s.push_str(p.note);

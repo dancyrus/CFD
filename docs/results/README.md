@@ -17,6 +17,10 @@ One file per suite per machine: `<suite>-<machine>.json`.
   -- --include-ignored` and `cargo test -p cfd-geom --test t0_rasterizer`.
 - `grading-bench-<machine>.json` — the grid-grading benchmark, written by
   `cargo test -p cfd-ui grading_bench -- --include-ignored`.
+- `contour-<machine>.json` — the contour-generator swap (cone equivalence,
+  bell vs published geometry, RS-25 cone-vs-bell report), written by
+  `cargo test -p cfd-ui contour` plus the slow before/after comparison
+  `cargo test -p cfd-ui rs25_before_after -- --include-ignored`.
 
 The **machine label is derived from the hardware** (CPU brand + logical core
 count, slugged — e.g. `apple-m1-8c`), never from a flag or hostname, so the
