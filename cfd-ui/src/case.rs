@@ -924,9 +924,15 @@ mod contour_swap {
             worst = worst.max((new[0][0] - old[0][0]).abs());
             let (ne, oe) = (new.last().unwrap(), old.last().unwrap());
             worst = worst.max((ne[0] - oe[0]).abs()).max((ne[1] - oe[1]).abs());
-            // …and every legacy vertex on the new wall.
+            // …and every legacy vertex on the new wall. The legacy exit z can
+            // land an ulp past the new polyline's (algebraically identical)
+            // exit z, where wall_radius returns None — clamp into the new
+            // span before sampling. Nothing is hidden: the endpoint z's were
+            // compared against the same tolerance above.
+            let (z_lo, z_hi) = (new[0][0], new.last().unwrap()[0]);
             for q in &old {
-                let r = wall_radius(&new, q[0]).expect("legacy vertex outside new wall");
+                let r = wall_radius(&new, q[0].clamp(z_lo, z_hi))
+                    .expect("legacy vertex outside new wall");
                 worst = worst.max((r - q[1]).abs());
             }
         }
@@ -1275,70 +1281,132 @@ mod contour_before_after {
     use super::*;
     use cfd_contract::Solver;
 
-    /// Cone-vs-bell report comparison. ~7 min of solver time; run explicitly:
+    /// Run one case to the §9 visual-steady step target (the grading_bench
+    /// finish line) and return (report, final step info, grid).
+    fn run_case(
+        c: &CaseParams,
+        wall: &[[f64; 2]],
+    ) -> (cfd_contract::Report, cfd_contract::StepInfo, Grid) {
+        let setup = make_setup(c, wall);
+        let g = setup.grid.clone();
+        let target = (6100.0 * g.lz() / LZ).round() as u64;
+        let mut s = cfd_core::EulerSolver::new(setup).unwrap();
+        let mut info = s.step().unwrap();
+        while info.step < target {
+            info = s.step().unwrap();
+        }
+        (s.report(), info, g)
+    }
+
+    /// Cone-vs-bell report comparison, ~10 min of solver time; run explicitly:
     ///
     ///     cargo test -p cfd-ui rs25_before_after -- --include-ignored --nocapture
     ///
-    /// Compact plume: mass flow, C_f, c* and exit Mach are exit-plane
-    /// quantities, unaffected by plume-domain length. Caveats recorded with
-    /// the numbers: RS-25 at sea level sits under the §13 separation warning
-    /// (inviscid solver, criterion conservative), so these are model-to-model
-    /// numbers, not pad predictions.
+    /// Two operating points, two roles:
+    ///
+    /// **Sea level** is the tasked report, and it is RECORDED, NOT ASSERTED.
+    /// RS-25 at sea level is deeply overexpanded (p_e/p_a ≈ 0.085, far under
+    /// the 0.40 separation threshold) and a 30k-step probe found no steady
+    /// state for either contour: the shock system breathes in and out of the
+    /// divergent section (the §9 "shock inside the nozzle moves slowly"
+    /// exception, taken to its limit) and every exit-plane readout oscillates
+    /// with O(1) amplitude. "C_f rises with the bell" rests on the divergence-
+    /// factor argument, which assumes attached full flow — at sea level it is
+    /// untestable in this model, which is precisely what the §13 separation
+    /// warning ("readouts are not valid in this regime") already says.
+    ///
+    /// **20 km** (p_a ≈ 5.5 kPa, p_e/p_a ≈ 1.6, attached and mildly
+    /// underexpanded) is where the claim is testable, and asserted: the
+    /// cone's 15° exit loses ~1.7% of axial momentum to divergence
+    /// ((1+cos 15°)/2) against the bell's ~7° exit (~0.4%), so C_f must
+    /// rise. Mass flow must also agree between the two runs — same chamber,
+    /// same throat — which doubles as the steadiness guard.
+    ///
+    /// Compact plume for all runs: these are exit-plane quantities,
+    /// unaffected by plume-domain length. Model-to-model comparison, not a
+    /// pad prediction.
     #[test]
     #[ignore = "solver benchmark: minutes; run explicitly with --include-ignored"]
-    fn rs25_before_after_sea_level() {
+    fn rs25_before_after() {
         let pre = PRESETS.iter().find(|p| p.name == "RS-25").unwrap();
         let mut c = pre.case(0.0, false);
         c.plume = PlumeLength::Compact;
-        let mut cf = [f64::NAN; 2];
-        for (k, (setting, wall)) in [
+        let walls = [
             ("15 deg cone (before)", conical_contour(c.area_ratio)),
             ("80% bell (after)", nozzle_contour(&c)),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let setup = make_setup(&c, &wall);
-            let g = setup.grid.clone();
-            // §9 visual-steady criterion, scaled by domain length — the same
-            // finish line grading_bench uses. Floors: the RS-25 cold start
-            // trips the 1e-6 floor by design (§5); the target comfortably
-            // clears the §13 quarantine (startup activations + 1500 quiet).
-            let target = (6100.0 * g.lz() / LZ).round() as u64;
-            let mut s = cfd_core::EulerSolver::new(setup).unwrap();
-            let mut info = s.step().unwrap();
-            while info.step < target {
-                info = s.step().unwrap();
-            }
-            let rep = s.report();
-            cf[k] = rep.thrust_coefficient;
-            cfd_results::record_note("contour", &format!("rs25-{setting}"), &format!(
+        ];
+
+        // Sea level: record the tasked before/after snapshot, honestly framed.
+        for (setting, wall) in &walls {
+            let (rep, info, g) = run_case(&c, wall);
+            cfd_results::record_note("contour", &format!("rs25-sea-level-{setting}"), &format!(
                 "RS-25 sea level, {setting}: mass flow {:.1} kg/s, C_f {:.4}, \
-                 c* {:.1} m/s, exit Mach {:.3} (area-avg) at step {} \
-                 ({} x {} cells, Compact plume, floors {}). Separated-flow \
-                 regime per the §13 criterion: model-to-model comparison, not \
-                 a pad prediction.",
+                 c* {:.1} m/s, exit Mach {:.3} (area-avg) at step {} ({} x {} \
+                 cells, Compact plume, floors {}). SNAPSHOT OF AN UNSTEADY \
+                 LIMIT CYCLE, not a steady state — see the \
+                 rs25-sea-level-unsteady note.",
                 rep.mass_flow_kg_s, rep.thrust_coefficient, rep.c_star_m_s,
                 rep.exit_mach, info.step, g.nz, g.nr, info.floor_activations));
             println!(
-                "{setting}: mdot {:.1} kg/s | C_f {:.4} | c* {:.1} m/s | M_e {:.3}",
+                "sea level, {setting}: mdot {:.1} kg/s | C_f {:.4} | c* {:.1} m/s | M_e {:.3}",
                 rep.mass_flow_kg_s, rep.thrust_coefficient, rep.c_star_m_s, rep.exit_mach
             );
         }
-        // The one assertable expectation: the cone's 15° exit dumps ~1.7% of
-        // axial momentum to divergence ((1+cos 15)/2) against the bell's ~7°
-        // exit (~0.4%), so C_f must rise with the bell.
+        cfd_results::record_note("contour", "rs25-sea-level-unsteady",
+            "RS-25 at sea level is deeply overexpanded (p_e/p_a ~ 0.085, §13 \
+             separation-warning regime) and has NO steady state in this inviscid \
+             model: a 30k-step probe of both contours shows the shock system \
+             breathing in and out of the nozzle, with exit-plane readouts \
+             oscillating over mdot 291-738 kg/s (cone) / 48-895 (bell), exit \
+             Mach 0.58-2.97 / 0.77-3.59, C_f 1.41-1.86 / 1.43-1.79. The \
+             cone-vs-bell C_f comparison is therefore asserted at 20 km \
+             (attached flow), not at sea level.");
+
+        // 20 km: attached flow — the assertable comparison.
+        c.altitude_m = 20_000.0;
+        let mut cf = [f64::NAN; 2];
+        let mut mdot = [f64::NAN; 2];
+        for (k, (setting, wall)) in walls.iter().enumerate() {
+            let (rep, info, g) = run_case(&c, wall);
+            cf[k] = rep.thrust_coefficient;
+            mdot[k] = rep.mass_flow_kg_s;
+            cfd_results::record_note("contour", &format!("rs25-20km-{setting}"), &format!(
+                "RS-25 at 20 km, {setting}: mass flow {:.1} kg/s, C_f {:.4}, \
+                 c* {:.1} m/s, exit Mach {:.3} (area-avg) at step {} ({} x {} \
+                 cells, Compact plume, floors {}).",
+                rep.mass_flow_kg_s, rep.thrust_coefficient, rep.c_star_m_s,
+                rep.exit_mach, info.step, g.nz, g.nr, info.floor_activations));
+            println!(
+                "20 km, {setting}: mdot {:.1} kg/s | C_f {:.4} | c* {:.1} m/s | M_e {:.3}",
+                rep.mass_flow_kg_s, rep.thrust_coefficient, rep.c_star_m_s, rep.exit_mach
+            );
+        }
+        let mdot_mismatch = (mdot[1] / mdot[0] - 1.0).abs();
         cfd_results::record_test("contour", cfd_results::TestResult {
-            id: "rs25-cf-rise".into(),
-            name: "RS-25 sea level C_f, 80% bell vs 15 deg cone".into(),
+            id: "rs25-mdot-agree-20km".into(),
+            name: "RS-25 20 km mass flow, bell vs cone (same throat; steadiness guard)".into(),
+            expected: "<= 5% mismatch".into(),
+            actual: mdot_mismatch.into(),
+            units: "relative mismatch".into(),
+            pass: mdot_mismatch <= 0.05,
+        });
+        cfd_results::record_test("contour", cfd_results::TestResult {
+            id: "rs25-cf-rise-20km".into(),
+            name: "RS-25 20 km C_f, 80% bell vs 15 deg cone".into(),
             expected: "bell > cone".into(),
             actual: (cf[1] - cf[0]).into(),
             units: "delta C_f".into(),
             pass: cf[1] > cf[0],
         });
         assert!(
+            mdot_mismatch <= 0.05,
+            "mass flow disagrees at 20 km (unsteady?): cone {} vs bell {} kg/s",
+            mdot[0],
+            mdot[1]
+        );
+        assert!(
             cf[1] > cf[0],
-            "C_f did not rise with the bell: cone {} vs bell {}",
+            "C_f did not rise with the bell at 20 km: cone {} vs bell {}",
             cf[0],
             cf[1]
         );
@@ -1386,3 +1454,4 @@ mod floor_diag {
         println!("total floors {prev}");
     }
 }
+
