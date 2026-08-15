@@ -80,7 +80,7 @@ The transient is the demo. The user watches the plume go from over-expanded to u
 
 Shade the slider track below the separation threshold and put a labeled tick at the crossing point, recomputed when the area ratio changes, so the user sees where the trustworthy range ends **before** dragging.
 
-**Area ratio and chamber pressure sliders.** Clamp the area-ratio slider so cells-across-the-throat-radius never drops below 20, and **display that number next to the thrust readout**. Below 20 the mass-flow error exceeds 5%.
+**Area ratio and chamber pressure sliders.** Clamp the area-ratio slider so cells-across-the-throat-radius never drops below 20, and **display that number next to the thrust readout**. Below 20 the mass-flow error exceeds 5%. *[Superseded by the configurable-domain work order: resolution is now a direct input (8–160 cells/r_t) and the N ≥ 20 rule survives as the amber badge; the displayed-next-to-thrust rule stands.]*
 
 **Turbo control** — 1× / 4× / 16× — running N solver steps per rendered frame, gated by a frame-time budget. Five lines, and it buys most of what local timestepping would without destroying the transient's physical meaning.
 
@@ -100,7 +100,7 @@ This is not decoration. It is the difference between a toy that teaches and a to
 
 > **⚠ SEPARATED FLOW — NOT SIMULATED.** Exit pressure ratio p_e/p_a = 0.28 is below the separation threshold of 0.40. A real nozzle would separate inside the divergent section: the boundary layer would detach and a shock would stand inside the nozzle. **This simulation is inviscid — it has no boundary layer and cannot separate.** Thrust and exit-pressure readouts are not valid in this regime.
 
-**Badges:** mass flow ±5% (amber below 20 cells across the throat); exit pressure and exit Mach "area-averaged, ±4%"; thrust coefficient "inviscid, no divergence correction applied"; drawn-geometry mode "sandbox — qualitative only", since no acceptance test covers an arbitrary user drawing.
+**Badges:** mass flow ±5% (amber below 20 cells across the throat) *[now computed live as ±(100/N_throat)% — see physics-reference §13]*; exit pressure and exit Mach "area-averaged, ±4%"; thrust coefficient "inviscid, no divergence correction applied"; drawn-geometry mode "sandbox — qualitative only", since no acceptance test covers an arbitrary user drawing.
 
 **Refuse to display:** Isp in seconds (needs real-gas and chemistry — show C_f relative to the 1-D ideal, which is a ratio and defensible); any efficiency to better than 1%; wall heat flux, shear, skin friction, boundary-layer thickness, wall temperature; separation station as a simulation result; absolute thrust for a named real engine; **anything at all while the floor-activation counter is nonzero** — blank the numeric panel and show "solution invalid."
 
