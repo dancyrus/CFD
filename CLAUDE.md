@@ -13,6 +13,20 @@ type and function signatures every crate codes against.
 **Find your session brief in `docs/sessions/` and follow it.** If you do not know
 which session you are, ask.
 
+## Solver optimization work goes on `solver-optimization`
+
+All solver optimization work commits to the `solver-optimization` branch, never
+straight to `main`. A human decides when it merges; do not merge it yourself.
+
+The plan of record is two project documents, not repo files — read both before
+starting optimization work: `claude/solver-performance-plan-v2.md` (what to
+optimize, in what order) and `claude/solver-generality-audit-v1.md` (what has to
+stay general while it is optimized). If you cannot see them, ask for them rather
+than guessing at the plan.
+
+**This rule expires when `solver-optimization` merges to `main`.** Delete this
+section as part of that merge.
+
 ## Crate ownership — do not cross these lines
 
 | Path | Owner |
