@@ -32,7 +32,13 @@ deuteranopia simulation, CIELAB L\* profile, and ΔE00 step size between adjacen
 LUT entries. A flat red trace is a perceptually uniform map. The sawtooth on
 `repo schlieren` is the duplicated-entry collapse described in §5.*
 
-## 2. Field → preset assignment
+## 2. Field → preset defaults
+
+These are **defaults, not fixed assignments.** Colormap identity is a `Preset`,
+independent of `FieldKind`; the player can put any preset on any field from the
+Display panel, and that choice is theirs to keep. The table is what the field
+starts as and what it returns to, and the rationale below is why — a player
+overriding it should be overriding a reasoned position, not an arbitrary one.
 
 The canvas is a **flat 2D image**, not a shaded 3D surface. Nothing else is
 using lightness, so we use the full black→white range. That is why the
@@ -40,7 +46,7 @@ using lightness, so we use the full black→white range. That is why the
 bounded-lightness family (`fast`, `smooth-cool-warm`) that ParaView defaults to
 for 3D scenes.
 
-| `FieldKind` | Type | Preset | Centre / range |
+| `FieldKind` | Type | Default preset | Centre / range |
 |---|---|---|---|
 | `Density` | sequential | **`viridis`** | data range, zero-anchored |
 | `Pressure` | sequential | **`inferno`** | data range |
@@ -74,6 +80,44 @@ Rationale for the ones that are not obvious:
   symmetry — keep it.
 
 **Not used, deliberately:** `jet`, `hsv`, any hand-rolled rainbow. See §7.
+
+### What the player can change
+
+Three controls in the Display panel, all per field.
+
+**The picker.** Every preset is offered for every field. The list is *not*
+filtered by `PresetKind` — a diverging map on `Mach` centred at 1.0 is a
+legitimate transonic view, and a filter that silently removed it would be
+wrong more often than the mistake it prevents. Guidance is carried by a weak
+inline warning instead: selecting a diverging preset for a field that is not
+signed says so, because the light band then lands wherever the range happens to
+put it and reads as a feature that is not there. Warn, never prevent.
+
+**The guardrail toggle ("free range").** §8's range rules — Schlieren pinned to
+[0, 1], signed fields symmetric about zero — are enforced by default, and
+editing one end of a signed field's range moves the other to match. The toggle
+suspends them for that field and names what is no longer enforced, e.g.
+*asymmetric — zero is off the colormap's light point*. It appears only on the
+fields that have a rule to suspend. Turning it back off re-imposes the rule
+immediately; leaving an asymmetric range under a toggle that claims symmetry
+would make the control a lie.
+
+**Auto vs manual ranges.** A range is *auto* while `lock_range` owns it and
+becomes *manual* the moment it is typed or dragged. The distinction only matters
+at the re-lock that follows a rebuild: auto ranges are overwritten with the new
+scales, manual ones are left exactly as the player set them and flagged
+*scales changed — range may be stale*, cleared by Refit or by any further edit.
+
+The flag is the whole point. A p₀ change can move the reference scales by 35×,
+so a range chosen against the old ones can render as a solid block of one
+colour. Discarding what the player typed loses their work; showing them the
+solid block with no explanation loses their trust. Flagging is the only option
+that loses neither.
+
+Edits are **rejected, not clamped**: a non-finite entry or an inverted range
+reverts to the last committed value and highlights the offending end. A silently
+clamped range misreports what was asked for, which is the same class of error as
+a silently rescaling colorbar.
 
 ## 3. Preset control points
 
@@ -188,12 +232,42 @@ blue-white-red. 10 anchors · max ΔE00 1.11 · step CV 19.2%.
 | 0.9529 | 198, 52, 52 |
 | 1.0000 | 180, 4, 38 |
 
-## 4. Why the current LUTs are wrong
+### Rainbow option: `turbo`
+Not the default for any field (§7); shipped so the "Turbo (classic)" picker
+entry is real turbo rather than a resample of it. 13 anchors · max ΔE00 1.79 ·
+1 L\* reversal · deuteranopia min step 0.081.
+
+| pos | rgb |
+|---|---|
+| 0.0000 | 48, 18, 59 |
+| 0.0902 | 68, 84, 195 |
+| 0.1451 | 71, 120, 240 |
+| 0.1922 | 65, 150, 255 |
+| 0.2549 | 39, 190, 233 |
+| 0.3412 | 29, 231, 178 |
+| 0.4667 | 136, 255, 78 |
+| 0.5412 | 190, 244, 52 |
+| 0.6275 | 238, 207, 58 |
+| 0.6941 | 254, 169, 51 |
+| 0.7647 | 249, 117, 29 |
+| 0.8745 | 210, 49, 5 |
+| 1.0000 | 122, 4, 3 |
+
+The CVD and step-CV numbers here fail the §10 gate on purpose — that is what
+§7 means by "conditional". They are recorded so the cost of choosing it is
+visible, not so it can be presented as an equal option.
+
+## 4. Why the old LUTs were wrong
+
+**Closed.** `colormap.rs` now builds every preset from the §3 tables. This
+section is kept because the measurements are the reason the tables look the way
+they do — anyone tempted to "tidy" the anchor positions into even spacing is
+about to reintroduce exactly this.
 
 Measured against the true reference maps, over 256 entries, max ΔE00 in
-CAM02-UCS. These are the numbers that justify changing `colormap.rs`.
+CAM02-UCS. These are the numbers that justified changing `colormap.rs`.
 
-| current LUT | max ΔE00 vs reference | verdict |
+| superseded LUT | max ΔE00 vs reference | verdict |
 |---|---|---|
 | 9 even-spaced viridis anchors | **1.10** | fine — keep the map, use the 7-anchor table anyway (fewer points, same fidelity) |
 | 9 even-spaced inferno anchors | **3.14** | marginal; visible as a soft false band in the smooth plume |
@@ -265,8 +339,10 @@ things fall out:
    exponential in the snapshot runs ~26× fewer times than it would per pixel.
    The per-pixel path stays a pure LUT index either way.
 
-Until that lands, at minimum round instead of truncating: `as u8` on
-`245.0 * exp(...)` biases every level down by up to one code.
+Until that lands, at minimum round instead of truncating: a bare `as u8` on
+`245.0 * exp(...)` biases every level down by up to one code. **Done** — the
+`grayscale` preset rounds. The root-cause fix is still open: it crosses into
+`cfd-core`, so it stays a separate work order.
 
 ## 6. Wall, NaN, and out-of-range
 
