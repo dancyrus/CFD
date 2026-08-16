@@ -1,9 +1,11 @@
 # Work order: general-geometry acceptance rungs (A1)
 
-**Status:** rungs landed; three of the four fail against the solver as it
-stands. That is the intended outcome — they were added *before* the fixes, not
-after. Nothing in the solver was changed by this work order and no tolerance
-was weakened to make a rung pass.
+**Status:** rungs landed. All four carry at least one failing assertion
+against the solver as it stands — 7 of the 13 new assertions pass, 6 fail.
+That is the intended outcome: they were added *before* the fixes, not after.
+Nothing in the solver was changed by this work order and no tolerance was
+weakened to make a rung pass. T0–T8 and the graded-grid guards were re-run
+unchanged and all pass.
 
 ## Why
 
