@@ -12,9 +12,10 @@ must never be gitignored.
 
 One file per suite per machine: `<suite>-<machine>.json`.
 
-- `ladder-<machine>.json` — the acceptance ladder (T0–T8 plus the graded-grid
-  guards), written by `cargo test -p cfd-core --test acceptance --test ladder
-  -- --include-ignored` and `cargo test -p cfd-geom --test t0_rasterizer`.
+- `ladder-<machine>.json` — the acceptance ladder (T0–T8, the general-geometry
+  rungs G0–G3, and the graded-grid guards), written by `cargo test -p cfd-core
+  --test acceptance --test ladder -- --include-ignored` and `cargo test -p
+  cfd-geom --test t0_rasterizer`.
 - `grading-bench-<machine>.json` — the grid-grading benchmark, written by
   `cargo test -p cfd-ui grading_bench -- --include-ignored`.
 - `contour-<machine>.json` — the contour-generator swap (cone equivalence,
