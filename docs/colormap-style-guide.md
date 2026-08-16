@@ -119,6 +119,14 @@ reverts to the last committed value and highlights the offending end. A silently
 clamped range misreports what was asked for, which is the same class of error as
 a silently rescaling colorbar.
 
+**What persists.** The preset choice survives a restart; the range does not, and
+resets to `lock_range`. A range belongs to the case that produced it — restoring
+one against a different p₀ would paint a solid block on launch, which is the
+failure this section exists to prevent. Presets are stored as their
+discriminants, so those are a persisted format: **add to the end of the enum,
+never renumber**, or every saved field silently changes colour. An index a build
+does not recognise falls back to that field's default and leaves the rest alone.
+
 ## 3. Preset control points
 
 Positions are normalised 0→1 and are **not evenly spaced**. Each set is the

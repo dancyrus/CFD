@@ -37,6 +37,13 @@ struct RangeState {
     invalid: RangeInvalid,
 }
 
+/// Storage key for the per-field colormap choice.
+///
+/// The preset choice persists; the display range deliberately does not. A range
+/// is tied to the case that produced it — restoring one against a different p₀
+/// would paint a solid block on launch, which is the failure §2 warns about.
+const CMAP_KEY: &str = "cfd.cmap.presets";
+
 const TURBO_STEPS: [u32; 3] = [1, 4, 16];
 /// Step of a rebuilt solver at which the deferred colorbar re-lock fires.
 const RELOCK_STEP: u64 = 30;
@@ -148,6 +155,7 @@ impl CfdApp {
         params: CaseParams,
         wall: Vec<[f64; 2]>,
         watermark: bool,
+        storage: Option<&dyn eframe::Storage>,
     ) -> Self {
         let mut locked = [(0.0f32, 1.0f32); 8];
         let mut cmap = [Preset::Viridis; 8];
@@ -155,6 +163,7 @@ impl CfdApp {
             locked[k as usize] = lock_range(k, initial.snapshot.range(k));
             cmap[k as usize] = Preset::default_for(k);
         }
+        cmap = restore_presets(storage.and_then(|s| eframe::get_value(s, CMAP_KEY)), cmap);
         let mut editor = StubEditor::new(wall.clone());
         editor.set_domain(params.lz_rt, params.lr_rt);
         CfdApp {
@@ -1395,6 +1404,31 @@ impl eframe::App for CfdApp {
                 };
             });
     }
+
+    /// Only the colormap choice is persisted — see `CMAP_KEY` for why the
+    /// range is not.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let ids = self.cmap.map(|p| p as u8);
+        eframe::set_value(storage, CMAP_KEY, &ids);
+    }
+}
+
+/// Fold a stored discriminant array over the defaults, one field at a time.
+///
+/// Per-field rather than all-or-nothing: an index this build does not know
+/// falls back to that field's default and leaves the other seven alone, so a
+/// settings file from a newer build degrades instead of being discarded.
+fn restore_presets(stored: Option<[u8; 8]>, defaults: [Preset; 8]) -> [Preset; 8] {
+    let Some(stored) = stored else {
+        return defaults;
+    };
+    let mut out = defaults;
+    for (slot, i) in out.iter_mut().zip(stored) {
+        if let Some(p) = Preset::from_index(i) {
+            *slot = p;
+        }
+    }
+    out
 }
 
 /// The range-edit rule as a pure function: `None` rejects the edit and leaves
@@ -1749,6 +1783,50 @@ mod tests {
         relock_field(UNSIGNED, &mut st, &mut locked, (0.0, 140.0));
         assert_eq!(locked, (0.0, 4.0), "a typed range must not be discarded");
         assert!(st.stale, "a surviving manual range must be flagged");
+    }
+
+    fn defaults() -> [Preset; 8] {
+        let mut d = [Preset::Viridis; 8];
+        for k in FieldKind::ALL {
+            d[k as usize] = Preset::default_for(k);
+        }
+        d
+    }
+
+    #[test]
+    fn no_stored_presets_leaves_the_defaults_alone() {
+        assert_eq!(restore_presets(None, defaults()), defaults());
+    }
+
+    #[test]
+    fn stored_presets_round_trip_through_discriminants() {
+        let mut want = defaults();
+        want[FieldKind::Mach as usize] = Preset::Turbo;
+        want[FieldKind::Density as usize] = Preset::Grayscale;
+        // Exactly what `save` writes.
+        let ids = want.map(|p| p as u8);
+        assert_eq!(restore_presets(Some(ids), defaults()), want);
+    }
+
+    #[test]
+    fn an_unknown_stored_preset_falls_back_per_field() {
+        // A settings file from a newer build: one index this build does not
+        // know. That field reverts to its default; the rest must survive.
+        let mut ids = defaults().map(|p| p as u8);
+        ids[FieldKind::Mach as usize] = 200;
+        ids[FieldKind::Pressure as usize] = Preset::Turbo as u8;
+
+        let got = restore_presets(Some(ids), defaults());
+        assert_eq!(
+            got[FieldKind::Mach as usize],
+            Preset::default_for(FieldKind::Mach),
+            "unknown index must fall back to the default"
+        );
+        assert_eq!(
+            got[FieldKind::Pressure as usize],
+            Preset::Turbo,
+            "one bad entry must not discard the others"
+        );
     }
 
     #[test]

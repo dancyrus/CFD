@@ -59,6 +59,16 @@ impl Preset {
         Preset::Turbo,
     ];
 
+    /// Inverse of `self as u8`. `None` for an index this build does not know,
+    /// which is how a settings file written by a newer build degrades: the
+    /// field falls back to its default instead of failing the whole load.
+    ///
+    /// The discriminants are the persisted format. Renumbering them silently
+    /// repaints every saved field with a different colormap — add at the end.
+    pub fn from_index(i: u8) -> Option<Preset> {
+        Preset::ALL.get(i as usize).copied()
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Preset::Viridis => "viridis",
@@ -291,6 +301,18 @@ mod tests {
         // Grayscale/schlieren is monotone decreasing (dark = strong gradient).
         let s = lut_for(Preset::Grayscale);
         assert!(s[0][0] > s[128][0] && s[128][0] > s[255][0]);
+    }
+
+    /// `from_index` indexes `ALL`, so the two must agree. They are also the
+    /// persisted format, so a mismatch would silently recolour saved fields.
+    #[test]
+    fn all_is_ordered_by_discriminant() {
+        for (i, p) in Preset::ALL.iter().enumerate() {
+            assert_eq!(*p as usize, i, "{} is out of discriminant order", p.name());
+            assert_eq!(Preset::from_index(i as u8), Some(*p));
+        }
+        assert_eq!(Preset::from_index(Preset::ALL.len() as u8), None);
+        assert_eq!(Preset::from_index(255), None);
     }
 
     /// §7: turbo is offered, but it is not the default for anything.

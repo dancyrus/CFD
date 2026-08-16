@@ -10,7 +10,11 @@ edition = "2021"
 cfd-contract = { workspace = true }
 cfd-core = { workspace = true }
 cfd-geom = { workspace = true }
-eframe = { workspace = true }
+# `persistence` carries the per-field colormap choice across restarts. It adds
+# four transitive crates (ron, base64, enumn, home) and NO serde beyond what
+# winit/wgpu already pull in. It also makes eframe persist window geometry,
+# which is a wanted side effect, not an accident.
+eframe = { workspace = true, features = ["persistence"] }
 egui = { workspace = true }
 triple_buffer = { workspace = true }
 
