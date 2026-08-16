@@ -272,16 +272,26 @@ impl CfdApp {
     }
 
     /// Apply a preset whole — geometry, area ratio, chamber pressure, gas
-    /// model and domain together, never partially — or revert to the demo
-    /// case (`None`). Altitude and vacuum mode carry over: they describe the
-    /// ambient, not the engine.
+    /// model, domain AND opening altitude together, never partially — or
+    /// revert to the demo case (`None`).
+    ///
+    /// Altitude used to carry over on the reasoning that it describes the
+    /// ambient rather than the engine. That is true of the slider but not of
+    /// the FIRST view of a preset: an altitude-optimised upper stage opened at
+    /// sea level is separated before the user has touched anything (Atlas
+    /// LR105 and Titan I LR91 sit at p_e/p_a 0.17 and 0.16 against the 0.40
+    /// threshold), and a warning that fires on arrival, about nothing the user
+    /// did, is a warning people learn to dismiss. So the opening altitude is
+    /// part of the preset — `EnginePreset::default_altitude_km`, 0 for every
+    /// engine that honestly runs on the pad. Vacuum mode still carries over;
+    /// it is a mode, not an altitude.
     fn apply_preset(&mut self, preset: Option<usize>) {
         self.preset = preset;
-        let (alt, vac) = (self.params.altitude_m, self.params.vacuum);
+        let vac = self.params.vacuum;
         self.params = match preset {
-            Some(i) => PRESETS[i].case(alt, vac),
+            Some(i) => PRESETS[i].case(PRESETS[i].default_altitude_m(), vac),
             None => CaseParams {
-                altitude_m: alt,
+                altitude_m: self.params.altitude_m,
                 vacuum: vac,
                 ..CaseParams::default()
             },
@@ -1699,6 +1709,25 @@ fn preset_tooltip(p: &case::EnginePreset) -> String {
             "\nBell angles from the Rao table, digitised at γ 1.23–1.25; this \
              engine runs γ {} — the wall shape inherits that mismatch (sub-degree).",
             p.gamma
+        ));
+    }
+    // Where γ/T₀/MW came from. The sidebar already labels them "propellant
+    // class, not measured"; for the CEA-backed classes the tooltip can say
+    // which class and what it implies, so the ideal c* is visible next to the
+    // solver's measured mass flow instead of only in a results file.
+    if let Some(class) = p.propellant_class {
+        s.push_str(&format!(
+            "\nγ/T₀/MW: {} equilibrium chamber (CEA, frozen γ) at this \
+             engine's O/F and p₀ — ideal c* {:.0} m/s.",
+            class.label(),
+            p.gas().cstar_ideal_m_s
+        ));
+    }
+    if p.default_altitude_km > 0.0 {
+        s.push_str(&format!(
+            "\nOpens at {:.0} km: altitude-optimised, and separated at sea \
+             level.",
+            p.default_altitude_km
         ));
     }
     if !p.note.is_empty() {

@@ -21,6 +21,21 @@ One file per suite per machine: `<suite>-<machine>.json`.
   bell vs published geometry, RS-25 cone-vs-bell report), written by
   `cargo test -p cfd-ui contour` plus the slow before/after comparison
   `cargo test -p cfd-ui rs25_before_after -- --include-ignored`.
+- `historical-presets-<machine>.json` — the historical engine presets
+  (1943–1961) and their CEA-backed propellant classes: cone geometry, domain
+  fit, separation at each preset's default altitude, the Redstone throat area
+  against its published diameter, and the regression pin on the six earlier
+  presets. Written by `cargo test -p cfd-ui historical_presets`, plus the
+  run-time benchmark `cargo test -p cfd-ui historical_preset_cost --
+  --include-ignored`.
+
+One companion file here is **not** machine-keyed JSON and is not written by
+`cfd-results`: `propellant-cea.md` is the output of `tools/propellant_cea.py`,
+an offline thermochemistry computation whose result depends on the reactant
+data and the CEA/cantera version, not on the hardware. It is a table, not a
+measurement, so it has no `machine` and no pass/fail. Regenerate it with the
+command recorded in its own header; the write-up that consumes it is
+`historical-presets-v1.md`.
 
 The **machine label is derived from the hardware** (CPU brand + logical core
 count, slugged — e.g. `apple-m1-8c`), never from a flag or hostname, so the

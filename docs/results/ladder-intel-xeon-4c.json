@@ -1,26 +1,26 @@
 {
-  "commit": "1e34ec2aef510af153eefaec8141148089b28727",
-  "timestamp": "2026-08-16T20:26:11Z",
+  "commit": "0519859732215cc28300a313731640655913cb3d",
+  "timestamp": "2026-08-16T23:35:00Z",
   "machine": "intel-xeon-4c",
   "tests": [
-    {"id":"T0-disk","name":"rasterizer disk area, R in {3..20} cells","expected":"<= 5e-3","actual":0.000000005412779598310543,"units":"worst relative area error","pass":true},
-    {"id":"T0-throat","name":"rasterized nozzle throat area, 6 slider settings","expected":"<= 5e-3","actual":0.0015822280899842056,"units":"worst relative area error","pass":true},
     {"id":"T5-toro2","name":"positivity: Toro test 2 double rarefaction","expected":0,"actual":0,"units":"floor activations","pass":true},
     {"id":"T3-unlimited","name":"order of accuracy, smooth advection, unlimited slope","expected":">= 1.90","actual":1.988265418395167,"units":"convergence order","pass":true},
     {"id":"T3-limited","name":"order of accuracy, smooth advection, minmod","expected":">= 1.50","actual":1.7759660019045689,"units":"convergence order","pass":true},
     {"id":"T2","name":"conservation drift, closed axisymmetric box, 1000 steps","expected":"<= 2e-6","actual":0.0000002982402645031242,"units":"relative drift","pass":true},
     {"id":"T5-vacuum","name":"positivity: demo nozzle starting into 50 km ambient","expected":0,"actual":0,"units":"floor activations","pass":true},
     {"id":"T6","name":"oblique shock, 15 deg wedge at M 2","expected":"45.344 +/- 1.5","actual":46.447713923674044,"units":"deg","pass":true},
-    {"id":"T8","name":"staircase wall-layer grid convergence, delta50 ratio 40/20","expected":"0.35-0.70","actual":0.5859441537648978,"units":"thickness ratio","pass":true},
     {"id":"T7-beta","name":"cone vs Taylor-Maccoll: shock angle","expected":"26.737 +/- 1.5","actual":27.960752909823302,"units":"deg","pass":true},
     {"id":"T7-p","name":"cone vs Taylor-Maccoll: surface pressure ratio","expected":"1.3739 +/- 8%","actual":1.394806315610697,"units":"p/p_inf","pass":true},
     {"id":"T7-mach","name":"cone vs Taylor-Maccoll: surface Mach","expected":"2.1468 +/- 5%","actual":2.1599653160179053,"units":"Mach","pass":true},
+    {"id":"T8","name":"staircase wall-layer grid convergence, delta50 ratio 40/20","expected":"0.35-0.70","actual":0.5859441537648978,"units":"thickness ratio","pass":true},
     {"id":"T1","name":"free-stream preservation (planar uniform, 200 steps)","expected":"<= 1e-5","actual":0.0000054836273193359375,"units":"max abs state error","pass":true},
     {"id":"T1-graded","name":"free-stream preservation on a graded grid (growth 1.15/1.2)","expected":"<= 1e-5","actual":0.0000006556510925292969,"units":"max abs state error","pass":true},
     {"id":"T4","name":"Sod shock tube, N = 200 uniform strip","expected":"<= 6.0e-3","actual":0.0042654666994339395,"units":"L1(rho)","pass":true},
     {"id":"WB","name":"well-balanced: quiescent axisymmetric box, 100 steps","expected":"<= 1e-7","actual":0,"units":"max abs drift","pass":true},
     {"id":"WB-graded","name":"well-balanced on a graded radial grid (growth 1.2)","expected":"<= 1e-7","actual":0,"units":"max abs drift","pass":true},
-    {"id":"T4-graded","name":"Sod on a graded strip (growth 1.01, ratio ~11x)","expected":"<= 8.0e-3","actual":0.005262820623815447,"units":"L1(rho)","pass":true}
+    {"id":"T4-graded","name":"Sod on a graded strip (growth 1.01, ratio ~11x)","expected":"<= 8.0e-3","actual":0.005262820623815447,"units":"L1(rho)","pass":true},
+    {"id":"T0-disk","name":"rasterizer disk area, R in {3..20} cells","expected":"<= 5e-3","actual":0.000000005412779598310543,"units":"worst relative area error","pass":true},
+    {"id":"T0-throat","name":"rasterized nozzle throat area, 6 slider settings","expected":"<= 5e-3","actual":0.0015822280899842056,"units":"worst relative area error","pass":true}
   ],
   "benchmarks": [],
   "notes": [
