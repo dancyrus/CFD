@@ -72,9 +72,16 @@ fn push_bell(
     let qz = (c2 - c1) / (m1 - m2);
     let qr = (m1 * c2 - m2 * c1) / (m1 - m2);
     if !(nz < qz && qz < ez) {
+        // Which side failed says which way to move, and this message is now
+        // user-visible (the app shows it when it falls back to the cone).
+        // Q_z past the exit: the bell is too SHORT for the area ratio. Q_z
+        // behind the throat-arc tangency: too LONG. Telling someone to
+        // lengthen an already-overlong nozzle sends them the wrong way.
+        let which = if qz <= nz { "too long" } else { "too short" };
         return Err(CfdError::Geometry(format!(
             "bell control point out of order (N_z={nz:.4}, Q_z={qz:.4}, E_z={ez:.4}): \
-             length {l_n:.4} r_t is too short for area ratio {:.4} at theta_n {tn_deg}",
+             length {l_n:.4} r_t is {which} for area ratio {:.4} at theta_n {tn_deg} / \
+             theta_e {te_deg}",
             re * re
         )));
     }
@@ -160,9 +167,9 @@ pub fn generate_contour(spec: &NozzleSpec, samples: usize) -> Result<WallProfile
         // Huzel–Huang reference length, INCLUDING the throat-arc term, which
         // that reference cone takes at 1.5 R_t (`L_C15_REF_ARC_RT`) — NOT at
         // this nozzle's own downstream arc. The Aspirespace / bell_nozzle.py
-        // form drops the term entirely and comes out short by an ε-dependent
-        // amount (2.89% at ε = 8, 1.32% at ε = 25, 0.72% at ε = 69, 0.45% at
-        // ε = 165), which is what makes an unqualified "80% bell" ambiguous.
+        // form drops the term entirely; the two differ by an ε-dependent
+        // amount (H&H longer by 2.89% at ε = 8, 1.32% at ε = 25, 0.72% at
+        // ε = 69, 0.45% at ε = 165), which makes "80% bell" ambiguous unqualified.
         // This is the pinned definition (physics-reference §10).
         ContourKind::ParabolicBell { bell_percent } => {
             let (tn_deg, te_deg) = rao_angles(eps, bell_percent);
@@ -451,6 +458,70 @@ mod tests {
             256
         )
         .is_err());
+        // theta_e = 0 is rejected because it UNBOUNDS the length: Q_z moves
+        // with E_z at rate tan(theta_e), so at zero the N_z < Q_z < E_z guard
+        // stops constraining the length at all and a 1e9 r_t "bell" validates.
+        for lf in [0.76, 1.0, 1.5] {
+            assert!(
+                generate_contour(
+                    &spec(
+                        ContourKind::DirectBell {
+                            theta_n_deg: 32.0,
+                            theta_e_deg: 0.0,
+                            length_fraction: lf
+                        },
+                        34.3
+                    ),
+                    256
+                )
+                .is_err(),
+                "theta_e = 0 accepted at length_fraction {lf}"
+            );
+        }
+        // …and an absurd length is rejected outright, so a near-zero exit
+        // angle cannot make the ordering guard toothless either.
+        assert!(generate_contour(
+            &spec(
+                ContourKind::DirectBell {
+                    theta_n_deg: 32.0,
+                    theta_e_deg: 0.001,
+                    length_fraction: 1e9
+                },
+                34.3
+            ),
+            256
+        )
+        .is_err());
+    }
+
+    /// The rejection message is user-visible now (cfd-ui shows it when the
+    /// generator falls back to the cone), so it must point the right way: Q_z
+    /// behind the tangency means too LONG, Q_z past the exit means too SHORT.
+    #[test]
+    fn bell_rejection_message_says_which_way_to_move() {
+        let msg = |eps: f64, tn: f64, te: f64, lf: f64| {
+            generate_contour(
+                &spec(
+                    ContourKind::DirectBell {
+                        theta_n_deg: tn,
+                        theta_e_deg: te,
+                        length_fraction: lf,
+                    },
+                    eps,
+                ),
+                256,
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        // Q_z past the exit: too short for this area ratio.
+        let short = msg(34.3, 32.0, 6.0, 0.2);
+        assert!(short.contains("too short"), "{short}");
+        // Q_z behind the throat-arc tangency: too long. Reached at a small
+        // area ratio, where the reference cone is short and the exit radius
+        // is close to the throat.
+        let long = msg(1.2, 20.0, 6.0, 1.5);
+        assert!(long.contains("too long"), "{long}");
     }
 
     #[test]

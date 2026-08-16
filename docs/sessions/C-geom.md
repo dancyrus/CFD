@@ -37,7 +37,7 @@ That closed form for `L_n` is exact — the identity was verified symbolically, 
 Same converging section and 1.5 r_t arc. The downstream arc is 0.382 r_t and runs to wall angle `theta_n`, not to 15°. Then a quadratic Bézier.
 
 ```
-L_c15 = ( r_t*(sqrt(eps)-1) + 0.382*r_t*(sec(15deg)-1) ) / tan(15deg)
+L_c15 = ( r_t*(sqrt(eps)-1) + 1.5*r_t*(sec(15deg)-1) ) / tan(15deg)   [1.5 R_t: H&H's REFERENCE cone]
 L_n   = bell_percent * L_c15
 
 N = ( 0.382*r_t*sin(theta_n),  r_t + 0.382*r_t*(1 - cos(theta_n)) )
@@ -54,7 +54,11 @@ Verified for r_t = 50 mm, ε = 25, 80% bell: wall angle is exactly `theta_n` at 
 
 `t` is not proportional to z. To sample uniformly in z, sample t densely and resample.
 
-**Two circulating definitions of `L_c15` differ by 0.337%.** The form above (Huzel–Huang) includes the throat-arc term; Aspirespace and the widely-copied `bell_nozzle.py` drop it. Use the form above and put a comment saying so, or "80% bell" is ambiguous.
+**The reference cone's throat arc is 1.5 R_t, not this nozzle's 0.382 R_t.** Huzel–Huang measure bell length against a 15° cone of the same throat area and area ratio *with a 1.5 R_t downstream arc*. That arc is part of the definition of the percentage and must not be read from the spec — otherwise "80% bell" means a different length for every nozzle, which the 0.300 R_t Raptor 2 arc makes concrete. The build got this wrong until the contour-hardening pass (code and this brief both said 0.382); correcting it moved RS-25's length error from −1.74% to −1.21%. Note the consequence: the app's own conical contour keeps its 0.382 R_t arc, so an "80% bell" is 80.4% of the cone the app actually draws — two different cones, on purpose.
+
+**Two circulating definitions of `L_c15` differ by an ε-dependent 0.4–2.9%.** The form above (Huzel–Huang) includes the throat-arc term; Aspirespace and the widely-copied `bell_nozzle.py` drop it. With the 1.5 R_t reference arc, H&H is longer by 2.89% at ε = 8, 1.32% at ε = 25, 0.72% at ε = 69, 0.45% at ε = 165 — not the constant 0.337% this brief used to quote, which was the ε = 25 value of the wrong (0.382 R_t) form. Use the form above and put a comment saying so, or "80% bell" is ambiguous.
+
+**Direct-angle bells.** `ContourKind::DirectBell { theta_n_deg, theta_e_deg, length_fraction }` runs the same construction with the angles as inputs and the throat arc from the spec, for hardware the Rao table cannot represent (Raptor 2: θ_n 32.0°, θ_e 6.0°, 0.300 R_t arc, FAA AR 2019-001b Table 1). Two extra guards it needs beyond the two above: `theta_e > 0` — at exactly zero, `Q_z` stops depending on `E_z` and the ordering guard no longer bounds the length at all — and an absolute cap on `length_fraction`, so a near-zero exit angle cannot make that guard toothless either.
 
 ### 3. `rao_angles(area_ratio, bell_percent) -> (theta_n, theta_e)`
 

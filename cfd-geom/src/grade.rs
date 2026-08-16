@@ -266,7 +266,28 @@ mod tests {
             let (dz, dr) = (0.145, 0.05);
             let base = Grid::uniform(260, 260, dz as f32, dr as f32);
             let solid = rasterize(&profile, &base, &refs).unwrap();
+            // Non-emptiness alone would also pass for a solid plug, which is
+            // what a mis-wound polygon produces — and a plug satisfies every
+            // hold/extent assert below. Check the bore is open at the throat.
             assert!(solid.fraction.iter().any(|&f| f > 0.0), "{name}: nothing rasterized");
+            let throat_z = profile.points[profile.throat_index][0] / refs.l_m;
+            let iz = (0..base.nz)
+                .min_by(|&a, &b| {
+                    let (da, db) = (
+                        (base.z_center(a) as f64 - throat_z).abs(),
+                        (base.z_center(b) as f64 - throat_z).abs(),
+                    );
+                    da.partial_cmp(&db).unwrap()
+                })
+                .unwrap();
+            let open = (0..base.nr)
+                .find(|&ir| solid.is_solid(base.idx(iz, ir)))
+                .expect("throat column is solid to the top");
+            assert!(
+                (base.r_face(open) as f64 - 1.0).abs() <= 2.0 * dr,
+                "{name}: throat open radius {}",
+                base.r_face(open)
+            );
             let spec = GradeSpec::new(dz, dr, 60.0, 26.0);
             let g = grade_from_solid(&solid, &spec).unwrap();
             assert!((g.lz() - 60.0).abs() < 1e-9 && (g.lr() - 26.0).abs() < 1e-9, "{name}");

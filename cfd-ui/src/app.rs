@@ -92,8 +92,10 @@ pub struct CfdApp {
     /// The contour kind the generator ACTUALLY produced for `committed_wall`,
     /// and the rejection message when it fell back to the cone. Never the
     /// requested kind: `params.contour_kind` is a request, and reading the
-    /// status line off it printed "80% bell" over a fallback cone.
-    wall_kind: ContourKind,
+    /// status line off it printed "80% bell" over a fallback cone. `None` is
+    /// a wall no generator produced — a hand-dragged one — which has no
+    /// contour family and no wall angles to name.
+    wall_kind: Option<ContourKind>,
     wall_fallback: Option<String>,
     /// True once the user has edited the wall by hand — flips the whole
     /// report into "sandbox — qualitative only".
@@ -148,7 +150,7 @@ impl CfdApp {
             editor,
             editor_on: false,
             committed_wall: wall.points,
-            wall_kind: wall.kind,
+            wall_kind: Some(wall.kind),
             wall_fallback: wall.fallback,
             geometry_custom: false,
             space_panned: false,
@@ -171,6 +173,12 @@ impl CfdApp {
         self.committed_wall = self.editor.points().to_vec();
         self.geometry_custom = true;
         self.preset = None; // hand-drawn walls are no named engine
+        // …and no contour family either. This is the fourth writer of
+        // `committed_wall`; leaving the generator's provenance behind here
+        // would put "measured bell · θ_n 32.0°" over a wall the user dragged
+        // by hand, which is the same lie as naming a bell over a fallback cone.
+        self.wall_kind = None;
+        self.wall_fallback = None;
         // Mid-run edits rasterize onto the solver's CURRENT (graded) grid —
         // that is the cheap-to-overwrite-mask property the sandbox rests on.
         // The grading itself is only recomputed on a rebuild (preset, p0 or
@@ -189,7 +197,7 @@ impl CfdApp {
         let wall = nozzle_contour(&self.params);
         self.editor.set_points(wall.points.clone());
         self.committed_wall = wall.points;
-        self.wall_kind = wall.kind;
+        self.wall_kind = Some(wall.kind);
         self.wall_fallback = wall.fallback;
         self.geometry_custom = false;
         let solid = rasterize_wall(&self.committed_wall, &self.latest.snapshot.grid);
@@ -230,7 +238,7 @@ impl CfdApp {
         self.editor.set_domain(lz, lr);
         self.editor.set_points(wall.points.clone());
         self.committed_wall = wall.points;
-        self.wall_kind = wall.kind;
+        self.wall_kind = Some(wall.kind);
         self.wall_fallback = wall.fallback;
         self.geometry_custom = false;
         let setup = make_setup(&self.params, &self.committed_wall);
@@ -481,14 +489,15 @@ impl CfdApp {
             None => String::new(),
         };
         let contour_desc = match self.wall_kind {
-            ContourKind::Conical => "15° cone".to_string(),
-            ContourKind::ParabolicBell => {
+            None => "hand-drawn wall".to_string(),
+            Some(ContourKind::Conical) => "15° cone".to_string(),
+            Some(ContourKind::ParabolicBell) => {
                 format!("{:.0}% bell{source}", self.params.bell_percent * 100.0)
             }
-            ContourKind::MeasuredBell {
+            Some(ContourKind::MeasuredBell {
                 theta_n_deg,
                 theta_e_deg,
-            } => format!(
+            }) => format!(
                 "measured bell · θ_n {theta_n_deg:.1}° θ_e {theta_e_deg:.1}° · \
                  {:.0}% length{source}",
                 self.params.bell_percent * 100.0
@@ -522,7 +531,7 @@ impl CfdApp {
         // bell is the end row's angles stretched to this exit radius. Merlin
         // Vac (ε = 165) lives above; the ε slider bottoms out at 2.0, below.
         // Measured-angle bells never touch the table, so they never flag.
-        if self.wall_kind == ContourKind::ParabolicBell
+        if self.wall_kind == Some(ContourKind::ParabolicBell)
             && !(4.0..=100.0).contains(&self.params.area_ratio)
         {
             let (end, side) = if self.params.area_ratio > 100.0 {

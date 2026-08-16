@@ -847,10 +847,9 @@ mod tests {
             // cone is what a rejected spec degrades to, so it may not
             // overrun the domain either. The cone is the longer of the two.
             assert!(c.contour_kind.is_bell(), "{}: preset is not a bell", p.name);
-            for (which, pts) in [
-                ("bell", nozzle_contour(&c).points),
-                ("cone", conical_contour(c.area_ratio)),
-            ] {
+            let bell = nozzle_contour(&c);
+            assert_eq!(bell.fallback, None, "{}: fell back to the cone", p.name);
+            for (which, pts) in [("bell", bell.points), ("cone", conical_contour(c.area_ratio))] {
                 let end = pts.last().unwrap();
                 assert!(
                     end[0] < c.lz_rt,
@@ -966,26 +965,80 @@ mod tests {
             // Finest spacing unchanged (dt is set by it) …
             assert!((g.dr_min() as f64 - dr).abs() < 1e-7, "{name}: dr_min {}", g.dr_min());
             assert!((g.dz_min() as f64 - dz).abs() < 1e-3, "{name}: dz_min {}", g.dz_min());
-            // … base resolution held across the whole bell, in both axes …
+            // … base resolution held across the whole bell in z. (Only in z:
+            // `rasterize_wall` closes the solid past the top of the domain, so
+            // the r solid span is the full height and the r-hold assert would
+            // be unfalsifiable. `dr_min` above is the r-axis check that bites.)
             let z_end = wall.points.last().unwrap()[0];
-            let r_end = wall.points.iter().map(|q| q[1]).fold(0.0, f64::max);
             for iz in 0..g.nz {
                 if g.z_edges()[iz + 1] <= z_end {
                     assert!((g.dz(iz) as f64 - dz).abs() < 1e-3, "{name}: dz({iz}) = {}", g.dz(iz));
                 }
             }
-            for ir in 0..g.nr {
-                if g.r_edges()[ir + 1] <= r_end {
-                    assert!((g.dr(ir) as f64 - dr).abs() < 1e-6, "{name}: dr({ir}) = {}", g.dr(ir));
-                }
-            }
             // … and the graded tail actually saves cells against uniform.
             let uniform = (lz / dz).round() as usize * (lr / dr).round() as usize;
             assert!(g.len() < uniform, "{name}: graded {} vs uniform {uniform}", g.len());
-            // The bell rasterizes onto the graded grid with a throat.
+            // The bell rasterizes onto the GRADED grid — the grid the solver
+            // actually runs on, not the base grid — with an open throat of the
+            // right radius. Non-emptiness alone would pass for a solid plug,
+            // which is exactly what a mis-wound polygon produces.
             let s = rasterize_wall(&wall.points, &g);
             assert!(s.fraction.iter().any(|&f| f > 0.0), "{name}: nothing rasterized");
+            assert!(s.fraction.iter().any(|&f| f < 1.0), "{name}: everything is solid");
+            let mut r_open_min = f64::INFINITY;
+            for iz in 0..g.nz {
+                if (g.z_center(iz) as f64) > z_end {
+                    break;
+                }
+                if let Some(ir) = (0..g.nr).find(|&ir| s.is_solid(g.idx(iz, ir))) {
+                    r_open_min = r_open_min.min(g.r_face(ir) as f64);
+                }
+            }
+            assert!(
+                (r_open_min - 1.0).abs() <= g.dr_min() as f64,
+                "{name}: graded-grid throat {r_open_min}"
+            );
         }
+    }
+
+    /// The fallback path itself, which no reachable slider setting produces
+    /// (every shipped preset and every ε on the slider generates cleanly) and
+    /// which therefore only a test can exercise: a rejected spec must come
+    /// back labelled as the cone it actually drew, carrying the reason. This
+    /// is the assertion the old `Vec<[f64; 2]>` return type could not make —
+    /// the status line went on saying "80% bell" over the fallback cone.
+    #[test]
+    fn a_rejected_spec_reports_the_cone_it_actually_drew() {
+        // Bell percent below the digitised table: rejected by NozzleSpec::validate.
+        let p = CaseParams {
+            contour_kind: ContourKind::ParabolicBell,
+            bell_percent: 0.5,
+            ..CaseParams::default()
+        };
+        let w = nozzle_contour(&p);
+        assert_eq!(w.kind, ContourKind::Conical, "produced kind must be what was drawn");
+        assert!(w.fallback.is_some(), "the reason must reach the caller");
+        assert!(
+            w.fallback.as_deref().unwrap().contains("bell_percent"),
+            "reason should name the offending parameter: {:?}",
+            w.fallback
+        );
+        assert_eq!(w.points, conical_contour(p.area_ratio), "must BE the fallback cone");
+        // Same for a measured-angle bell whose angles cannot close a contour.
+        let p = CaseParams {
+            contour_kind: ContourKind::MeasuredBell {
+                theta_n_deg: 6.0,
+                theta_e_deg: 32.0,
+            },
+            ..CaseParams::default()
+        };
+        let w = nozzle_contour(&p);
+        assert_eq!(w.kind, ContourKind::Conical);
+        assert!(w.fallback.is_some());
+        // And a spec that IS accepted must never claim a fallback.
+        let w = nozzle_contour(&CaseParams::default());
+        assert_eq!(w.kind, ContourKind::Conical);
+        assert_eq!(w.fallback, None);
     }
 
     #[test]

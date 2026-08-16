@@ -140,20 +140,35 @@ impl NozzleSpec {
                 theta_e_deg,
                 length_fraction,
             } => {
-                // No table to stay inside: the angles are the measurement. Only
-                // the geometry has to close — theta_n above theta_e (the Bezier
-                // control point divides by their tangent difference), both wall
-                // angles in the first quadrant, and a positive length.
+                // No table to stay inside: the angles are the measurement. What
+                // has to hold is that the geometry closes — theta_n above
+                // theta_e (the Bezier control point divides by their tangent
+                // difference), both wall angles strictly inside the first
+                // quadrant, and a length in a range that is still a bell.
                 if !(theta_n_deg > 0.0 && theta_n_deg < 90.0) {
                     return Err(bad(format!("theta_n_deg = {theta_n_deg}")));
                 }
-                if !(theta_e_deg >= 0.0 && theta_e_deg < theta_n_deg) {
+                // theta_e = 0 is excluded on purpose and is NOT merely
+                // degenerate-looking: the contour's only length bound is the
+                // N_z < Q_z < E_z ordering, and Q_z moves with E_z at rate
+                // tan(theta_e). At theta_e = 0 that coupling vanishes, Q_z
+                // stops depending on the length, and a 1e9 r_t "bell" passes
+                // every check. An axial exit is not a bell anyway.
+                if !(theta_e_deg > 0.0 && theta_e_deg < theta_n_deg) {
                     return Err(bad(format!(
-                        "theta_e_deg = {theta_e_deg} (must be in 0..theta_n = {theta_n_deg})"
+                        "theta_e_deg = {theta_e_deg} (must be in 0 < theta_e < theta_n = \
+                         {theta_n_deg}; a zero exit angle leaves the length unbounded)"
                     )));
                 }
-                if !(length_fraction.is_finite() && length_fraction > 0.0) {
-                    return Err(bad(format!("length_fraction = {length_fraction}")));
+                // Absolute length bound, so a near-zero theta_e cannot make the
+                // ordering guard toothless either. Past the 15 deg reference
+                // cone's own length there is no bell left to speak of.
+                if !(length_fraction.is_finite() && length_fraction > 0.0 && length_fraction <= 1.5)
+                {
+                    return Err(bad(format!(
+                        "length_fraction = {length_fraction} (supported range 0.0..=1.5 of the \
+                         15 deg reference cone)"
+                    )));
                 }
             }
         }
