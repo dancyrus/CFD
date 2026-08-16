@@ -1273,8 +1273,12 @@ fn g0_dalembert_negative_control() {
            "< 1e-3 at every level", worst_residual, "normalized residual", steady);
     record("G0-order", "d'Alembert negative control: order of C_d decay under \
             refinement", ">= 1.0", fine, "convergence order", fine >= 1.0);
+    // Gated on `steady` as well as on the decrease: a C_d read off an
+    // oscillating wake is not a measurement, and a green row next to a number
+    // that is not a measurement is exactly the authoritative-looking lie the
+    // honesty rules exist to prevent.
     record("G0-cd", "d'Alembert negative control: C_d at h = 0.025 (exact 0)",
-           0.0, c3, "C_d", c3.abs() < c2.abs());
+           0.0, c3, "C_d", steady && c3.abs() < c2.abs());
     cfd_results::record_note("ladder", "g0-refinement", &format!(
         "G0 refinement: C_d = {c1:+.4e} / {c2:+.4e} / {c3:+.4e} at h = 0.1 / 0.05 / \
          0.025, time-averaged over the last 10 of 40 domain crossings; observed \
