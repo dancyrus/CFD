@@ -1,6 +1,6 @@
 {
-  "commit": "141b69f38aafd9ab7bd97f9dfda1cdba7e92fff9",
-  "timestamp": "2026-08-16T22:39:06Z",
+  "commit": "929bf735539a239b6a98c29198c67399af40d248",
+  "timestamp": "2026-08-16T23:29:58Z",
   "machine": "intel-xeon-4c",
   "tests": [
     {"id":"T0-disk","name":"rasterizer disk area, R in {3..20} cells","expected":"<= 5e-3","actual":0.000000005412779598310543,"units":"worst relative area error","pass":true},
