@@ -13,15 +13,35 @@ use std::sync::Arc;
 use cfd_contract::{Ambient, Chamber, GasModel, Grid, Numerics, RefScales, SolidField, SolveSetup};
 use cfd_geom::NozzleSpec;
 
-/// Demo-case domain from docs/physics-reference.md §8: 46.4 x 10 r_t at
-/// 20 radial cells per throat radius -> the interactive 320 x 200 grid.
-/// Presets size their own domain via `preset_domain`.
+/// The HISTORIC compact demo domain from docs/physics-reference.md §8:
+/// 46.4 x 10 r_t at 20 radial cells per throat radius -> the interactive
+/// 320 x 200 grid. Still the reference point of the cost model and the
+/// "Preview" shortcut; the default domain is now `LZ_DEFAULT x LR_DEFAULT`
+/// (§8 reversal — simulation quality outranks interactivity).
 pub const LZ: f64 = 46.4;
 pub const LR: f64 = 10.0;
 pub const CELLS_PER_RT: f64 = 20.0;
 /// The §8 anisotropy, dz/dr = 0.1449/0.0500. Widening dz is nearly free in dt
-/// (the radial term dominates) while linearly cutting cells.
-const DZ_OVER_DR: f64 = 2.9;
+/// (the radial term dominates) while linearly cutting cells. Now a per-case
+/// field (`CaseParams::dz_over_dr`); this is its default.
+pub const DZ_OVER_DR: f64 = 2.9;
+/// Default (and largest-preset) domain extents in throat radii — roughly 2x
+/// the old largest tier (the deleted "Long", 125.6 x 16 for the demo case) in
+/// both directions. docs/work-orders/configurable-domain.md.
+pub const LZ_DEFAULT: f64 = 282.0;
+pub const LR_DEFAULT: f64 = 32.0;
+/// Radial extent of the held-base-resolution region, as a multiple of the
+/// wall's outer radius: §8's compact radial sizing (L_r = 3.54 r_e against a
+/// peak plume radius near 2.2 r_e, 1.6x margin). Base radial cells are held
+/// through min(lr_rt, PLUME_HOLD * r_wall) so the plume core never lands on
+/// graded cells; only the quiescent far field beyond grades out to lr_rt.
+pub const PLUME_HOLD: f64 = 3.54;
+/// UI input ranges. The §8 N_throat >= 20 rule survives as the amber badge,
+/// not as a clamp: 8 cells/r_t is Preview-grade, honestly labelled.
+pub const CELLS_PER_RT_RANGE: (f64, f64) = (8.0, 160.0);
+pub const DZ_OVER_DR_RANGE: (f64, f64) = (1.0, 8.0);
+pub const LZ_RANGE: (f64, f64) = (20.0, 600.0);
+pub const LR_RANGE: (f64, f64) = (5.0, 100.0);
 
 /// Altitude ceiling, docs/physics-reference.md §5: 58 km is where the
 /// thinnest ambient still clears the pressure floor for the highest-pressure
@@ -52,47 +72,45 @@ pub fn separation_threshold(exit_mach: f64) -> f64 {
     (1.88 * exit_mach - 1.0).powf(-0.64).max(0.40)
 }
 
-/// Plume length control (grid-grading work order, item 3). The graded
-/// tensor-product grid makes the longer options cheap: base resolution is
-/// held across the nozzle, and the extra plume is covered by geometrically
-/// growing cells, so `Long` costs cells only in its graded tail while the
-/// timestep (set by the finest spacing) does not change at all.
+/// Domain-size shortcuts (docs/work-orders/configurable-domain.md). These are
+/// NOT tiers: each one just fills the four editable fields (domain length and
+/// radius, cells per throat radius, dz/dr), which stay editable afterwards.
+/// The graded tensor-product grid keeps the big domains cheap: base
+/// resolution is held across the geometry and the plume core, the far field
+/// is covered by geometrically growing cells, and the timestep (set by the
+/// finest spacing) does not change at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlumeLength {
-    /// The historic §8 domain: the Mach disk and half of one shock cell.
-    Compact,
-    /// ~20 exit radii of plume: the Mach disk plus ~2 shock cells.
+pub enum DomainPreset {
+    /// The historic §8 compact interactive domain: returns in seconds, shows
+    /// the Mach disk and half of one shock cell.
+    Preview,
+    /// Half the Large domain in both directions.
     Standard,
-    /// ~40 exit radii of plume: 4-5 shock cells.
-    Long,
+    /// The full domain — the default. §8 reversal: quality over turnaround.
+    Large,
 }
 
-impl PlumeLength {
-    pub const ALL: [PlumeLength; 3] = [PlumeLength::Compact, PlumeLength::Standard, PlumeLength::Long];
+impl DomainPreset {
+    pub const ALL: [DomainPreset; 3] =
+        [DomainPreset::Preview, DomainPreset::Standard, DomainPreset::Large];
 
     pub fn label(self) -> &'static str {
         match self {
-            PlumeLength::Compact => "Compact",
-            PlumeLength::Standard => "Standard",
-            PlumeLength::Long => "Long",
+            DomainPreset::Preview => "Preview",
+            DomainPreset::Standard => "Standard",
+            DomainPreset::Large => "Large",
         }
     }
 
-    /// Extra plume length beyond the compact domain, in exit radii.
-    fn extra_exit_radii(self) -> f64 {
+    /// The field values this shortcut fills in:
+    /// (lz_rt, lr_rt, cells_per_rt, dz_over_dr).
+    pub fn values(self) -> (f64, f64, f64, f64) {
         match self {
-            PlumeLength::Compact => 0.0,
-            PlumeLength::Standard => 8.0,
-            PlumeLength::Long => 28.0,
-        }
-    }
-
-    /// Radial headroom multiplier over the compact far field.
-    fn lr_factor(self) -> f64 {
-        match self {
-            PlumeLength::Compact => 1.0,
-            PlumeLength::Standard => 1.3,
-            PlumeLength::Long => 1.6,
+            DomainPreset::Preview => (LZ, LR, CELLS_PER_RT, DZ_OVER_DR),
+            DomainPreset::Standard => {
+                (LZ_DEFAULT / 2.0, LR_DEFAULT / 2.0, CELLS_PER_RT, DZ_OVER_DR)
+            }
+            DomainPreset::Large => (LZ_DEFAULT, LR_DEFAULT, CELLS_PER_RT, DZ_OVER_DR),
         }
     }
 }
@@ -154,19 +172,21 @@ pub struct CaseParams {
     /// Labelled vacuum mode: back pressure fixed at `VACUUM_P_FRAC * p0`,
     /// ignoring `altitude_m`. The region above the 58 km slider cap.
     pub vacuum: bool,
-    /// COMPACT domain size in throat radii and radial cells per throat
-    /// radius. The demo case uses the §8 defaults; presets size the domain to
-    /// their bell via `preset_domain` (and Merlin Vac drops to 14 cells/r_t).
-    /// `plume` extends past these extents on the graded tail.
+    /// FULL domain extents in throat radii and the mesh resolution, all
+    /// directly configurable in the sidebar (work order: configurable-domain).
+    /// `cells_per_rt` is the base radial resolution (cells across the throat
+    /// radius); `dz_over_dr` the §8 anisotropy lever. Engine presets size the
+    /// domain to their bell via `preset_domain` (and Merlin Vac drops to
+    /// 14 cells/r_t); the demo defaults are the Large domain.
     pub lz_rt: f64,
     pub lr_rt: f64,
     pub cells_per_rt: f64,
-    pub plume: PlumeLength,
+    pub dz_over_dr: f64,
 }
 
 impl Default for CaseParams {
     fn default() -> Self {
-        // The demo case, docs/physics-reference.md §6.
+        // The demo case, docs/physics-reference.md §6, on the Large domain.
         CaseParams {
             p0_pa: 5.0e6,
             t0_k: 3200.0,
@@ -181,31 +201,38 @@ impl Default for CaseParams {
             throat_arc_down: THROAT_ARC_DOWN,
             altitude_m: 0.0,
             vacuum: false,
-            lz_rt: LZ,
-            lr_rt: LR,
+            lz_rt: LZ_DEFAULT,
+            lr_rt: LR_DEFAULT,
             cells_per_rt: CELLS_PER_RT,
-            plume: PlumeLength::Standard,
+            dz_over_dr: DZ_OVER_DR,
         }
     }
 }
 
-/// Full domain extents for this case, (lz, lr) in throat radii: the compact
-/// extents plus the plume option's graded extension.
-pub fn domain(p: &CaseParams) -> (f64, f64) {
-    let r_e = p.area_ratio.max(1.0).sqrt();
-    (
-        p.lz_rt + p.plume.extra_exit_radii() * r_e,
-        p.lr_rt * p.plume.lr_factor(),
-    )
+/// Sanitize the four sidebar fields: clamp into range, replace non-finite
+/// entry with the previous committed value. The solver can never see NaN,
+/// zero or negative sizing through this path.
+pub fn sanitize_domain(p: &mut CaseParams, committed: &CaseParams) {
+    let fix = |v: &mut f64, old: f64, range: (f64, f64)| {
+        if !v.is_finite() {
+            *v = old;
+        }
+        *v = v.clamp(range.0, range.1);
+    };
+    fix(&mut p.cells_per_rt, committed.cells_per_rt, CELLS_PER_RT_RANGE);
+    fix(&mut p.dz_over_dr, committed.dz_over_dr, DZ_OVER_DR_RANGE);
+    fix(&mut p.lz_rt, committed.lz_rt, LZ_RANGE);
+    fix(&mut p.lr_rt, committed.lr_rt, LR_RANGE);
 }
 
-/// Uniform anisotropic BASE grid over the compact domain, dz/dr = 2.9 (§8).
-/// At the defaults this is exactly the historic 320 x 200 interactive grid.
-/// This is the rasterization target the grading rule reads the solid span
-/// from — the solver itself runs on `graded_grid`.
+/// Uniform anisotropic BASE grid over the full extents. At the Preview
+/// shortcut values this is exactly the historic 320 x 200 interactive grid.
+/// Benchmark/test reference only — the solver runs on `graded_grid`, whose
+/// rasterization target is wall-fitted, not this.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn base_grid(p: &CaseParams) -> Grid {
     let dr = 1.0 / p.cells_per_rt;
-    let dz = DZ_OVER_DR * dr;
+    let dz = p.dz_over_dr * dr;
     Grid::uniform(
         (p.lz_rt / dz).round() as usize,
         (p.lr_rt / dr).round() as usize,
@@ -214,26 +241,49 @@ pub fn base_grid(p: &CaseParams) -> Grid {
     )
 }
 
-/// The graded solver grid for this case and wall: rasterize the wall on the
-/// compact base grid, find the solid span, hold base resolution across it and
-/// grade geometrically out to the plume-option extents (the spacing rule
-/// itself lives in cfd-geom; growth 1.05).
+/// The graded solver grid for this case and wall: rasterize the wall on a
+/// wall-fitted uniform target, find the solid span, hold base resolution
+/// across it and grade geometrically out to the full extents (the spacing
+/// rule itself lives in cfd-geom; growth 1.05, width cap 6x).
+///
+/// The rasterization target spans the wall bounding box plus the grading
+/// margin axially, and min(lr_rt, PLUME_HOLD x wall outer radius) radially.
+/// `rasterize_wall` closes the solid above the wall to the target's top row,
+/// so the radial solid span — and with it the held-base region — reaches that
+/// top: base radial cells cover the plume core (§8's 3.54 r_e compact
+/// sizing), and only the quiescent far field beyond grades out to lr_rt. For
+/// the demo case this reproduces the old pipeline's held region exactly.
+/// Keeping the target wall-sized (instead of domain-sized) is what makes the
+/// live cost readout cheap at any domain extent.
 pub fn graded_grid(p: &CaseParams, wall: &[[f64; 2]]) -> Grid {
-    let base = base_grid(p);
-    let solid = rasterize_wall(wall, &base);
-    let (lz, lr) = domain(p);
     let dr = 1.0 / p.cells_per_rt;
-    let spec = cfd_geom::GradeSpec::new(DZ_OVER_DR * dr, dr, lz, lr);
-    cfd_geom::grade_from_solid(&solid, &spec).unwrap_or(base)
+    let dz = p.dz_over_dr * dr;
+    let z_wall = wall.iter().map(|q| q[0]).fold(0.0, f64::max);
+    let r_wall = wall.iter().map(|q| q[1]).fold(0.0, f64::max);
+    let lz_t = (z_wall + 16.0 * dz).min(p.lz_rt);
+    let lr_t = (PLUME_HOLD * r_wall).min(p.lr_rt);
+    let target = Grid::uniform(
+        ((lz_t / dz).round() as usize).max(4),
+        ((lr_t / dr).round() as usize).max(4),
+        dz as f32,
+        dr as f32,
+    );
+    let solid = rasterize_wall(wall, &target);
+    let spec = cfd_geom::GradeSpec::new(dz, dr, p.lz_rt, p.lr_rt);
+    cfd_geom::grade_from_solid(&solid, &spec).unwrap_or(target)
 }
 
-/// Preset domain sizing in throat radii, (length, height). Height must hold
-/// the bell exit plus plume spread; length the nozzle plus a plume that grows
-/// with exit radius. Run time goes roughly as length² · height — see the
-/// preset tooltips for the relative cost.
+/// Engine-preset domain sizing in throat radii, (length, radius) — FULL
+/// extents. Radius must hold the bell exit plus plume spread; length the
+/// nozzle plus a plume that grows with exit radius. These are the same
+/// physical extents the old Standard tier produced for a preset, so preset
+/// behaviour (and cost) is unchanged by the tier removal.
 pub fn preset_domain(area_ratio: f64) -> (f64, f64) {
     let s = area_ratio.sqrt();
-    (3.0 * (s - 1.0) + 20.0, (2.5 * s).max(10.0))
+    (
+        3.0 * (s - 1.0) + 20.0 + 8.0 * s,
+        (2.5 * s).max(10.0) * 1.3,
+    )
 }
 
 /// US standard atmosphere 1976, layers to 71 km (clamped at the 58 km slider
@@ -445,10 +495,11 @@ pub const PRESETS: [EnginePreset; 6] = [
         bell_percent: 0.75,
         bell_source: "design-class estimate",
         slow: true,
-        note: "≈12× the Merlin 1D run time even at the reduced 14 cells per \
-               throat radius (the mass-flow badge goes amber for that reason). \
-               ε = 165 is past the end of the digitised Rao table (ε ≤ 100): \
-               the bell angles clamp to the ε = 100 row — see the amber flag.",
+        note: "The costliest preset by far even at the reduced 14 cells per \
+               throat radius (the mass-flow badge goes amber for that reason) \
+               — see the run-time multiple above. ε = 165 is also past the end \
+               of the digitised Rao table (ε ≤ 100): the bell angles clamp to \
+               the ε = 100 row — see the amber flag.",
     },
 ];
 
@@ -473,17 +524,24 @@ impl EnginePreset {
             lz_rt,
             lr_rt,
             cells_per_rt: self.cells_per_rt,
-            plume: PlumeLength::Standard,
+            dz_over_dr: DZ_OVER_DR,
         }
     }
 
-    /// Run time relative to Merlin 1D (length² · height), for tooltips.
+    /// Run time relative to Merlin 1D, for tooltips: steps to steady (∝
+    /// domain length / dt) times work per step (∝ graded cell count) — the
+    /// same model as `estimate_cost`, as a machine-independent ratio.
     pub fn relative_cost(&self) -> f64 {
-        let cost = |ar: f64| {
-            let (lz, lr) = preset_domain(ar);
-            lz * lz * lr
+        let cost = |e: &EnginePreset| {
+            let c = e.case(0.0, false);
+            // The preset's OWN wall, not the legacy cone: the grading rule
+            // reads its held span from the rasterized geometry, and a bell is
+            // shorter than the cone at the same area ratio, so costing the
+            // cone prices a nozzle this preset never solves.
+            let est = estimate_cost(&c, &nozzle_contour(&c).points, None);
+            est.steps * est.cells as f64
         };
-        cost(self.area_ratio) / cost(PRESETS[0].area_ratio)
+        cost(self) / cost(&PRESETS[0])
     }
 }
 
@@ -730,32 +788,87 @@ pub fn make_setup(p: &CaseParams, wall: &[[f64; 2]]) -> SolveSetup {
     }
 }
 
-/// Rough time-to-steady estimate for a plume option, seconds of wall clock.
-///
-/// Model: visual steady is ~5 plume transits (physics-reference §9 measured
-/// ~6,100 steps for the compact demo domain), the step count scales with the
-/// domain length (transit-dominated) and inversely with the finest radial
-/// spacing (which sets dt), and the cost per step scales with the cell count.
-/// `measured` is a live (steps/s, cells) sample used to calibrate the
-/// machine's throughput; without one a conservative constant stands in. An
-/// estimate, honestly labelled "~" in the UI — not a readout.
-pub fn estimate_steady_seconds(
-    p: &CaseParams,
-    plume: PlumeLength,
-    wall: &[[f64; 2]],
-    measured: Option<(f64, usize)>,
-) -> f64 {
-    const STEPS_COMPACT_DEMO: f64 = 6100.0; // §9, at LZ = 46.4 and dr = 0.05
-    let case = CaseParams { plume, ..*p };
-    let g = graded_grid(&case, wall);
+// ---------------------------------------------------------------------------
+// Live cost readout (work order: configurable-domain). Every number here is
+// an ESTIMATE for sizing decisions, computed before any solve starts, and the
+// UI labels it "~". The wall-clock figure uses cells/s measured on THIS
+// machine (worker calibration run) — never a constant from another machine.
+// ---------------------------------------------------------------------------
+
+/// Estimated bytes per PADDED cell held by the whole app: the solver's
+/// buffers (u_old/u_new/u1/rhs 4x16 B + primitives 16 B + mask/solid bools,
+/// ~82 B), the solid-fraction fields, and the triple-buffered SI snapshots
+/// (8 f32 fields x ~5 live copies), rounded up for slack.
+pub const EST_BYTES_PER_CELL: u64 = 300;
+/// The solver's own share of the estimate: what a Rebuild must allocate.
+pub const EST_SOLVER_BYTES_PER_CELL: u64 = 100;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CostEstimate {
+    /// Interior cells of the graded grid these settings produce.
+    pub cells: usize,
+    pub nz: usize,
+    pub nr: usize,
+    /// Estimated steps to VISUAL steady (§9 criterion).
+    pub steps: f64,
+    /// Estimated wall-clock seconds; NaN until a throughput sample exists.
+    pub seconds: f64,
+    /// Estimated total memory (padded cells x EST_BYTES_PER_CELL).
+    pub bytes: u64,
+}
+
+/// Cost of solving this case to visual steady. Step model: §9 measured
+/// ~6,100 steps on the 46.4-long compact demo at dz/dr = 0.145/0.05; steps
+/// scale with domain length (transit-dominated) and with 1/dt, and dt scales
+/// like 1/(1/dz + 1/dr) at fixed wave speeds (§5). `cells_per_sec` is the
+/// measured throughput of this machine, if a sample exists yet.
+pub fn estimate_cost(p: &CaseParams, wall: &[[f64; 2]], cells_per_sec: Option<f64>) -> CostEstimate {
+    const STEPS_REF: f64 = 6100.0; // §9, at LZ = 46.4, dz = 0.145, dr = 0.05
+    let g = graded_grid(p, wall);
     let dr = 1.0 / p.cells_per_rt;
-    let steps = STEPS_COMPACT_DEMO * (g.lz() / LZ) * (0.05 / dr);
-    // cells/s throughput; the fallback is the §8 low-end M1 figure.
-    let throughput = match measured {
-        Some((sps, cells)) if sps > 1.0 => sps * cells as f64,
-        _ => 10.0e6,
+    let dz = p.dz_over_dr * dr;
+    let steps =
+        STEPS_REF * (g.lz() / LZ) * ((1.0 / dz + 1.0 / dr) / (1.0 / 0.145 + 1.0 / 0.05));
+    let padded = (g.nz + 2 * cfd_contract::NG) * (g.nr + 2 * cfd_contract::NG);
+    let seconds = match cells_per_sec {
+        Some(cps) if cps > 0.0 => steps * g.len() as f64 / cps,
+        _ => f64::NAN,
     };
-    steps * g.len() as f64 / throughput
+    CostEstimate {
+        cells: g.len(),
+        nz: g.nz,
+        nr: g.nr,
+        steps,
+        seconds,
+        bytes: padded as u64 * EST_BYTES_PER_CELL,
+    }
+}
+
+/// Best-effort memory budget for the blocking confirmation: MemAvailable on
+/// Linux, total memory on macOS, 8 GB when neither can be read. An estimate
+/// for a guard rail, not an allocator.
+pub fn memory_budget_bytes() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+            for line in s.lines() {
+                if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                    if let Some(kb) = rest.split_whitespace().next().and_then(|v| v.parse::<u64>().ok()) {
+                        return kb * 1024;
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = std::process::Command::new("sysctl").args(["-n", "hw.memsize"]).output() {
+            if let Ok(b) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() {
+                return b;
+            }
+        }
+    }
+    8 * 1024 * 1024 * 1024
 }
 
 #[cfg(test)]
@@ -783,65 +896,149 @@ mod tests {
     }
 
     #[test]
-    fn default_base_grid_is_the_reference_320x200() {
-        let g = base_grid(&CaseParams::default());
+    fn preview_base_grid_is_the_reference_320x200() {
+        let (lz_rt, lr_rt, cells_per_rt, dz_over_dr) = DomainPreset::Preview.values();
+        let p = CaseParams { lz_rt, lr_rt, cells_per_rt, dz_over_dr, ..CaseParams::default() };
+        let g = base_grid(&p);
         assert_eq!((g.nz, g.nr), (320, 200));
         assert!((g.dz(0) - 0.145).abs() < 1e-6 && (g.dr(0) - 0.05).abs() < 1e-7);
     }
 
-    /// The graded default (Standard plume): ~50% longer domain than compact
-    /// at roughly the compact cell count, with the base spacing held across
-    /// the nozzle and the finest spacing unchanged (so dt is unchanged).
+    /// The default (Large) domain: 282 x 32 r_t — roughly 2x the deleted
+    /// largest tier in both directions — at a graded cell count a few times
+    /// the historic 64k compact grid, with the base spacing held across the
+    /// nozzle and plume core and the finest spacing unchanged (so dt is
+    /// unchanged from the compact grid).
     #[test]
-    fn graded_standard_domain_is_cheap() {
+    fn default_large_domain_is_graded_and_dt_neutral() {
         let p = CaseParams::default();
+        assert_eq!((p.lz_rt, p.lr_rt), (LZ_DEFAULT, LR_DEFAULT));
         let wall = conical_contour(p.area_ratio);
-        let (lz, lr) = domain(&p);
-        assert!(lz > LZ * 1.4, "Standard lz = {lz}");
         let g = graded_grid(&p, &wall);
-        assert!((g.lz() - lz).abs() < 1e-6 && (g.lr() - lr).abs() < 1e-6);
+        assert!((g.lz() - p.lz_rt).abs() < 1e-6 && (g.lr() - p.lr_rt).abs() < 1e-6);
         assert!((g.dz_min() as f64 - 0.145).abs() < 1e-3);
         assert!((g.dr_min() as f64 - 0.05).abs() < 1e-7);
-        let base_cells = base_grid(&p).len();
+        // A uniform grid at these extents would be ~14x the historic compact
+        // 64k; grading must keep it within a few multiples.
         assert!(
-            g.len() < base_cells * 12 / 10,
-            "graded Standard is {} cells vs {} compact-uniform",
+            g.len() < 3 * 64_000,
+            "graded Large is {} cells ({} x {})",
             g.len(),
-            base_cells
+            g.nz,
+            g.nr
         );
-        // Base resolution held across the whole nozzle span.
+        // Base resolution held across the whole nozzle span...
         let z_end = wall.last().unwrap()[0];
         for iz in 0..g.nz {
             if g.z_edges()[iz + 1] <= z_end {
                 assert!((g.dz(iz) as f64 - 0.145).abs() < 1e-3, "dz({iz}) = {}", g.dz(iz));
             }
         }
-        // Long reaches ~40 exit radii of plume beyond the nozzle.
-        let pl = CaseParams { plume: PlumeLength::Long, ..p };
-        let (lz_l, _) = domain(&pl);
-        let r_e = p.area_ratio.sqrt();
-        assert!((lz_l - LZ) / r_e >= 27.9, "Long adds {} r_e", (lz_l - LZ) / r_e);
-        let gl = graded_grid(&pl, &wall);
-        assert!(
-            gl.len() < base_cells * 2,
-            "graded Long is {} cells vs {} compact-uniform",
-            gl.len(),
-            base_cells
+        // ...and base radial cells across the plume core (§8: 3.54 r_e).
+        let r_hold = PLUME_HOLD * p.area_ratio.sqrt();
+        for ir in 0..g.nr {
+            if g.r_edges()[ir + 1] <= r_hold {
+                assert!((g.dr(ir) as f64 - 0.05).abs() < 1e-6, "dr({ir}) = {}", g.dr(ir));
+            }
+        }
+        // Graded cells never shrink below base and never exceed the 6x cap
+        // by more than the closing stretch.
+        for iz in 0..g.nz {
+            let d = g.dz(iz) as f64;
+            assert!(d > 0.144 && d < 0.145 * 6.0 * 1.1, "dz({iz}) = {d}");
+        }
+    }
+
+    /// The three shortcut buttons produce the graded grids the §8 table
+    /// quotes (demo case). Loose bands: the exact counts are recorded in
+    /// docs/results/; this pins the order of magnitude and prints the truth.
+    #[test]
+    fn domain_presets_produce_expected_grids() {
+        let expect = [
+            (DomainPreset::Preview, 25_000, 40_000),
+            (DomainPreset::Standard, 45_000, 90_000),
+            (DomainPreset::Large, 90_000, 190_000),
+        ];
+        for (opt, lo, hi) in expect {
+            let (lz_rt, lr_rt, cells_per_rt, dz_over_dr) = opt.values();
+            let p = CaseParams { lz_rt, lr_rt, cells_per_rt, dz_over_dr, ..CaseParams::default() };
+            let g = graded_grid(&p, &conical_contour(p.area_ratio));
+            println!(
+                "{}: {} x {} = {} cells over {:.1} x {:.1} r_t",
+                opt.label(), g.nz, g.nr, g.len(), g.lz(), g.lr()
+            );
+            assert!(
+                (lo..hi).contains(&g.len()),
+                "{}: {} cells outside [{lo}, {hi})", opt.label(), g.len()
+            );
+        }
+    }
+
+    /// The OLD default (graded Standard tier) reproduced through the new
+    /// direct fields must give a BIT-IDENTICAL grid to the old pipeline,
+    /// replicated inline here: raster on the compact 46.4 x 10 base grid,
+    /// grade to the Standard extents. Identical grid + untouched solver =>
+    /// identical numbers; the recorded cell count (39,312 on intel-xeon-4c)
+    /// pins it to the committed baseline. If this fails, something other
+    /// than sizing changed — stop and report.
+    #[test]
+    fn old_default_settings_reproduce_the_old_grid() {
+        let r_e = 8.0f64.sqrt();
+        let old = CaseParams {
+            lz_rt: LZ + 8.0 * r_e, // old Standard: compact + 8 exit radii
+            lr_rt: LR * 1.3,       // and 1.3x radial headroom
+            cells_per_rt: CELLS_PER_RT,
+            dz_over_dr: DZ_OVER_DR,
+            ..CaseParams::default()
+        };
+        let wall = conical_contour(old.area_ratio);
+        let new_grid = graded_grid(&old, &wall);
+
+        // The old pipeline, verbatim: rasterize on the compact base grid,
+        // grade from its solid span to the full extents.
+        let dr = 1.0 / old.cells_per_rt;
+        let dz = DZ_OVER_DR * dr;
+        let compact = Grid::uniform(
+            (LZ / dz).round() as usize,
+            (LR / dr).round() as usize,
+            dz as f32,
+            dr as f32,
         );
+        assert_eq!((compact.nz, compact.nr), (320, 200));
+        let solid = rasterize_wall(&wall, &compact);
+        let spec = cfd_geom::GradeSpec::new(dz, dr, old.lz_rt, old.lr_rt);
+        let old_grid = cfd_geom::grade_from_solid(&solid, &spec).unwrap();
+
+        assert_eq!(
+            old_grid, new_grid,
+            "new pipeline must reproduce the old default grid exactly \
+             (old {} x {}, new {} x {})",
+            old_grid.nz, old_grid.nr, new_grid.nz, new_grid.nr
+        );
+        assert_eq!(new_grid.len(), 39_312, "recorded graded-Standard cell count");
     }
 
     #[test]
-    fn presets_fit_their_domain_and_match_the_costed_ratios() {
-        // Relative run times quoted in the task/tooltips: Raptor 2.1,
-        // AJ10 3.4, RS-25 4.3, Merlin Vac 11.7 (F-1 shares Merlin's domain).
-        let expect = [1.0, 1.0, 2.1, 3.4, 4.3, 11.7];
-        for (p, want) in PRESETS.iter().zip(expect) {
-            assert!(
-                (p.relative_cost() / want - 1.0).abs() < 0.05,
-                "{}: cost {:.2} vs {want}",
-                p.name,
-                p.relative_cost()
-            );
+    fn presets_fit_their_domain_and_cost_sanely() {
+        // Costs are computed from the graded-grid model (steps x cells), so
+        // assert structure, not brittle constants: Merlin 1D is the unit,
+        // cost rises with area ratio among the full-resolution presets, and
+        // Merlin Vac is the costliest.
+        let costs: Vec<f64> = PRESETS.iter().map(|p| p.relative_cost()).collect();
+        println!("relative costs: {costs:?}");
+        assert!((costs[0] - 1.0).abs() < 1e-12);
+        // F-1 shares Merlin 1D's area ratio and therefore its domain. The
+        // costs are no longer bit-equal because the estimate now prices each
+        // preset's OWN wall (a 75% bell against Merlin's 78%), and the grading
+        // rule reads its held span from that wall — a few percent, not a tier.
+        assert!(
+            (costs[1] - costs[0]).abs() < 0.05,
+            "F-1 shares Merlin's domain: {costs:?}"
+        );
+        assert!(costs[2] > 1.5 && costs[3] > costs[2] && costs[4] > costs[3],
+                "costs not increasing with area ratio: {costs:?}");
+        assert!(costs[5] > costs[4] && costs[5] > 5.0, "Merlin Vac not costliest: {costs:?}");
+        for p in PRESETS.iter() {
             let c = p.case(0.0, false);
             // Both the preset's bell and the fallback cone must fit: the
             // cone is what a rejected spec degrades to, so it may not
@@ -958,12 +1155,19 @@ mod tests {
             assert_eq!(wall.fallback, None, "{name}: fell back to the cone");
             assert!(wall.kind.is_bell());
             let g = graded_grid(&p, &wall.points);
-            let (lz, lr) = domain(&p);
+            let (lz, lr) = (p.lz_rt, p.lr_rt);
             assert!((g.lz() - lz).abs() < 1e-6 && (g.lr() - lr).abs() < 1e-6, "{name}: extents");
             let dr = 1.0 / p.cells_per_rt;
-            let dz = DZ_OVER_DR * dr;
-            // Finest spacing unchanged (dt is set by it) …
-            assert!((g.dr_min() as f64 - dr).abs() < 1e-7, "{name}: dr_min {}", g.dr_min());
+            let dz = p.dz_over_dr * dr;
+            // Finest spacing unchanged (dt is set by it) — to within the
+            // wall-fitted hold's integer-cell rounding, which can land base a
+            // fraction of a percent low (RS-25: 0.049994 against 0.05). That
+            // direction only ever shrinks dt, so dt-neutrality is preserved.
+            assert!(
+                g.dr_min() as f64 <= dr + 1e-9 && g.dr_min() as f64 > dr * 0.999,
+                "{name}: dr_min {} vs base {dr}",
+                g.dr_min()
+            );
             assert!((g.dz_min() as f64 - dz).abs() < 1e-3, "{name}: dz_min {}", g.dz_min());
             // … base resolution held across the whole bell in z. (Only in z:
             // `rasterize_wall` closes the solid past the top of the domain, so
@@ -1408,7 +1612,9 @@ mod perf_probe {
 
     #[test]
     fn snapshot_timing_probe() {
-        let p = CaseParams::default();
+        // Preview extents: the probe times snapshot cost, not domain size.
+        let (lz_rt, lr_rt, cells_per_rt, dz_over_dr) = DomainPreset::Preview.values();
+        let p = CaseParams { lz_rt, lr_rt, cells_per_rt, dz_over_dr, ..CaseParams::default() };
         let setup = make_setup(&p, &conical_contour(p.area_ratio));
         let mut s = cfd_core::MockSolver::new(setup).unwrap();
         for _ in 0..200 {
@@ -1471,7 +1677,7 @@ mod grading_bench {
         });
     }
 
-    fn run_case(name: &str, setup: SolveSetup, project: bool) {
+    fn run_case(name: &str, setup: SolveSetup) {
         let g = setup.grid.clone();
         let target = steps_to_visual_steady(&g);
         let mut s = cfd_core::EulerSolver::new(setup).unwrap();
@@ -1483,29 +1689,32 @@ mod grading_bench {
             s.step().unwrap();
         }
         let sps = 250.0 / t0.elapsed().as_secs_f64();
-        let mut info;
-        let (wall_s, how, floors, last_floor) = if project {
-            (target as f64 / sps, "projected", 0, 0)
-        } else {
-            let t1 = Instant::now();
+        let t1 = Instant::now();
+        let mut info = s.step().unwrap();
+        let mut floors = info.floor_activations;
+        let mut last_floor = if floors > 0 { info.step } else { 0 };
+        while info.step < target {
             info = s.step().unwrap();
-            let mut floors = info.floor_activations;
-            let mut last_floor = if floors > 0 { info.step } else { 0 };
-            while info.step < target {
-                info = s.step().unwrap();
-                if info.floor_activations > floors {
-                    floors = info.floor_activations;
-                    last_floor = info.step;
-                }
+            if info.floor_activations > floors {
+                floors = info.floor_activations;
+                last_floor = info.step;
             }
-            (300.0 / sps + t1.elapsed().as_secs_f64(), "measured", floors, last_floor)
-        };
+        }
+        let wall_s = 300.0 / sps + t1.elapsed().as_secs_f64();
+        let rep = s.report();
         println!(
             "{name}: {} x {} = {} cells | {:.0} steps/s | visual steady \
-             (step {target}) in {:.0} s wall ({how}) | floors {floors} (last at step {last_floor})",
-            g.nz, g.nr, g.len(), sps, wall_s
+             (step {target}) in {:.0} s wall | floors {floors} (last at step {last_floor}) | \
+             mdot {:.2} kg/s, C_f {:.3}, exit M {:.3}",
+            g.nz, g.nr, g.len(), sps, wall_s,
+            rep.mass_flow_kg_s, rep.thrust_coefficient, rep.exit_mach
         );
         record_bench(name, g.len(), sps, wall_s);
+        cfd_results::record_note("grading-bench", &format!("{name}-report"), &format!(
+            "{name} at visual steady (step {target}): mass flow {:.3} kg/s, C_f {:.4}, \
+             exit Mach {:.3} (area-avg), p_e/p_a {:.3}, N_throat {:.0}.",
+            rep.mass_flow_kg_s, rep.thrust_coefficient, rep.exit_mach,
+            rep.exit_pressure_ratio, rep.cells_per_throat_radius));
         if floors > 0 {
             cfd_results::record_note("grading-bench", name, &format!(
                 "{name}: {floors} positivity-floor activations, all during the cold-start \
@@ -1513,47 +1722,49 @@ mod grading_bench {
         }
         // Floor contact must have the §13 cold-start shape: confined to the
         // startup front and quiet ever after (the report quarantine covers
-        // it). Steady-state floor contact is a hard failure. Measured here:
-        // graded Long trips 552 at the lip corner over steps 91-121 (the
-        // startup blast expands deeper in the larger domain), zero after;
-        // every other case is clean.
+        // it). Steady-state floor contact is a hard failure. The startup
+        // blast expands deeper before relief in the larger domains, so the
+        // cold-start window is a few hundred steps at the lip corner.
         assert!(
             floors == 0 || last_floor < 1500,
             "{name}: floors {floors}, last at step {last_floor} — not startup-confined"
         );
     }
 
-    /// The work-order report (item 5): cells, steps/s and seconds-to-steady
-    /// before (uniform grids) and after (graded), on this machine.
+    fn preset_case(preset: DomainPreset) -> CaseParams {
+        let (lz_rt, lr_rt, cells_per_rt, dz_over_dr) = preset.values();
+        CaseParams { lz_rt, lr_rt, cells_per_rt, dz_over_dr, ..CaseParams::default() }
+    }
+
+    /// The work-order report (item 8): cells, steps/s, seconds-to-steady and
+    /// the report numbers at each domain preset plus the old-default
+    /// (graded-Standard tier) equivalent, on this machine.
     ///
     ///     cargo test -p cfd-ui grading_bench -- --include-ignored --nocapture
     #[test]
-    #[ignore = "benchmark: minutes of solver time; run explicitly"]
+    #[ignore = "benchmark: tens of minutes of solver time; run explicitly"]
     fn grading_before_after() {
         let wall = conical_contour(8.0);
 
-        // BEFORE 1: the historic compact uniform 320 x 200 demo grid.
-        let pc = CaseParams { plume: PlumeLength::Compact, ..CaseParams::default() };
-        run_case("uniform Compact (historic)", bench_setup(base_grid(&pc), &pc, &wall), false);
+        // Reference: the historic compact uniform 320 x 200 demo grid.
+        let pc = preset_case(DomainPreset::Preview);
+        run_case("uniform Compact (historic)", bench_setup(base_grid(&pc), &pc, &wall));
 
-        // BEFORE 2: the rejected alternative — the Long domain at UNIFORM
-        // base resolution (what the work order prices at ~14x).
-        let pl = CaseParams { plume: PlumeLength::Long, ..CaseParams::default() };
-        let (lz, lr) = domain(&pl);
-        let dr = 1.0 / pl.cells_per_rt;
-        let dz = 2.9 * dr;
-        let ug = Grid::uniform(
-            (lz / dz).round() as usize,
-            (lr / dr).round() as usize,
-            dz as f32,
-            dr as f32,
-        );
-        run_case("uniform Long (rejected)", bench_setup(ug, &pl, &wall), true);
+        // The old default: the deleted Standard tier's extents through the
+        // new direct fields (the grid is bit-identical to the old pipeline —
+        // old_default_settings_reproduce_the_old_grid).
+        let r_e = 8.0f64.sqrt();
+        let po = CaseParams {
+            lz_rt: LZ + 8.0 * r_e,
+            lr_rt: LR * 1.3,
+            ..CaseParams::default()
+        };
+        run_case("old Standard (equivalence)", make_setup(&po, &wall));
 
-        // AFTER: the graded Standard and Long grids.
-        let ps = CaseParams::default(); // Standard is the default
-        run_case("graded Standard (default)", make_setup(&ps, &wall), false);
-        run_case("graded Long", make_setup(&pl, &wall), false);
+        // The three shortcuts; Large is the default.
+        run_case("Preview preset", make_setup(&preset_case(DomainPreset::Preview), &wall));
+        run_case("Standard preset", make_setup(&preset_case(DomainPreset::Standard), &wall));
+        run_case("Large preset (default)", make_setup(&preset_case(DomainPreset::Large), &wall));
         cfd_results::record_note("grading-bench", "criterion",
             "seconds_to_steady uses the §9 VISUAL-steady criterion (~5 plume transits, \
              scaled by domain length). The residual-based settled flag does not fire at \
@@ -1696,14 +1907,20 @@ mod contour_before_after {
     /// A single-instant read is exactly what this test used to do, and it
     /// flipped sign before ~step 2000.
     ///
-    /// Compact plume for all runs: these are exit-plane quantities, unaffected
-    /// by plume-domain length. Model-to-model comparison, not a pad prediction.
+    /// COMPACT extents for all runs: these are exit-plane quantities, and the
+    /// plume tail past the lip does not move them — it only costs solver time.
+    /// The configurable-domain work order folded the plume extension into
+    /// `preset_domain`, so the compact sizing (§8: 3(√ε−1) + 20 long, 2.5√ε
+    /// high) is set explicitly here rather than selected by a tier.
+    /// Model-to-model comparison, not a pad prediction.
     #[test]
     #[ignore = "solver benchmark: ~25 min; run explicitly with --include-ignored"]
     fn rs25_before_after() {
         let pre = PRESETS.iter().find(|p| p.name == "RS-25").unwrap();
         let mut c = pre.case(0.0, false);
-        c.plume = PlumeLength::Compact;
+        let s = c.area_ratio.sqrt();
+        c.lz_rt = 3.0 * (s - 1.0) + 20.0;
+        c.lr_rt = (2.5 * s).max(10.0);
         let walls = [
             ("15 deg cone (before)", conical_contour(c.area_ratio)),
             ("80% bell (after)", nozzle_contour(&c).points),
@@ -1880,8 +2097,8 @@ mod floor_diag {
 
     #[test]
     #[ignore = "diagnostic"]
-    fn diag_graded_long_floors() {
-        let pl = CaseParams { plume: PlumeLength::Long, ..CaseParams::default() };
+    fn diag_graded_large_floors() {
+        let pl = CaseParams::default(); // the Large domain
         let wall = conical_contour(pl.area_ratio);
         let setup = make_setup(&pl, &wall);
         let g = setup.grid.clone();

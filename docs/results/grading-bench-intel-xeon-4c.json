@@ -1,16 +1,23 @@
 {
-  "commit": "ab39fb48c9e0607289579a86238e92862e3ed06c",
-  "timestamp": "2026-08-14T18:52:00Z",
+  "commit": "ced9aaf63a67f34ad3c8fecd901ee0a5d7bee51c",
+  "timestamp": "2026-08-15T00:41:08Z",
   "machine": "intel-xeon-4c",
   "tests": [],
   "benchmarks": [
-    {"case":"demo nozzle (gamma 1.24, eps 8, sea level)","setting":"uniform Compact (historic)","cells":64000,"steps_per_sec":48.766078423056264,"seconds_to_steady":143.7465115566},
-    {"case":"demo nozzle (gamma 1.24, eps 8, sea level)","setting":"uniform Long (rejected)","cells":277120,"steps_per_sec":11.83388894280548,"seconds_to_steady":1394.9767552987041},
-    {"case":"demo nozzle (gamma 1.24, eps 8, sea level)","setting":"graded Standard (default)","cells":39312,"steps_per_sec":87.83889929021893,"seconds_to_steady":124.2597844516},
-    {"case":"demo nozzle (gamma 1.24, eps 8, sea level)","setting":"graded Long","cells":57318,"steps_per_sec":55.40096561214952,"seconds_to_steady":336.9140399272}
+    {"case":"demo nozzle (gamma 1.24, eps 8, sea level)","setting":"uniform Compact (historic)","cells":64000,"steps_per_sec":93.57010369762645,"seconds_to_steady":73.862399522},
+    {"case":"demo nozzle (gamma 1.24, eps 8, sea level)","setting":"old Standard (equivalence)","cells":39312,"steps_per_sec":149.56480479637148,"seconds_to_steady":65.4410033838},
+    {"case":"demo nozzle (gamma 1.24, eps 8, sea level)","setting":"Preview preset","cells":28400,"steps_per_sec":188.75566882066806,"seconds_to_steady":33.3808292526},
+    {"case":"demo nozzle (gamma 1.24, eps 8, sea level)","setting":"Standard preset","cells":61746,"steps_per_sec":99.90999128866801,"seconds_to_steady":207.74370728099998},
+    {"case":"demo nozzle (gamma 1.24, eps 8, sea level)","setting":"Large preset (default)","cells":123900,"steps_per_sec":51.330637251702754,"seconds_to_steady":803.8152223866}
   ],
   "notes": [
-    "graded Long: 552 positivity-floor activations, all during the cold-start front (last at step 301, zero after) — the §13 quarantine class.",
+    "uniform Compact (historic) at visual steady (step 6100): mass flow 21.417 kg/s, C_f 1.3230, exit Mach 2.589 (area-avg), p_e/p_a 0.954, N_throat 20.",
+    "old Standard (equivalence) at visual steady (step 9075): mass flow 21.345 kg/s, C_f 1.3177, exit Mach 2.599 (area-avg), p_e/p_a 0.944, N_throat 20.",
+    "Preview preset at visual steady (step 6100): mass flow 21.380 kg/s, C_f 1.3191, exit Mach 2.613 (area-avg), p_e/p_a 0.936, N_throat 20.",
+    "Standard preset at visual steady (step 18537): mass flow 21.365 kg/s, C_f 1.3187, exit Mach 2.605 (area-avg), p_e/p_a 0.941, N_throat 20.",
+    "Standard preset: 551 positivity-floor activations, all during the cold-start front (last at step 301, zero after) — the §13 quarantine class.",
+    "Large preset (default) at visual steady (step 37073): mass flow 21.367 kg/s, C_f 1.3179, exit Mach 2.619 (area-avg), p_e/p_a 0.931, N_throat 20.",
+    "Large preset (default): 9280 positivity-floor activations, all during the cold-start front (last at step 301, zero after) — the §13 quarantine class.",
     "seconds_to_steady uses the §9 VISUAL-steady criterion (~5 plume transits, scaled by domain length). The residual-based settled flag does not fire at sea level on either the uniform or the graded grid — the mildly overexpanded plume keeps breathing above the 1e-3 threshold."
   ]
 }

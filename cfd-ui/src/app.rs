@@ -14,7 +14,7 @@ use cfd_contract::{FieldKind, SolverCommand};
 use crate::canvas::{colorbar, fmt_value, Canvas, BG};
 use crate::case::{
     self, ambient_nd, atmosphere, ideal_cf, make_setup, nozzle_contour, rasterize_wall,
-    separation_altitude_m, separation_threshold, CaseParams, ContourKind, PlumeLength, ALT_MAX_M,
+    separation_altitude_m, separation_threshold, CaseParams, ContourKind, DomainPreset, ALT_MAX_M,
     PRESETS, R_UNIVERSAL_SI, VACUUM_P_FRAC,
 };
 use crate::editor::{EditorBackend, StubEditor};
@@ -102,10 +102,26 @@ pub struct CfdApp {
     geometry_custom: bool,
     space_panned: bool,
     hover_text: String,
-    /// Cached plume-option time-to-steady estimates and the frame generation
-    /// they were computed at (each estimate re-runs the grading, so it is
-    /// refreshed on a slow cadence rather than per repaint).
-    plume_est: Option<([f64; 3], u64)>,
+    // Domain-size staging (work order: configurable-domain): the four sidebar
+    // fields, committed on release / focus loss like the sliders. `params`
+    // holds the values the solver is actually running.
+    ui_lz_rt: f64,
+    ui_lr_rt: f64,
+    ui_cells_per_rt: f64,
+    ui_dz_over_dr: f64,
+    /// Cached live cost readout: (staged field values, ui tick it was
+    /// computed at, estimate). Each estimate re-runs grading + wall
+    /// rasterization, so it refreshes on a bounded cadence, not per repaint.
+    cost_cache: Option<([f64; 4], u64, case::CostEstimate)>,
+    /// Repaint counter for the cost-readout cadence (frame_gen freezes when
+    /// the worker pauses; this does not).
+    ui_tick: u64,
+    /// The staged domain settings exceed the machine's memory: the rebuild is
+    /// blocked until the user explicitly confirms or reverts.
+    mem_confirm: bool,
+    /// Engine-preset tooltips, built once: `relative_cost` re-runs the
+    /// grading for its cost model, far too slow for a per-repaint call.
+    preset_tips: Vec<String>,
     /// ANALYTIC PREVIEW overlay — true only for MockSolver builds.
     watermark: bool,
 }
@@ -124,10 +140,7 @@ impl CfdApp {
             locked[k as usize] = lock_range(k, initial.snapshot.range(k));
         }
         let mut editor = StubEditor::new(wall.points.clone());
-        {
-            let (lz, lr) = case::domain(&params);
-            editor.set_domain(lz, lr);
-        }
+        editor.set_domain(params.lz_rt, params.lr_rt);
         CfdApp {
             out,
             tx,
@@ -135,6 +148,10 @@ impl CfdApp {
             frame_gen: 0,
             ui_area_ratio: params.area_ratio,
             ui_p0_mpa: params.p0_pa / 1e6,
+            ui_lz_rt: params.lz_rt,
+            ui_lr_rt: params.lr_rt,
+            ui_cells_per_rt: params.cells_per_rt,
+            ui_dz_over_dr: params.dz_over_dr,
             params,
             preset: None,
             relock_pending: false,
@@ -155,7 +172,10 @@ impl CfdApp {
             geometry_custom: false,
             space_panned: false,
             hover_text: String::new(),
-            plume_est: None,
+            cost_cache: None,
+            ui_tick: 0,
+            mem_confirm: false,
+            preset_tips: PRESETS.iter().map(preset_tooltip).collect(),
             watermark,
         }
     }
@@ -233,9 +253,9 @@ impl CfdApp {
         };
         self.ui_area_ratio = self.params.area_ratio;
         self.ui_p0_mpa = self.params.p0_pa / 1e6;
+        self.sync_domain_fields();
         let wall = nozzle_contour(&self.params);
-        let (lz, lr) = case::domain(&self.params);
-        self.editor.set_domain(lz, lr);
+        self.editor.set_domain(self.params.lz_rt, self.params.lr_rt);
         self.editor.set_points(wall.points.clone());
         self.committed_wall = wall.points;
         self.wall_kind = Some(wall.kind);
@@ -247,68 +267,242 @@ impl CfdApp {
         self.canvas.request_fit(); // the domain just changed size
     }
 
-    /// Plume length control (grid-grading work order, item 3): Compact /
-    /// Standard / Long with an estimated time to steady state per option.
-    /// Switching rebuilds the solver on the re-graded grid (the domain
-    /// changes, so the field restarts).
-    fn plume_selector(&mut self, ui: &mut egui::Ui) {
-        // Refresh the estimates at ~1 Hz: each one re-runs the grading and
-        // rasterization for its candidate domain.
-        let stale = match self.plume_est {
+    /// Mirror the committed params into the staged sidebar fields.
+    fn sync_domain_fields(&mut self) {
+        self.ui_lz_rt = self.params.lz_rt;
+        self.ui_lr_rt = self.params.lr_rt;
+        self.ui_cells_per_rt = self.params.cells_per_rt;
+        self.ui_dz_over_dr = self.params.dz_over_dr;
+        self.mem_confirm = false;
+    }
+
+    /// The staged sidebar values as a candidate case, sanitized (clamped
+    /// ranges; non-finite entry falls back to the committed value) so the
+    /// cost estimator and the solver can never see NaN or a zero-size grid.
+    fn staged_params(&mut self) -> CaseParams {
+        let mut cand = CaseParams {
+            lz_rt: self.ui_lz_rt,
+            lr_rt: self.ui_lr_rt,
+            cells_per_rt: self.ui_cells_per_rt,
+            dz_over_dr: self.ui_dz_over_dr,
+            ..self.params
+        };
+        case::sanitize_domain(&mut cand, &self.params);
+        self.ui_lz_rt = cand.lz_rt;
+        self.ui_lr_rt = cand.lr_rt;
+        self.ui_cells_per_rt = cand.cells_per_rt;
+        self.ui_dz_over_dr = cand.dz_over_dr;
+        cand
+    }
+
+    /// Commit the staged domain settings: rebuild and restart on the
+    /// re-graded grid, exactly as the old tier buttons did. Blocked behind an
+    /// explicit confirmation when the estimate exceeds the machine's memory
+    /// (`force` is that confirmation).
+    fn commit_domain(&mut self, force: bool) {
+        let cand = self.staged_params();
+        if cand == self.params {
+            self.mem_confirm = false;
+            return;
+        }
+        let est = case::estimate_cost(&cand, &self.committed_wall, self.throughput());
+        if !force && est.bytes > case::memory_budget_bytes() {
+            self.mem_confirm = true;
+            return;
+        }
+        self.mem_confirm = false;
+        self.params = cand;
+        self.cost_cache = None;
+        self.editor.set_domain(self.params.lz_rt, self.params.lr_rt);
+        let setup = make_setup(&self.params, &self.committed_wall);
+        let _ = self.tx.send(UiCommand::Rebuild(Box::new(setup)));
+        self.relock_pending = true;
+        self.canvas.request_fit();
+    }
+
+    /// This machine's measured solver throughput in cells/s, if the worker's
+    /// calibration run has reported yet.
+    fn throughput(&self) -> Option<f64> {
+        (self.latest.cells_per_sec > 0.0).then_some(self.latest.cells_per_sec)
+    }
+
+    /// Domain size and mesh resolution (work order: configurable-domain):
+    /// a live cost readout above four editable fields, plus three shortcut
+    /// buttons that just fill the fields. Committing a change re-grades the
+    /// grid, rebuilds the solver and restarts the field.
+    fn domain_section(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Domain size").strong());
+
+        // ---- live cost readout, from the STAGED values, before any solve.
+        // Bounded cadence: each estimate re-runs grading + rasterization.
+        let staged = self.staged_params();
+        let key = [staged.lz_rt, staged.lr_rt, staged.cells_per_rt, staged.dz_over_dr];
+        let stale = match &self.cost_cache {
             None => true,
-            Some((_, gen)) => self.frame_gen.saturating_sub(gen) > 60,
+            Some((k, tick, _)) => {
+                let age = self.ui_tick.saturating_sub(*tick);
+                (*k != key && age >= 10) || age > 120
+            }
         };
         if stale {
-            let measured = (self.latest.steps_per_sec > 1.0).then(|| {
-                (self.latest.steps_per_sec, self.latest.snapshot.grid.len())
-            });
-            let mut est = [0.0f64; 3];
-            for (k, opt) in PlumeLength::ALL.iter().enumerate() {
-                est[k] = case::estimate_steady_seconds(
-                    &self.params, *opt, &self.committed_wall, measured,
-                );
-            }
-            self.plume_est = Some((est, self.frame_gen));
+            let est = case::estimate_cost(&staged, &self.committed_wall, self.throughput());
+            self.cost_cache = Some((key, self.ui_tick, est));
         }
-        let est = self.plume_est.map(|(e, _)| e).unwrap_or_default();
-        let mut clicked: Option<PlumeLength> = None;
+        let est = self.cost_cache.as_ref().unwrap().2;
+        ui.label(
+            RichText::new(format!(
+                "{} cells ({} × {} graded) · ~{} steps to steady",
+                group_thousands(est.cells as u64),
+                est.nz,
+                est.nr,
+                group_thousands(est.steps.round() as u64),
+            ))
+            .small(),
+        );
+        let time_txt = if est.seconds.is_finite() {
+            format!("~{} wall clock", fmt_duration(est.seconds))
+        } else {
+            "wall clock: measuring this machine…".to_string()
+        };
+        ui.label(RichText::new(format!("{time_txt} · ~{} memory", fmt_bytes(est.bytes))).small())
+            .on_hover_text(
+                "Estimated from the §9 visual-steady step count scaled to this \
+                 domain and dt, and from a solver throughput measured on THIS \
+                 machine at the last rebuild. An estimate, not a promise.",
+            );
+        if est.seconds.is_finite() && est.seconds > 1800.0 {
+            ui.colored_label(
+                AMBER,
+                RichText::new(format!(
+                    "~{} — over the ~30 min budget for a normal run",
+                    fmt_duration(est.seconds)
+                ))
+                .small(),
+            );
+        }
+
+        // ---- the four fields. Committed on release / focus loss, like the
+        // sliders; DragValue clamps typed input into the same ranges that
+        // `sanitize_domain` enforces.
+        let mut commit = false;
+        ui.horizontal(|ui| {
+            ui.label("Resolution");
+            let r = ui.add(
+                egui::DragValue::new(&mut self.ui_cells_per_rt)
+                    .range(case::CELLS_PER_RT_RANGE.0..=case::CELLS_PER_RT_RANGE.1)
+                    .speed(0.5)
+                    .fixed_decimals(0)
+                    .suffix(" cells/r_t"),
+            )
+            .on_hover_text(
+                "Base radial cells across the throat radius. The mass-flow \
+                 badge goes amber below 20 (§8).",
+            );
+            commit |= r.drag_stopped() || r.lost_focus();
+            ui.label("· aspect dz/dr");
+            let r = ui.add(
+                egui::DragValue::new(&mut self.ui_dz_over_dr)
+                    .range(case::DZ_OVER_DR_RANGE.0..=case::DZ_OVER_DR_RANGE.1)
+                    .speed(0.05)
+                    .fixed_decimals(1),
+            )
+            .on_hover_text(
+                "Axial cells are this many times wider than radial ones. \
+                 dt is set by the radial spacing, so wide-in-z is nearly free \
+                 (§8); narrow it toward 2.0 to resolve the throat arc better.",
+            );
+            commit |= r.drag_stopped() || r.lost_focus();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Domain");
+            let r = ui.add(
+                egui::DragValue::new(&mut self.ui_lz_rt)
+                    .range(case::LZ_RANGE.0..=case::LZ_RANGE.1)
+                    .speed(1.0)
+                    .fixed_decimals(0),
+            )
+            .on_hover_text("Domain length in throat radii.");
+            commit |= r.drag_stopped() || r.lost_focus();
+            ui.label("×");
+            let r = ui.add(
+                egui::DragValue::new(&mut self.ui_lr_rt)
+                    .range(case::LR_RANGE.0..=case::LR_RANGE.1)
+                    .speed(0.5)
+                    .fixed_decimals(0),
+            )
+            .on_hover_text("Domain radius in throat radii.");
+            commit |= r.drag_stopped() || r.lost_focus();
+            ui.label(RichText::new("r_t (length × radius)").weak().small());
+        });
+
+        // ---- shortcuts: fill the fields and commit. Not tiers — the fields
+        // stay editable afterwards.
         ui.horizontal_wrapped(|ui| {
-            ui.label("Plume");
-            for (k, opt) in PlumeLength::ALL.iter().enumerate() {
-                let label = format!("{} · ~{}", opt.label(), fmt_duration(est[k]));
+            for opt in DomainPreset::ALL {
+                let (lz, lr, n, asp) = opt.values();
+                let selected = self.params.lz_rt == lz
+                    && self.params.lr_rt == lr
+                    && self.params.cells_per_rt == n
+                    && self.params.dz_over_dr == asp;
                 let tip = match opt {
-                    PlumeLength::Compact => "The historic domain: Mach disk plus half a shock cell.",
-                    PlumeLength::Standard => "~20 exit radii of plume: Mach disk plus ~2 shock cells.",
-                    PlumeLength::Long => "~40 exit radii of plume: 4-5 shock cells.",
+                    DomainPreset::Preview => {
+                        "The historic compact interactive domain — returns in \
+                         seconds; Mach disk plus half a shock cell."
+                    }
+                    DomainPreset::Standard => "Half the Large domain in both directions.",
+                    DomainPreset::Large => "The full domain (the default).",
                 };
                 let r = ui
-                    .selectable_label(self.params.plume == *opt, label)
+                    .selectable_label(selected, opt.label())
                     .on_hover_text(format!(
-                        "{tip}\nEstimated time to visual steady state on this machine. \
-                         Switching re-grades the grid and restarts the field."
+                        "{tip}\n{lz:.0} × {lr:.0} r_t at {n:.0} cells/r_t — fills the \
+                         fields above; they stay editable."
                     ));
-                if r.clicked() && self.params.plume != *opt {
-                    clicked = Some(*opt);
+                if r.clicked() && !selected {
+                    self.ui_lz_rt = lz;
+                    self.ui_lr_rt = lr;
+                    self.ui_cells_per_rt = n;
+                    self.ui_dz_over_dr = asp;
+                    commit = true;
                 }
             }
         });
         ui.label(
             RichText::new(
-                "graded grid: base cells across the geometry, 1.05 growth beyond \
-                 — dt is unchanged, only the tail cells are added",
+                "graded grid: base cells across the geometry and plume core, \
+                 1.05 growth beyond — dt is unchanged, only far-field cells \
+                 are added",
             )
             .weak()
             .small(),
         );
-        if let Some(opt) = clicked {
-            self.params.plume = opt;
-            self.plume_est = None;
-            let (lz, lr) = case::domain(&self.params);
-            self.editor.set_domain(lz, lr);
-            let setup = make_setup(&self.params, &self.committed_wall);
-            let _ = self.tx.send(UiCommand::Rebuild(Box::new(setup)));
-            self.relock_pending = true;
-            self.canvas.request_fit();
+
+        if commit {
+            self.commit_domain(false);
+        }
+
+        // ---- blocking confirmation: the staged settings would exhaust
+        // memory. Nothing rebuilds until the user decides.
+        if self.mem_confirm {
+            warning_box(
+                ui,
+                RED,
+                "TOO BIG FOR THIS MACHINE",
+                &format!(
+                    "These settings need ~{} but only ~{} of memory is \
+                     available. The app may crash or thrash if you proceed.",
+                    fmt_bytes(est.bytes),
+                    fmt_bytes(case::memory_budget_bytes())
+                ),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Run anyway").clicked() {
+                    self.commit_domain(true);
+                }
+                if ui.button("Revert").clicked() {
+                    self.sync_domain_fields();
+                }
+            });
         }
     }
 
@@ -468,7 +662,7 @@ impl CfdApp {
                 };
                 let r = ui
                     .selectable_label(self.preset == Some(i), label)
-                    .on_hover_text(preset_tooltip(p));
+                    .on_hover_text(&self.preset_tips[i]);
                 if r.clicked() && self.preset != Some(i) {
                     self.apply_preset(Some(i));
                 }
@@ -583,7 +777,7 @@ impl CfdApp {
             .weak()
             .small(),
         );
-        self.plume_selector(ui);
+        self.domain_section(ui);
     }
 
     fn operating_point(&mut self, ui: &mut egui::Ui) {
@@ -731,6 +925,20 @@ impl CfdApp {
         // quantized to a cell face, and 1.0/dr in f32 lands at 19.9999997.
         let n_throat = rep.cells_per_throat_radius.round();
         let underresolved = n_throat.is_finite() && n_throat < 20.0;
+        // Resolution-dependent badges (work order: configurable-domain).
+        // Mass-flow quantization is ±1/N_throat of the throat area (§8 table:
+        // ±5% at 20 cells/r_t, ±2.5% at 40). The staircase-wall biases are
+        // FIRST order in cell size, so the T8-measured figures at the
+        // N_throat = 20 reference (≈13% thrust, ≈19% exit Mach) scale as
+        // 20/N_throat — quoted numbers would lie at any other resolution.
+        let scale_ok = n_throat.is_finite() && n_throat >= 1.0;
+        let mdot_band = if scale_ok {
+            format!("±{:.1}%", 100.0 / n_throat)
+        } else {
+            "±?%".into()
+        };
+        let thrust_bias = 13.0 * 20.0 / n_throat;
+        let mach_bias = 19.0 * 20.0 / n_throat;
 
         // Greyed-out whenever unsettled: a report from an unconverged field
         // is not a number.
@@ -741,7 +949,7 @@ impl CfdApp {
                 .show(ui, |ui| {
                     ui.label("mass flow");
                     ui.monospace(fmt_or_dash(rep.mass_flow_kg_s, "kg/s"));
-                    ui.label(RichText::new("±5%").small().color(if underresolved {
+                    ui.label(RichText::new(&mdot_band).small().color(if underresolved {
                         AMBER
                     } else {
                         ui.visuals().weak_text_color()
@@ -773,13 +981,18 @@ impl CfdApp {
                             "—".into()
                         });
                         // N_throat lives NEXT TO the thrust readout, by decree.
-                        // The bias figure is measured (T8, ladder.rs): the
-                        // staircase wall's entropy layer costs ~13% of thrust at
-                        // the default N_throat = 20.
+                        // The bias reference is measured (T8, ladder.rs): the
+                        // staircase wall's entropy layer costs ~13% of thrust
+                        // at N_throat = 20, first order in cell size.
                         ui.label(
-                            RichText::new(format!(
-                                "{n_throat:.0} cells / r_t · ≈13% low (staircase wall)"
-                            ))
+                            RichText::new(if scale_ok {
+                                format!(
+                                    "{n_throat:.0} cells / r_t · ≈{thrust_bias:.0}% low \
+                                     (staircase wall)"
+                                )
+                            } else {
+                                "resolution unknown".into()
+                            })
                             .small()
                             .color(if underresolved {
                                 AMBER
@@ -817,13 +1030,18 @@ impl CfdApp {
                     ui.label("exit Mach");
                     ui.monospace(fmt_or_dash(rep.exit_mach, ""));
                     // Measured (T8): the wall layer drags the area average
-                    // ~19% below the 1-D ideal at default resolution; the
-                    // core flow is within ~7%.
+                    // ~19% below the 1-D ideal at N_throat = 20, first order
+                    // in cell size; the core flow is within ~7%.
                     ui.label(
-                        RichText::new(format!(
-                            "area-avg · ≈19% low at this res (staircase wall) · 1-D ideal {:.2}",
-                            rep.ideal_exit_mach
-                        ))
+                        RichText::new(if scale_ok {
+                            format!(
+                                "area-avg · ≈{mach_bias:.0}% low at this res (staircase \
+                                 wall) · 1-D ideal {:.2}",
+                                rep.ideal_exit_mach
+                            )
+                        } else {
+                            format!("area-avg · 1-D ideal {:.2}", rep.ideal_exit_mach)
+                        })
                         .small()
                         .weak(),
                     );
@@ -960,6 +1178,7 @@ impl CfdApp {
 
 impl eframe::App for CfdApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ui_tick += 1;
         // Pull the newest published frame; the clone only happens when the
         // worker actually published (max ~60/s), not per repaint.
         if self.out.updated() {
@@ -1115,6 +1334,26 @@ fn fmt_duration(secs: f64) -> String {
     } else {
         format!("{:.1} min", secs / 60.0)
     }
+}
+
+fn fmt_bytes(b: u64) -> String {
+    if b >= 1024 * 1024 * 1024 {
+        format!("{:.1} GB", b as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else {
+        format!("{:.0} MB", (b as f64 / (1024.0 * 1024.0)).max(1.0))
+    }
+}
+
+fn group_thousands(v: u64) -> String {
+    let s = v.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn fmt_pressure(pa: f64) -> String {

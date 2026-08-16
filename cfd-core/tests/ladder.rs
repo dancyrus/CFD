@@ -162,15 +162,34 @@ fn t3_error(n: usize, limiter: cfd_contract::Limiter) -> f64 {
     l1
 }
 
-/// T3 — order of accuracy on smooth advection. Two thresholds, because a
-/// limited scheme cannot hit 2.0 and "1.6" alone is ambiguous between a
-/// healthy limiter and broken reconstruction.
+/// T3 — order of accuracy on smooth advection, three resolutions (N = 100,
+/// 200, 400) at fixed domain size for BOTH reconstruction paths. Two
+/// thresholds, because a limited scheme cannot hit 2.0 and "1.6" alone is
+/// ambiguous between a healthy limiter and broken reconstruction.
+///
+/// This is also the grid-convergence guard for the configurable-domain work
+/// order: resolution is now a free sidebar input, so the observed order must
+/// stay what the committed pre-change ladder recorded (1.988 unlimited,
+/// 1.776 minmod on intel-xeon-4c) — a change here means the sizing work
+/// touched the numerics, which it must not.
 #[test]
 #[ignore = "ladder: run with --include-ignored"]
 fn t3_order_of_accuracy() {
     let e100 = t3_error(100, cfd_contract::Limiter::None);
     let e200 = t3_error(200, cfd_contract::Limiter::None);
+    let e400 = t3_error(400, cfd_contract::Limiter::None);
+    println!("T3 unlimited pairs: 100/200 -> {:.3}, 200/400 -> {:.3}",
+             (e100 / e200).log2(), (e200 / e400).log2());
     let order_unlimited = (e100 / e200).log2();
+    // The unlimited fine pair degrades (~1.2) as the smooth-advection error
+    // approaches the first-order inlet/outflow contamination and the f32
+    // field's roundoff floor — pre-existing behaviour, recorded (not gated)
+    // so a future change to it is visible.
+    cfd_results::record_note("ladder", "t3-pairs", &format!(
+        "T3 pairwise orders at N = 100/200/400: unlimited {:.3} / {:.3}, \
+         minmod recorded below; the asserted pairs (unlimited 100/200, minmod \
+         200/400) are the stable ones and must not move under sizing work.",
+        (e100 / e200).log2(), (e200 / e400).log2()));
     let e100 = t3_error(100, cfd_contract::Limiter::Minmod);
     let e200 = t3_error(200, cfd_contract::Limiter::Minmod);
     let e400 = t3_error(400, cfd_contract::Limiter::Minmod);

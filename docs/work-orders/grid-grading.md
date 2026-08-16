@@ -47,6 +47,9 @@ reference nozzle exit planes or exit radii anywhere.
 3. PLUME LENGTH CONTROL
 Compact / Standard / Long (~40 exit radii, 4-5 shock cells). Default
 Standard. Show estimated time to steady state per option.
+[SUPERSEDED by docs/work-orders/configurable-domain.md: the tiers are
+replaced by directly configurable domain extent and mesh resolution
+with a live cost readout; the grading rule itself is unchanged.]
 
 4. EXPLICITLY NOT DOING
 No refinement boxes, no quadtree adaptivity, no sparse allocation.

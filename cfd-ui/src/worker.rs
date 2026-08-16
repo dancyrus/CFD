@@ -27,6 +27,11 @@ pub struct UiFrame {
     pub report: Report,
     pub info: StepInfo,
     pub steps_per_sec: f64,
+    /// Measured solver throughput of THIS machine in cells/s, from the short
+    /// calibration run at each solver build. The cost readout's wall-clock
+    /// estimate divides by this — never by a constant from another machine.
+    /// 0.0 until the first calibration completes.
+    pub cells_per_sec: f64,
     /// The worker's own pause state; diverges from the UI's only when the
     /// solver errored and paused itself.
     pub paused: bool,
@@ -71,10 +76,55 @@ pub fn solver_kind() -> cfd_contract::SolverKind {
 }
 
 pub fn build(setup: &SolveSetup) -> cfd_contract::Result<Box<dyn Solver>> {
+    // Allocation guard: refuse a grid whose solver buffers cannot fit in the
+    // memory the machine has to give, with a message instead of an OOM abort.
+    // The UI's blocking confirmation is the first line of defence; this is
+    // the second (the estimate is exactly that — an estimate).
+    let need = setup.grid.glen() as u64 * crate::case::EST_SOLVER_BYTES_PER_CELL;
+    let have = crate::case::memory_budget_bytes();
+    if need > have {
+        return Err(cfd_contract::CfdError::Parameter(format!(
+            "grid of {} x {} cells needs ~{} MB of solver buffers but only \
+             ~{} MB of memory is available — reduce the domain or resolution",
+            setup.grid.nz,
+            setup.grid.nr,
+            need / (1024 * 1024),
+            have / (1024 * 1024)
+        )));
+    }
     Ok(match solver_kind() {
         cfd_contract::SolverKind::Mock => Box::new(MockSolver::new(setup.clone())?),
         cfd_contract::SolverKind::Real => Box::new(EulerSolver::new(setup.clone())?),
     })
+}
+
+/// Short timed run measuring this machine's solver throughput in cells/s,
+/// used by the sidebar cost readout. Runs right after every build, on the
+/// startup transient the solver would be stepping through anyway; capped at
+/// ~300 ms so a rebuild never stalls noticeably. Returns the throughput and
+/// the last step's info (the steps are real and count normally).
+fn calibrate(solver: &mut dyn Solver, info: &mut StepInfo, error: &mut Option<String>) -> f64 {
+    let cells = solver.snapshot().grid.len();
+    let t0 = Instant::now();
+    let mut n = 0u32;
+    while n < 24 && t0.elapsed() < Duration::from_millis(300) {
+        match solver.step() {
+            Ok(i) => {
+                *info = i;
+                n += 1;
+            }
+            Err(e) => {
+                *error = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    let el = t0.elapsed().as_secs_f64();
+    if n == 0 || el <= 0.0 {
+        0.0
+    } else {
+        n as f64 * cells as f64 / el
+    }
 }
 
 pub fn make_frame(solver: &dyn Solver, info: StepInfo) -> UiFrame {
@@ -83,6 +133,7 @@ pub fn make_frame(solver: &dyn Solver, info: StepInfo) -> UiFrame {
         report: solver.report(),
         info,
         steps_per_sec: 0.0,
+        cells_per_sec: 0.0,
         paused: false,
         error: None,
     }
@@ -112,6 +163,10 @@ pub fn spawn(
             let mut rate_t0 = Instant::now();
             let mut rate_steps: u64 = 0;
             let mut steps_per_sec = 0.0f64;
+            // Throughput calibration for the cost readout, re-measured at
+            // every build so it always describes the current grid on this
+            // machine.
+            let mut cells_per_sec = calibrate(solver.as_mut(), &mut info, &mut error);
 
             'main: loop {
                 let mut single_step = false;
@@ -125,6 +180,8 @@ pub fn spawn(
                                     solver = s;
                                     info = FRESH_INFO;
                                     error = None;
+                                    cells_per_sec =
+                                        calibrate(solver.as_mut(), &mut info, &mut error);
                                 }
                                 Err(e) => error = Some(e.to_string()),
                             }
@@ -142,6 +199,8 @@ pub fn spawn(
                                     solver = s;
                                     info = FRESH_INFO;
                                     error = None;
+                                    cells_per_sec =
+                                        calibrate(solver.as_mut(), &mut info, &mut error);
                                 }
                                 Err(e) => error = Some(e.to_string()),
                             },
@@ -223,6 +282,7 @@ pub fn spawn(
                         report: solver.report(),
                         info,
                         steps_per_sec: if paused { 0.0 } else { steps_per_sec },
+                        cells_per_sec,
                         paused,
                         error: error.clone(),
                     });
@@ -279,7 +339,10 @@ mod tests {
     #[test]
     fn worker_honours_every_command() {
         std::env::set_var("CFD_SOLVER", "mock");
-        let params = CaseParams::default();
+        // Preview extents: this test checks command plumbing, and the mock's
+        // per-cell snapshot cost on the Large default would only slow it.
+        let (lz_rt, lr_rt, cells_per_rt, dz_over_dr) = case::DomainPreset::Preview.values();
+        let params = CaseParams { lz_rt, lr_rt, cells_per_rt, dz_over_dr, ..CaseParams::default() };
         let wall = case::conical_contour(params.area_ratio);
         let setup = case::make_setup(&params, &wall);
         let solver_grid = setup.grid.clone();
