@@ -139,6 +139,10 @@ impl ContourKind {
 /// The §10 parametric family shared by both contours: 30° converging cone,
 /// contraction ratio 4, 1.5 r_t upstream arc, 0.382 r_t downstream arc, and
 /// the 15° cone half-angle the demo case and the bell's length reference use.
+/// Default cone half-angle: the §10 demo case's 15°. A per-case FIELD, not a
+/// constant, for the same reason as the four below — the cone's exit-lip handle
+/// carries the area ratio radially and this angle axially, so a const here
+/// meant every cone lip drag was silently reverted the moment it was committed.
 pub const CONE_HALF_ANGLE_DEG: f64 = 15.0;
 /// Defaults of the four §10 family parameters that used to be hard-coded
 /// consts and are now per-case fields — the parametric editor puts a handle on
@@ -175,6 +179,9 @@ pub struct CaseParams {
     pub converge_half_angle_deg: f64,
     pub throat_arc_up: f64,
     pub chamber_len_rt: f64,
+    /// Cone half-angle, for `ContourKind::Conical`. Ignored by the bells, which
+    /// carry their own wall angles.
+    pub cone_half_angle_deg: f64,
     pub altitude_m: f64,
     /// Labelled vacuum mode: back pressure fixed at `VACUUM_P_FRAC * p0`,
     /// ignoring `altitude_m`. The region above the 58 km slider cap.
@@ -210,6 +217,7 @@ impl Default for CaseParams {
             converge_half_angle_deg: CONVERGE_HALF_ANGLE_DEG,
             throat_arc_up: THROAT_ARC_UP,
             chamber_len_rt: CHAMBER_LEN_RT,
+            cone_half_angle_deg: CONE_HALF_ANGLE_DEG,
             altitude_m: 0.0,
             vacuum: false,
             lz_rt: LZ_DEFAULT,
@@ -536,6 +544,7 @@ impl EnginePreset {
             converge_half_angle_deg: CONVERGE_HALF_ANGLE_DEG,
             throat_arc_up: THROAT_ARC_UP,
             chamber_len_rt: CHAMBER_LEN_RT,
+            cone_half_angle_deg: CONE_HALF_ANGLE_DEG,
             altitude_m,
             vacuum,
             lz_rt,
@@ -678,7 +687,7 @@ pub struct GeneratedWall {
 pub fn nozzle_curve(p: &CaseParams) -> cfd_geom::NozzleCurve {
     let contour = match p.contour_kind {
         ContourKind::Conical => cfd_geom::ContourKind::Conical {
-            half_angle_deg: CONE_HALF_ANGLE_DEG,
+            half_angle_deg: p.cone_half_angle_deg,
         },
         ContourKind::ParabolicBell => cfd_geom::ContourKind::ParabolicBell {
             bell_percent: p.bell_percent,
@@ -723,7 +732,16 @@ pub fn apply_curve(p: &mut CaseParams, c: &cfd_geom::NozzleCurve) {
     p.throat_arc_down = c.spec.throat_arc_down;
     p.chamber_len_rt = c.chamber_len_rt;
     match c.spec.contour {
-        cfd_geom::ContourKind::Conical { .. } => p.contour_kind = ContourKind::Conical,
+        // The cone's half-angle is a DEGREE OF FREEDOM — its exit-lip handle
+        // sets the area ratio radially and this angle axially — so it has to
+        // come back out. Dropping it here made every cone lip drag snap back to
+        // 15° on release, and a lip dragged toward the axis committed an area
+        // ratio whose exit sits inside a 15° throat arc, which the generator
+        // then rejects: the wall fell back to the cone with zero handles.
+        cfd_geom::ContourKind::Conical { half_angle_deg } => {
+            p.contour_kind = ContourKind::Conical;
+            p.cone_half_angle_deg = half_angle_deg;
+        }
         cfd_geom::ContourKind::ParabolicBell { bell_percent } => {
             p.contour_kind = ContourKind::ParabolicBell;
             p.bell_percent = bell_percent;
@@ -793,7 +811,7 @@ pub fn nozzle_contour(p: &CaseParams) -> GeneratedWall {
 /// in `cfd_geom::generate_contour`; it survives as (a) the infallible
 /// fallback for a rejected `NozzleSpec`, and (b) the independent reference
 /// the cone-equivalence test compares the new path against.
-fn fallback_cone(area_ratio: f64) -> Vec<[f64; 2]> {
+pub(crate) fn fallback_cone(area_ratio: f64) -> Vec<[f64; 2]> {
     let alpha = 15f64.to_radians();
     let beta = 30f64.to_radians();
     let (r1, r2, r_c) = (1.5, 0.382, 2.0);

@@ -783,7 +783,13 @@ impl CfdApp {
         };
         let contour_desc = match self.wall_kind {
             None => "hand-drawn wall".to_string(),
-            Some(ContourKind::Conical) => "15° cone".to_string(),
+            // The half-angle is a live parameter now (the cone's exit-lip
+            // handle sets it), so it cannot be the hard-coded 15 it used to be
+            // — the label would go on claiming 15° over a wall the user had
+            // dragged to 20.
+            Some(ContourKind::Conical) => {
+                format!("{:.1}° cone", self.params.cone_half_angle_deg)
+            }
             Some(ContourKind::ParabolicBell) => {
                 format!("{:.0}% bell{source}", self.params.bell_percent * 100.0)
             }
@@ -894,6 +900,20 @@ impl CfdApp {
                 ))
                 .small()
                 .color(ACCENT),
+            );
+            return;
+        }
+        if handles.is_empty() {
+            // Only reachable behind the "contour rejected" flag below, which
+            // carries the generator's reason. Saying nothing here would leave
+            // an editor with no grabbable anything and no explanation.
+            ui.label(
+                RichText::new(
+                    "no handles — this contour was rejected; move the area-ratio \
+                     slider or pick an engine to regenerate",
+                )
+                .small()
+                .color(AMBER),
             );
             return;
         }
@@ -1029,11 +1049,15 @@ impl CfdApp {
         ui.add_space(6.0);
 
         // ---- Area ratio (regenerates the parametric contour on release).
-        // The range stretches to hold a selected preset (up to ε = 165);
-        // egui would otherwise clamp the staged value back into 2..16.
+        // The range stretches to hold whatever ε is actually set — up to 165
+        // for a preset, and DOWN below 2 for an exit lip the user dragged
+        // toward the axis. egui clamps the staged value into the slider's
+        // range, so a fixed 2.0 floor would silently walk a dragged ε back up
+        // to 2 and then regenerate a wall the user never asked for.
         let ar_max = self.ui_area_ratio.max(16.0);
+        let ar_min = self.ui_area_ratio.min(2.0);
         let r = ui.add(
-            egui::Slider::new(&mut self.ui_area_ratio, 2.0..=ar_max)
+            egui::Slider::new(&mut self.ui_area_ratio, ar_min..=ar_max)
                 .text("Area ratio ε")
                 .fixed_decimals(1),
         );

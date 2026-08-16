@@ -580,6 +580,10 @@ pub struct Handle { pub id: HandleId, pub kind: HandleKind, pub anchor: [f64; 2]
 /// nozzle vanishes mid-drag.
 pub struct DragOutcome { pub curve: NozzleCurve, pub clamped: Option<String> }
 // Nine handles for a bell (eight pickable + the derived Q), six for a cone.
+// ExitLip carries TWO degrees of freedom: area ratio radially, and axially the
+// bell length fraction or the cone half-angle (bisected — L_n(alpha) has no
+// closed-form inverse). drag_handle refuses to bisect from a curve that is
+// already infeasible, and reports why rather than returning it.
 // A ThetaN or ThetaE drag converts ParabolicBell -> DirectBell: a hand-set wall
 // angle is no longer a (area ratio, bell percent) table lookup.
 

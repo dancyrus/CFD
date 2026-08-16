@@ -274,6 +274,17 @@ impl Canvas {
                         _ => out.wants_point_edit = true,
                     }
                 }
+                if out.wants_point_edit {
+                    // The app answers this by REPLACING the editor — nine
+                    // parametric handles become ~90 freeform points — and
+                    // `drag_point` is a bare index held across frames. A
+                    // secondary click fires while the primary button is still
+                    // down, so without this the next frame would drag freeform
+                    // point 5 because handle 5 was grabbed. Indices do not
+                    // survive an editor swap.
+                    self.drag_point = None;
+                    self.hover_point = None;
+                }
             }
         } else {
             self.drag_point = None;

@@ -399,7 +399,7 @@ Consequences that are now rules:
 
 ### Editing the parametric wall
 
-Nine handles for a bell, six for a cone — chamber radius, chamber end, converging half-angle β, throat arc R1, throat arc R2, θ_n, θ_e, exit lip, and the derived control point Q.
+Nine handles for a bell, six for a cone — chamber radius, chamber end, converging half-angle β, throat arc R1, throat arc R2, θ_n, θ_e, exit lip, and the derived control point Q. **The exit lip carries two degrees of freedom**: the area ratio radially, and axially the bell length fraction — or, on a cone, the half-angle α (there is no closed-form inverse of `L_n(α)`, so it is bisected). Every one of these is a per-case parameter, including α: as a constant it made every cone lip drag revert the instant it was committed.
 
 **Q is not draggable, and that is a physics decision, not a UI one.** Q is the intersection of the two tangent lines: once θ_n, θ_e, N and E are fixed it has zero remaining degrees of freedom. Moving it would break the G1 tangency at N, and θ_n is a wall angle only because of that tangency — a wall that leaves the throat arc at some other angle is not a bell with that θ_n, it is a wall with a kink. It is drawn as a hollow diamond on a dashed N–Q–E control polygon, so the construction is visible and untouchable.
 

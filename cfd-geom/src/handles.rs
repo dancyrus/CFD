@@ -239,10 +239,26 @@ impl NozzleCurve {
     /// until it physically cannot, and then stops, which is what every CAD
     /// package does and what a constraint is supposed to feel like.
     pub fn drag_handle(&self, id: HandleId, world: [f64; 2]) -> DragOutcome {
-        let Some(want) = self.param_from_world(id, world) else {
+        // The bisection below assumes `self` is a feasible starting point — it
+        // only ever returns a midpoint that passed `feasible()`, or `self`. If
+        // `self` is already infeasible it would hand back an infeasible curve
+        // while reporting a successful clamp. Say so instead: there is nothing
+        // to drag from, and the caller's escape is to regenerate.
+        if let Err(why) = self.feasible() {
             return DragOutcome {
                 curve: *self,
-                clamped: None,
+                clamped: Some(format!("this wall is not a valid contour: {why}")),
+            };
+        }
+        let Some(want) = self.param_from_world(id, world) else {
+            // A handle whose parameter cannot be read off this contour —
+            // theta_n on a cone, or anything at all on the derived control
+            // point. Silence here reads as a broken handle, so name it.
+            return DragOutcome {
+                curve: *self,
+                clamped: (id != HandleId::ControlPoint).then(|| {
+                    format!("{} does not apply to this contour", id.label())
+                }),
             };
         };
         let have = self.handle_param(id);
@@ -768,6 +784,44 @@ mod tests {
         assert!(out.curve.feasible().is_ok());
         // …and it stopped SHORT of the request, not at it.
         assert!(out.curve.divergent_len_rt().unwrap() < c.divergent_len_rt().unwrap());
+    }
+
+    /// A drag from a wall that is ALREADY not a valid contour must not hand
+    /// back an infeasible curve while claiming it clamped successfully — the
+    /// bisection can only return a point it verified or `self`, and `self` is
+    /// the bad one. Reachable: commit a steep measured bell, then move the
+    /// area-ratio slider until that bell no longer closes.
+    #[test]
+    fn dragging_from_an_infeasible_wall_reports_it_instead_of_returning_it() {
+        // A bell percent below the digitised Rao table: rejected by
+        // NozzleSpec::validate, which pieces() runs first, so the whole curve
+        // is infeasible.
+        let bad = NozzleCurve::new(spec(
+            16.0,
+            0.05,
+            0.382,
+            ContourKind::ParabolicBell { bell_percent: 0.4 },
+        ));
+        assert!(bad.feasible().is_err(), "this fixture is supposed to be infeasible");
+        for id in [
+            HandleId::ChamberRadius,
+            HandleId::ThetaN,
+            HandleId::ThetaE,
+            HandleId::ExitLip,
+            HandleId::ThroatArcDown,
+        ] {
+            let out = bad.drag_handle(id, [3.0, 1.4]);
+            assert!(
+                out.clamped.is_some(),
+                "{id:?}: an impossible drag must say why, not fail silently"
+            );
+            // And it must not pretend the result is usable.
+            assert!(out.curve.feasible().is_err() == bad.feasible().is_err());
+        }
+        // The derived control point stays silent, because refusing to move is
+        // its whole documented behaviour rather than a failure.
+        let good = walls()[1].1;
+        assert_eq!(good.drag_handle(HandleId::ControlPoint, [3.0, 1.4]).clamped, None);
     }
 
     /// The cone's exit lip carries the half-angle in z and the area ratio in r,

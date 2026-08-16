@@ -95,12 +95,23 @@ impl ParametricEditor {
     /// keep the two in step.
     fn rebuild(&mut self) {
         let inv = 1.0 / self.rt;
-        if let Ok(p) = self.curve.tessellate(&self.tess) {
-            self.points = p
-                .points
-                .iter()
-                .map(|q| [q[0] * inv, q[1] * inv])
-                .collect();
+        match self.curve.tessellate(&self.tess) {
+            Ok(p) => {
+                self.points = p
+                    .points
+                    .iter()
+                    .map(|q| [q[0] * inv, q[1] * inv])
+                    .collect()
+            }
+            // The editor must show the wall the SOLVER got, or the ghost
+            // preview is a lie and the "did the wall change?" commit test
+            // compares two different things. `nozzle_contour` answers a
+            // rejected spec with the fallback cone, so this does too. No
+            // reachable slider setting produces one today
+            // (`the_editor_always_shows_the_wall_the_solver_got` sweeps the
+            // range to prove it), which is exactly why it needs to be
+            // structural rather than left to the caller to notice.
+            Err(_) => self.points = crate::case::fallback_cone(self.curve.spec.area_ratio),
         }
         self.handles = self
             .curve
@@ -224,9 +235,28 @@ mod tests {
     #[test]
     fn no_reachable_handle_position_falls_back_to_the_cone() {
         let mut swept = 0;
-        for pre in PRESETS.iter() {
-            let base = pre.case(0.0, false);
+        // THE DEMO CONE IS IN THIS LIST, and it is the case that matters most:
+        // it is what the app starts on. An earlier version of this test looped
+        // PRESETS only — all six of which are bells — and asserted
+        // `w.kind.is_bell()`, which is both why it never exercised the six-handle
+        // cone commit path and why it could not have been extended to. It missed
+        // that the cone's half-angle had no home in CaseParams, so every cone
+        // exit-lip drag was reverted on release and some committed a spec the
+        // generator then rejected. Assert the kind is PRESERVED, not that it is
+        // a bell.
+        let cases: Vec<CaseParams> = PRESETS
+            .iter()
+            .map(|q| q.case(0.0, false))
+            .chain([CaseParams::default()])
+            .collect();
+        for base in cases {
+            let name = format!("{:?} eps {:.1}", base.contour_kind, base.area_ratio);
             let n = ParametricEditor::new(&base).handles().len();
+            assert_eq!(
+                n,
+                if base.contour_kind.is_bell() { 9 } else { 6 },
+                "{name}: handle count"
+            );
             for i in 0..n {
                 if !ParametricEditor::new(&base).handles()[i].pickable {
                     continue;
@@ -240,12 +270,36 @@ mod tests {
                         e.drag(i, [a[0] + d * ang.cos(), (a[1] + d * ang.sin()).max(0.0)]);
                         let mut p = base;
                         crate::case::apply_curve(&mut p, e.curve());
+                        // …and a second round trip is a fixed point.
+                        let mut p2 = p;
+                        crate::case::apply_curve(&mut p2, &crate::case::nozzle_curve(&p));
+                        assert_eq!(p2, p, "apply_curve is not idempotent");
                         let w = crate::case::nozzle_contour(&p);
-                        let at = format!("{} handle {i} dir {k} step {step}", pre.name);
+                        let at = format!("{name} handle {i} dir {k} step {step}");
                         assert_eq!(w.fallback, None, "{at}: fell back to the cone");
-                        assert!(w.kind.is_bell(), "{at}: stopped being a bell ({:?})", w.kind);
-                        assert!(w.points.len() > 20, "{at}: {} points", w.points.len());
-                        // The committed polyline is what the editor showed.
+                        // A drag may take a table bell to a measured bell, but
+                        // it may never change the FAMILY: a bell stays a bell,
+                        // a cone stays a cone.
+                        assert_eq!(
+                            w.kind.is_bell(),
+                            base.contour_kind.is_bell(),
+                            "{at}: contour family changed ({:?} -> {:?})",
+                            base.contour_kind,
+                            w.kind
+                        );
+                        // The polyline stays strictly denser than the handle
+                        // set — the property this whole change is about. (Not
+                        // a magic point count: a steep converging angle
+                        // legitimately shortens the wall to 19 points.)
+                        assert!(
+                            w.points.len() > n,
+                            "{at}: {} points for {n} handles",
+                            w.points.len()
+                        );
+                        // THE ROUND TRIP IS LOSSLESS. The editor showed one
+                        // wall; committing it through apply_curve and back out
+                        // through nozzle_contour must give the same wall, or
+                        // the shape jumps the instant the user lets go.
                         assert_eq!(w.points, e.polyline(), "{at}: commit changed the wall");
                         swept += 1;
                     }
@@ -346,6 +400,54 @@ mod tests {
         assert_eq!(
             rao_clamp_warning(Some(ContourKind::ParabolicBell), 2.0),
             Some((4.0, "starts at"))
+        );
+    }
+
+    /// The editor's polyline must always BE `nozzle_contour`'s, including on
+    /// the fallback path. The app compares `editor.polyline()` against
+    /// `committed_wall` to decide whether a drag changed anything and whether
+    /// to draw the ghost preview; if the two are produced by different code
+    /// with different failure behaviour, both of those go wrong silently.
+    ///
+    /// Swept over the whole reachable area-ratio slider range for every preset
+    /// and the demo case (no rejection is reachable there — that is the point
+    /// of sweeping rather than assuming), plus a spec that IS rejected.
+    #[test]
+    fn the_editor_always_shows_the_wall_the_solver_got() {
+        let mut checked = 0;
+        for base in PRESETS.iter().map(|q| q.case(0.0, false)).chain([CaseParams::default()]) {
+            for k in 0..=200 {
+                let mut p = base;
+                p.area_ratio = 2.0 + (200.0 - 2.0) * k as f64 / 200.0;
+                let w = crate::case::nozzle_contour(&p);
+                let e = ParametricEditor::new(&p);
+                assert_eq!(
+                    e.polyline(),
+                    w.points,
+                    "eps {:.2} {:?}: editor and solver disagree",
+                    p.area_ratio,
+                    p.contour_kind
+                );
+                assert_eq!(w.fallback, None, "eps {:.2}: unexpectedly rejected", p.area_ratio);
+                assert!(!e.handles().is_empty());
+                checked += 1;
+            }
+        }
+        assert!(checked > 1000);
+        // And the deliberately-rejected spec: a bell percent below the
+        // digitised table. Both must land on the fallback cone.
+        let p = CaseParams {
+            contour_kind: ContourKind::ParabolicBell,
+            bell_percent: 0.5,
+            ..CaseParams::default()
+        };
+        let w = crate::case::nozzle_contour(&p);
+        assert!(w.fallback.is_some(), "this spec is supposed to be rejected");
+        let e = ParametricEditor::new(&p);
+        assert_eq!(e.polyline(), w.points, "the editor must fall back too");
+        assert!(
+            e.handles().is_empty(),
+            "a rejected curve has no degrees of freedom to offer"
         );
     }
 
