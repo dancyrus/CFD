@@ -689,12 +689,15 @@ impl Piece {
             Piece::ThroatArc {
                 z_t, radius, sign, ..
             } => {
-                // The wall angle IS the parameter: tan(phi) is the slope, and
-                // phi carries the sign of (z - z_t) on the downstream arc.
+                // The wall angle IS the parameter. Differentiating
+                //   z = z_t + sign*R*sin(phi),  r = 1 + R*(1 - cos phi)
+                // gives dr/dz = (R sin phi)/(sign*R cos phi) = sign*tan(phi).
+                // So the sign of the slope is the sign of the arc: the
+                // upstream arc (sign = -1) descends toward the throat, the
+                // downstream arc (sign = +1) climbs away from it.
                 let s = (sign * (z - z_t) / radius).clamp(-1.0, 1.0);
                 let phi = s.asin();
-                // Upstream the wall descends (dr/dz < 0), downstream it climbs.
-                [1.0, -sign * phi.tan()]
+                [1.0, sign * phi.tan()]
             }
             Piece::Bezier { n, q, e } => {
                 let t = bezier_t_at_z(n[0], q[0], e[0], z).unwrap_or(0.0);
@@ -1107,6 +1110,70 @@ mod tests {
                 assert!(w[1][0] > w[0][0], "{name}: z not strictly increasing at the cap");
             }
         }
+    }
+
+    /// The analytic tangent must agree with the derivative of the analytic
+    /// radius, on EVERY piece. The two are independent code paths — one
+    /// differentiates the parameterization, the other inverts it — and the
+    /// throat arcs are where they can disagree in sign without anything else
+    /// noticing, because the app reads its wall angles off the divergent
+    /// section and nothing there touches the converging arc.
+    #[test]
+    fn the_tangent_is_the_derivative_of_the_radius() {
+        for (name, c) in curves() {
+            let rt = c.spec.throat_radius_m;
+            let z1 = c.length_m().unwrap();
+            let h = 1e-7 * z1;
+            let mut worst = 0.0f64;
+            for k in 1..2000 {
+                let z = z1 * k as f64 / 2000.0;
+                let (Some(a), Some(b)) = (c.radius_at(z - h), c.radius_at(z + h)) else {
+                    continue;
+                };
+                let fd = (b - a) / (2.0 * h);
+                let t = c.tangent_at(z).unwrap();
+                let an = t[1] / t[0];
+                // Skip the piece joins, where a central difference straddles a
+                // curvature discontinuity and measures the average of two
+                // different slopes.
+                if (fd - an).abs() > 0.05 && is_near_a_join(&c, z / rt) {
+                    continue;
+                }
+                worst = worst.max((fd - an).abs());
+            }
+            println!("{name}: worst |dr/dz analytic - finite difference| = {worst:.2e}");
+            assert!(worst < 1e-4, "{name}: tangent disagrees with radius by {worst:.3e}");
+            // The converging wall descends and the diverging wall climbs — the
+            // sign error this test exists to catch.
+            let z_t = c.throat_z_rt() * rt;
+            assert!(
+                c.tangent_at(0.5 * z_t).unwrap()[1] <= 0.0,
+                "{name}: the converging wall must not climb"
+            );
+            assert!(
+                c.tangent_at(0.5 * (z_t + z1)).unwrap()[1] > 0.0,
+                "{name}: the diverging wall must climb"
+            );
+            // …and just inside each throat arc, specifically.
+            let r1 = c.spec.throat_arc_up;
+            assert!(
+                c.tangent_at(z_t - 0.3 * r1 * rt).unwrap()[1] < 0.0,
+                "{name}: the upstream throat arc must descend"
+            );
+            let r2 = c.spec.throat_arc_down;
+            assert!(
+                c.tangent_at(z_t + 0.3 * r2 * rt).unwrap()[1] > 0.0,
+                "{name}: the downstream throat arc must climb"
+            );
+        }
+    }
+
+    /// Within a hair of a piece boundary, in r_t.
+    fn is_near_a_join(c: &NozzleCurve, z_rt: f64) -> bool {
+        c.pieces()
+            .unwrap()
+            .iter()
+            .any(|p| (p.end()[0] - z_rt).abs() < 1e-3 || (p.start()[0] - z_rt).abs() < 1e-3)
     }
 
     /// `radius_at` outside the curve is `None`, and the Bézier inversion is
