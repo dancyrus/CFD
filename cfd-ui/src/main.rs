@@ -17,8 +17,8 @@ use cfd_contract::{Solver, SolverKind, StepInfo};
 
 fn main() -> eframe::Result {
     let params = case::CaseParams::default();
-    let wall = case::conical_contour(params.area_ratio);
-    let setup = case::make_setup(&params, &wall);
+    let wall = case::nozzle_contour(&params);
+    let setup = case::make_setup(&params, &wall.points);
 
     // EulerSolver by default; CFD_SOLVER=mock flips back to the analytic
     // preview without a rebuild (abort-ladder rung 0).
@@ -58,7 +58,7 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             worker::spawn(setup, solver, info, cc.egui_ctx.clone(), rx, buf_in);
             Ok(Box::new(ExitGuard {
-                app: app::CfdApp::new(buf_out, tx, initial, params, wall, mock),
+                app: app::CfdApp::new(buf_out, tx, initial, params, wall, mock, cc.storage),
                 tx: tx_exit,
             }))
         }),
@@ -74,6 +74,12 @@ struct ExitGuard {
 impl eframe::App for ExitGuard {
     fn update(&mut self, ctx: &eframe::egui::Context, frame: &mut eframe::Frame) {
         self.app.update(ctx, frame);
+    }
+
+    /// eframe saves through the outermost `App`, which is this wrapper, so the
+    /// delegation is what actually persists the colormap choice.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.app.save(storage);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

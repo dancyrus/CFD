@@ -220,4 +220,94 @@ mod tests {
         let g = grade_from_solid(&empty, &spec).unwrap();
         assert!((g.lz() - 40.0).abs() < 1e-9);
     }
+
+    /// The same rule on a real rasterized BELL, not a synthetic block or the
+    /// legacy cone: the bell is the wall every engine preset actually
+    /// produces, it is shorter than the cone, and its lip sits at a different
+    /// station — which is precisely what the held span is read from. Both bell
+    /// paths (Rao table and measured angles) are exercised.
+    #[test]
+    fn grade_from_solid_holds_base_across_a_rasterized_bell() {
+        use crate::{generate_contour, rasterize, ContourKind, NozzleSpec};
+        use cfd_contract::{GasModel, RefScales};
+
+        let gas = GasModel { gamma: 1.2, r_specific_si: 616.0 };
+        let refs = RefScales::from_chamber(0.138, 2.06e7, 3600.0, &gas);
+        let bells = [
+            (
+                "80% table bell, eps 25",
+                25.0,
+                0.382,
+                ContourKind::ParabolicBell { bell_percent: 0.8 },
+            ),
+            (
+                "measured bell, eps 34.3 (theta_n 32 / theta_e 6)",
+                34.3,
+                0.300,
+                ContourKind::DirectBell {
+                    theta_n_deg: 32.0,
+                    theta_e_deg: 6.0,
+                    length_fraction: 0.76,
+                },
+            ),
+        ];
+        for (name, area_ratio, arc, contour) in bells {
+            let spec_n = NozzleSpec {
+                throat_radius_m: 0.138,
+                area_ratio,
+                contraction_ratio: 4.0,
+                converge_half_angle_deg: 30.0,
+                throat_arc_up: 1.5,
+                throat_arc_down: arc,
+                contour,
+            };
+            let profile = generate_contour(&spec_n, 512).unwrap();
+            // Base grid big enough to hold the whole bell, then grade out.
+            let (dz, dr) = (0.145, 0.05);
+            let base = Grid::uniform(260, 260, dz as f32, dr as f32);
+            let solid = rasterize(&profile, &base, &refs).unwrap();
+            // Non-emptiness alone would also pass for a solid plug, which is
+            // what a mis-wound polygon produces — and a plug satisfies every
+            // hold/extent assert below. Check the bore is open at the throat.
+            assert!(solid.fraction.iter().any(|&f| f > 0.0), "{name}: nothing rasterized");
+            let throat_z = profile.points[profile.throat_index][0] / refs.l_m;
+            let iz = (0..base.nz)
+                .min_by(|&a, &b| {
+                    let (da, db) = (
+                        (base.z_center(a) as f64 - throat_z).abs(),
+                        (base.z_center(b) as f64 - throat_z).abs(),
+                    );
+                    da.partial_cmp(&db).unwrap()
+                })
+                .unwrap();
+            let open = (0..base.nr)
+                .find(|&ir| solid.is_solid(base.idx(iz, ir)))
+                .expect("throat column is solid to the top");
+            assert!(
+                (base.r_face(open) as f64 - 1.0).abs() <= 2.0 * dr,
+                "{name}: throat open radius {}",
+                base.r_face(open)
+            );
+            let spec = GradeSpec::new(dz, dr, 60.0, 26.0);
+            let g = grade_from_solid(&solid, &spec).unwrap();
+            assert!((g.lz() - 60.0).abs() < 1e-9 && (g.lr() - 26.0).abs() < 1e-9, "{name}");
+            // Base resolution held across the bell itself (its z-extent and
+            // its exit radius, both in r_t = non-dimensional units).
+            let z_end = profile.points.last().unwrap()[0] / refs.l_m;
+            let r_end = area_ratio.sqrt();
+            for iz in 0..g.nz {
+                if g.z_edges()[iz + 1] <= z_end {
+                    assert!((g.dz(iz) as f64 - dz).abs() < 1e-6, "{name}: dz({iz}) {}", g.dz(iz));
+                }
+            }
+            for ir in 0..g.nr {
+                if g.r_edges()[ir + 1] <= r_end {
+                    assert!((g.dr(ir) as f64 - dr).abs() < 1e-6, "{name}: dr({ir}) {}", g.dr(ir));
+                }
+            }
+            // The graded tail saves cells against the uniform equivalent.
+            let uniform = (60.0 / dz).round() as usize * (26.0 / dr).round() as usize;
+            assert!(g.len() < uniform, "{name}: graded {} vs uniform {uniform}", g.len());
+        }
+    }
 }

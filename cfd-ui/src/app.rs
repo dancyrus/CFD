@@ -11,14 +11,38 @@ use eframe::egui::{
 
 use cfd_contract::{FieldKind, SolverCommand};
 
-use crate::canvas::{colorbar, fmt_value, Canvas, BG};
+use crate::canvas::{colorbar, fmt_value, range_drag, Canvas, RangeEdit, RangeInvalid, BG};
 use crate::case::{
-    self, ambient_nd, atmosphere, conical_contour, ideal_cf, make_setup, rasterize_wall,
-    separation_altitude_m, separation_threshold, CaseParams, DomainPreset, ALT_MAX_M, PRESETS,
-    R_UNIVERSAL_SI, VACUUM_P_FRAC,
+    self, ambient_nd, atmosphere, ideal_cf, make_setup, nozzle_contour, rasterize_wall,
+    separation_altitude_m, separation_threshold, CaseParams, ContourKind, DomainPreset, ALT_MAX_M,
+    PRESETS, R_UNIVERSAL_SI, VACUUM_P_FRAC,
 };
+use crate::colormap::{Preset, PresetKind};
 use crate::editor::{EditorBackend, StubEditor};
 use crate::worker::{UiCommand, UiFrame};
+
+/// Per-field state attached to `CfdApp::locked`.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+struct RangeState {
+    /// The range was typed or dragged rather than set by `lock_range`. Manual
+    /// ranges survive a re-lock; auto ones are overwritten by it.
+    manual: bool,
+    /// A manual range survived a re-lock, so the scales it was chosen against
+    /// may no longer exist. Cleared by Refit or by any further edit.
+    stale: bool,
+    /// Guardrails suspended for this field: the Schlieren pin and the signed
+    /// symmetry stop being enforced, and the caveat is shown instead.
+    free: bool,
+    /// Ends whose last edit was rejected.
+    invalid: RangeInvalid,
+}
+
+/// Storage key for the per-field colormap choice.
+///
+/// The preset choice persists; the display range deliberately does not. A range
+/// is tied to the case that produced it — restoring one against a different p₀
+/// would paint a solid block on launch, which is the failure §2 warns about.
+const CMAP_KEY: &str = "cfd.cmap.presets";
 
 const TURBO_STEPS: [u32; 3] = [1, 4, 16];
 /// Step of a rebuilt solver at which the deferred colorbar re-lock fires.
@@ -83,12 +107,25 @@ pub struct CfdApp {
     /// Locked per-field display ranges; refit is the only thing that moves
     /// them. An auto-rescaling colorbar makes two frames incomparable.
     locked: [(f32, f32); 8],
+    /// Per-field colormap choice. Decoupled from `FieldKind` — the style guide
+    /// §2 table is the default, not a fixed assignment.
+    cmap: [Preset; 8],
+    /// Per-field bookkeeping for `locked`, parallel to it by field index.
+    range_state: [RangeState; 8],
     smooth: bool,
 
     canvas: Canvas,
     editor: StubEditor,
     editor_on: bool,
     committed_wall: Vec<[f64; 2]>,
+    /// The contour kind the generator ACTUALLY produced for `committed_wall`,
+    /// and the rejection message when it fell back to the cone. Never the
+    /// requested kind: `params.contour_kind` is a request, and reading the
+    /// status line off it printed "80% bell" over a fallback cone. `None` is
+    /// a wall no generator produced — a hand-dragged one — which has no
+    /// contour family and no wall angles to name.
+    wall_kind: Option<ContourKind>,
+    wall_fallback: Option<String>,
     /// True once the user has edited the wall by hand — flips the whole
     /// report into "sandbox — qualitative only".
     geometry_custom: bool,
@@ -124,14 +161,18 @@ impl CfdApp {
         tx: Sender<UiCommand>,
         initial: UiFrame,
         params: CaseParams,
-        wall: Vec<[f64; 2]>,
+        wall: case::GeneratedWall,
         watermark: bool,
+        storage: Option<&dyn eframe::Storage>,
     ) -> Self {
         let mut locked = [(0.0f32, 1.0f32); 8];
+        let mut cmap = [Preset::Viridis; 8];
         for k in FieldKind::ALL {
             locked[k as usize] = lock_range(k, initial.snapshot.range(k));
+            cmap[k as usize] = Preset::default_for(k);
         }
-        let mut editor = StubEditor::new(wall.clone());
+        cmap = restore_presets(storage.and_then(|s| eframe::get_value(s, CMAP_KEY)), cmap);
+        let mut editor = StubEditor::new(wall.points.clone());
         editor.set_domain(params.lz_rt, params.lr_rt);
         CfdApp {
             out,
@@ -154,11 +195,15 @@ impl CfdApp {
             paused: false,
             turbo_idx: 0,
             locked,
+            cmap,
+            range_state: [RangeState::default(); 8],
             smooth: false,
             canvas: Canvas::new(),
             editor,
             editor_on: false,
-            committed_wall: wall,
+            committed_wall: wall.points,
+            wall_kind: Some(wall.kind),
+            wall_fallback: wall.fallback,
             geometry_custom: false,
             space_panned: false,
             hover_text: String::new(),
@@ -183,6 +228,12 @@ impl CfdApp {
         self.committed_wall = self.editor.points().to_vec();
         self.geometry_custom = true;
         self.preset = None; // hand-drawn walls are no named engine
+        // …and no contour family either. This is the fourth writer of
+        // `committed_wall`; leaving the generator's provenance behind here
+        // would put "measured bell · θ_n 32.0°" over a wall the user dragged
+        // by hand, which is the same lie as naming a bell over a fallback cone.
+        self.wall_kind = None;
+        self.wall_fallback = None;
         // Mid-run edits rasterize onto the solver's CURRENT (graded) grid —
         // that is the cheap-to-overwrite-mask property the sandbox rests on.
         // The grading itself is only recomputed on a rebuild (preset, p0 or
@@ -198,9 +249,11 @@ impl CfdApp {
             self.preset = None; // partial change: no longer the named engine
         }
         self.params.area_ratio = self.ui_area_ratio;
-        let wall = conical_contour(self.params.area_ratio);
-        self.editor.set_points(wall.clone());
-        self.committed_wall = wall;
+        let wall = nozzle_contour(&self.params);
+        self.editor.set_points(wall.points.clone());
+        self.committed_wall = wall.points;
+        self.wall_kind = Some(wall.kind);
+        self.wall_fallback = wall.fallback;
         self.geometry_custom = false;
         let solid = rasterize_wall(&self.committed_wall, &self.latest.snapshot.grid);
         self.cmd(SolverCommand::SetGeometry(Arc::new(solid)));
@@ -236,10 +289,12 @@ impl CfdApp {
         self.ui_area_ratio = self.params.area_ratio;
         self.ui_p0_mpa = self.params.p0_pa / 1e6;
         self.sync_domain_fields();
-        let wall = conical_contour(self.params.area_ratio);
+        let wall = nozzle_contour(&self.params);
         self.editor.set_domain(self.params.lz_rt, self.params.lr_rt);
-        self.editor.set_points(wall.clone());
-        self.committed_wall = wall;
+        self.editor.set_points(wall.points.clone());
+        self.committed_wall = wall.points;
+        self.wall_kind = Some(wall.kind);
+        self.wall_fallback = wall.fallback;
         self.geometry_custom = false;
         let setup = make_setup(&self.params, &self.committed_wall);
         let _ = self.tx.send(UiCommand::Rebuild(Box::new(setup)));
@@ -487,6 +542,14 @@ impl CfdApp {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
+        // A field being typed into owns the keyboard. Every shortcut below is
+        // also a character you type into a number: 1-8 pick the display field,
+        // "." single-steps, E is the e in 1e-5. Without this gate, typing 3
+        // into the resolution field switched the display to Pressure, and the
+        // "." in 1.5 paused the solver and stepped it once.
+        if keyboard_is_captured(ctx) {
+            return;
+        }
         let (pressed, space_released) = ctx.input(|i| {
             let mut v: Vec<Key> = Vec::new();
             for k in [Key::Period, Key::R, Key::F, Key::T, Key::E, Key::L] {
@@ -584,6 +647,66 @@ impl CfdApp {
         });
     }
 
+    /// The single writer for `locked`, shared by every range editor — the
+    /// in-place colorbar labels and the explicit min/max row. Two views, one
+    /// value: they cannot drift because neither of them owns it.
+    ///
+    /// A rejected edit reverts and highlights rather than clamping. Silently
+    /// clamping would misreport what the player asked for, and on a signed
+    /// field it is not even well defined — the symmetry rule would undo the
+    /// clamp on the next edit anyway.
+    fn apply_range_edit(&mut self, field: FieldKind, edit: RangeEdit) {
+        let i = field as usize;
+        let (min_end, v) = match edit {
+            RangeEdit::None => return,
+            RangeEdit::Min(v) => (true, v),
+            RangeEdit::Max(v) => (false, v),
+        };
+        let free = self.range_state[i].free;
+        match edited_range(field, free, self.locked[i], min_end, v) {
+            Some(r) => {
+                self.locked[i] = r;
+                self.range_state[i].manual = true;
+                self.range_state[i].stale = false;
+                self.range_state[i].invalid = RangeInvalid::default();
+            }
+            None => self.range_state[i].invalid.set(min_end, true),
+        }
+    }
+
+    /// Refit hands the range back to `lock_range`, which also clears `manual` —
+    /// so a later re-lock is free to overwrite it again.
+    fn refit_range(&mut self, field: FieldKind) {
+        let i = field as usize;
+        let r = self.latest.snapshot.range(field);
+        self.locked[i] = if self.range_state[i].free {
+            // Guardrails suspended: fit the data as it actually is.
+            if r.1 > r.0 {
+                r
+            } else {
+                (r.0, r.0 + 1.0)
+            }
+        } else {
+            lock_range(field, r)
+        };
+        self.range_state[i] = RangeState {
+            free: self.range_state[i].free,
+            ..RangeState::default()
+        };
+    }
+
+    /// Turning guardrails back on re-imposes them immediately. Leaving an
+    /// asymmetric range in place under a rule that claims symmetry would make
+    /// the toggle a lie about what is being displayed.
+    fn set_free_range(&mut self, field: FieldKind, free: bool) {
+        let i = field as usize;
+        self.range_state[i].free = free;
+        self.range_state[i].invalid = RangeInvalid::default();
+        if !free {
+            self.locked[i] = lock_range(field, self.locked[i]);
+        }
+    }
+
     fn display_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("Display");
         ui.horizontal_wrapped(|ui| {
@@ -597,10 +720,20 @@ impl CfdApp {
             }
         });
         ui.add_space(4.0);
+
+        let field = self.field;
+        let i = field as usize;
+        let mut edit = RangeEdit::None;
         ui.horizontal(|ui| {
-            colorbar(ui, self.field, self.locked[self.field as usize], 120.0);
+            edit = colorbar(
+                ui,
+                self.cmap[i],
+                self.locked[i],
+                120.0,
+                self.range_state[i].invalid,
+            );
             ui.vertical(|ui| {
-                ui.label(RichText::new(self.field.label()).strong());
+                ui.label(RichText::new(field.label()).strong());
                 ui.label(RichText::new("range locked").weak().small());
                 if ui
                     .button("Refit range")
@@ -611,13 +744,96 @@ impl CfdApp {
                     )
                     .clicked()
                 {
-                    self.locked[self.field as usize] =
-                        lock_range(self.field, self.latest.snapshot.range(self.field));
+                    self.refit_range(field);
+                }
+                if self.range_state[i].stale {
+                    ui.label(
+                        RichText::new("scales changed — range may be stale")
+                            .weak()
+                            .small()
+                            .color(AMBER),
+                    )
+                    .on_hover_text(
+                        "This range was typed, so the re-lock after the rebuild \
+                         left it alone. A p₀ change can move the reference \
+                         scales by 35×, which renders a stale range as a solid \
+                         block of one colour. Refit to clear.",
+                    );
                 }
                 ui.checkbox(&mut self.smooth, "Smooth (L)")
                     .on_hover_text("LINEAR filtering; default NEAREST shows cells");
             });
         });
+        self.apply_range_edit(field, edit);
+
+        // ---- colormap picker. Every preset is offered for every field: the
+        // guidance is carried by the warning below, not by filtering the list.
+        ui.horizontal(|ui| {
+            ui.label("Colormap");
+            egui::ComboBox::from_id_salt("cmap_pick")
+                .selected_text(self.cmap[i].name())
+                .show_ui(ui, |ui| {
+                    for p in Preset::ALL {
+                        ui.selectable_value(&mut self.cmap[i], p, p.name());
+                    }
+                });
+        });
+        if self.cmap[i].kind() == PresetKind::Diverging && !field.is_signed() {
+            ui.label(
+                RichText::new(
+                    "diverging map on an unsigned field — the light band lands \
+                     at an arbitrary value and reads as a feature that is not there",
+                )
+                .weak()
+                .small(),
+            )
+            .on_hover_text(
+                "Legitimate if you mean it: a diverging map centred on Mach 1.0 \
+                 is a real transonic view. It is only misleading when the centre \
+                 is wherever the range happens to put it.",
+            );
+        }
+
+        // ---- explicit range row, the second view of `locked`.
+        let mut row_edit = RangeEdit::None;
+        ui.horizontal(|ui| {
+            let (lo, hi) = self.locked[i];
+            let span = hi - lo;
+            let invalid = self.range_state[i].invalid;
+            ui.label("min");
+            if let Some(v) = range_drag(ui, lo, span, invalid.min, None) {
+                row_edit = RangeEdit::Min(v);
+            }
+            ui.label("max");
+            if let Some(v) = range_drag(ui, hi, span, invalid.max, None) {
+                row_edit = RangeEdit::Max(v);
+            }
+        });
+        self.apply_range_edit(field, row_edit);
+
+        // Only Schlieren and the signed velocities carry a guardrail; on any
+        // other field the toggle would be a control that does nothing.
+        if field == FieldKind::Schlieren || field.is_signed() {
+            let mut free = self.range_state[i].free;
+            if ui
+                .checkbox(&mut free, "Free range")
+                .on_hover_text(
+                    "Suspend the style guide's range rule for this field \
+                     (docs/colormap-style-guide.md §8).",
+                )
+                .changed()
+            {
+                self.set_free_range(field, free);
+            }
+            if self.range_state[i].free {
+                let caveat = if field.is_signed() {
+                    "asymmetric — zero is off the colormap's light point"
+                } else {
+                    "unpinned — Schlieren is renormalised to [0, 1] every frame"
+                };
+                ui.label(RichText::new(caveat).weak().small().color(AMBER));
+            }
+        }
     }
 
     fn engine_section(&mut self, ui: &mut egui::Ui) {
@@ -656,15 +872,79 @@ impl CfdApp {
             Some(i) => format!("{} · {}", PRESETS[i].name, PRESETS[i].propellant),
             None => "custom gas".to_string(),
         };
+        // What was PRODUCED, not what was asked for: on a rejected spec the
+        // wall is the fallback cone and `wall_kind` says so.
+        let source = match self.preset {
+            Some(i) => format!(" — {}", PRESETS[i].bell_source),
+            None => String::new(),
+        };
+        let contour_desc = match self.wall_kind {
+            None => "hand-drawn wall".to_string(),
+            Some(ContourKind::Conical) => "15° cone".to_string(),
+            Some(ContourKind::ParabolicBell) => {
+                format!("{:.0}% bell{source}", self.params.bell_percent * 100.0)
+            }
+            Some(ContourKind::MeasuredBell {
+                theta_n_deg,
+                theta_e_deg,
+            }) => format!(
+                "measured bell · θ_n {theta_n_deg:.1}° θ_e {theta_e_deg:.1}° · \
+                 {:.0}% length{source}",
+                self.params.bell_percent * 100.0
+            ),
+        };
         ui.label(
             RichText::new(format!(
-                "{head} · r_t {:.0} mm · ε {:.1}",
+                "{head} · r_t {:.0} mm · ε {:.1} · {contour_desc}",
                 self.params.r_throat_m * 1e3,
                 self.params.area_ratio
             ))
             .weak()
             .small(),
         );
+        // Honesty flag: the wall on screen is not the wall that was asked for.
+        // eprintln! into a windowed app's stdout is not a disclosure.
+        if let Some(why) = &self.wall_fallback {
+            ui.label(
+                RichText::new("contour rejected — showing the 15° fallback cone")
+                    .small()
+                    .color(AMBER),
+            )
+            .on_hover_text(format!(
+                "cfd_geom::generate_contour rejected this nozzle spec:\n{why}\n\n\
+                 The wall being solved is the legacy 15° cone, not the requested \
+                 contour. Every readout belongs to that cone.",
+            ));
+        }
+        // Honesty flag: the digitised Rao table runs ε = 4..100 and rao_angles
+        // CLAMPS at both ends rather than extrapolating — past either end the
+        // bell is the end row's angles stretched to this exit radius. Merlin
+        // Vac (ε = 165) lives above; the ε slider bottoms out at 2.0, below.
+        // Measured-angle bells never touch the table, so they never flag.
+        if self.wall_kind == Some(ContourKind::ParabolicBell)
+            && !(4.0..=100.0).contains(&self.params.area_ratio)
+        {
+            let (end, side) = if self.params.area_ratio > 100.0 {
+                (100.0, "ends at")
+            } else {
+                (4.0, "starts at")
+            };
+            ui.label(
+                RichText::new(format!(
+                    "bell angles clamped: Rao table {side} ε = {end:.0} (this nozzle is ε {:.1})",
+                    self.params.area_ratio
+                ))
+                .small()
+                .color(AMBER),
+            )
+            .on_hover_text(format!(
+                "θ_n and θ_e come from the digitised Rao table, which covers \
+                 ε = 4–100; outside it the angles clamp to the ε = {end:.0} row \
+                 instead of extrapolating (the published data does not support \
+                 extrapolation). The wall shown is that bell continued to this \
+                 exit radius — plausible, but not a tabulated Rao contour.",
+            ));
+        }
         ui.label(
             RichText::new(format!(
                 "γ {} · T₀ {:.0} K · MW {:.1} g/mol — propellant class, not measured",
@@ -1117,8 +1397,16 @@ impl eframe::App for CfdApp {
                 self.relock_armed = true;
             }
             if self.relock_armed && self.latest.info.step >= RELOCK_STEP {
+                // A typed range is left alone, and flagged. A p₀ change can
+                // move the reference scales by 35×, so a range chosen against
+                // the old ones can render as a solid block of a single colour.
+                // Discarding what the player typed loses their work; showing
+                // the solid block with no explanation loses their trust.
+                // Flagging is the only option that loses neither.
                 for k in FieldKind::ALL {
-                    self.locked[k as usize] = lock_range(k, self.latest.snapshot.range(k));
+                    let i = k as usize;
+                    let fresh = self.latest.snapshot.range(k);
+                    relock_field(k, &mut self.range_state[i], &mut self.locked[i], fresh);
                 }
                 self.relock_armed = false;
             }
@@ -1177,6 +1465,7 @@ impl eframe::App for CfdApp {
                     &self.latest,
                     self.frame_gen,
                     self.field,
+                    self.cmap[self.field as usize],
                     self.locked[self.field as usize],
                     self.smooth,
                     &mut self.editor,
@@ -1206,6 +1495,87 @@ impl eframe::App for CfdApp {
                     None => String::new(),
                 };
             });
+    }
+
+    /// Only the colormap choice is persisted — see `CMAP_KEY` for why the
+    /// range is not.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let ids = self.cmap.map(|p| p as u8);
+        eframe::set_value(storage, CMAP_KEY, &ids);
+    }
+}
+
+/// True while a widget owns the keyboard, i.e. while the player is typing into
+/// a field. The single gate for every global shortcut.
+///
+/// `wants_keyboard_input` is `memory.focused().is_some()`, and in egui 0.31
+/// only a widget that registers `interested_in_focus` can hold that: `DragValue`
+/// — which does so exactly while it is in text-entry mode, being a draggable
+/// button otherwise — and `TextEdit`. A `Button` never takes focus, so clicking
+/// Play or a preset does not leave the shortcuts dead behind it. Focus is set
+/// during the widget pass and read at the start of the next one, which is when
+/// `handle_keys` runs: the frame that carries the keystroke.
+fn keyboard_is_captured(ctx: &egui::Context) -> bool {
+    ctx.wants_keyboard_input()
+}
+
+/// Fold a stored discriminant array over the defaults, one field at a time.
+///
+/// Per-field rather than all-or-nothing: an index this build does not know
+/// falls back to that field's default and leaves the other seven alone, so a
+/// settings file from a newer build degrades instead of being discarded.
+fn restore_presets(stored: Option<[u8; 8]>, defaults: [Preset; 8]) -> [Preset; 8] {
+    let Some(stored) = stored else {
+        return defaults;
+    };
+    let mut out = defaults;
+    for (slot, i) in out.iter_mut().zip(stored) {
+        if let Some(p) = Preset::from_index(i) {
+            *slot = p;
+        }
+    }
+    out
+}
+
+/// The range-edit rule as a pure function: `None` rejects the edit and leaves
+/// the committed range alone. `min_end` says which end the player touched.
+///
+/// Separate from `CfdApp` so the rules are testable without an event loop.
+fn edited_range(
+    field: FieldKind,
+    free: bool,
+    cur: (f32, f32),
+    min_end: bool,
+    v: f32,
+) -> Option<(f32, f32)> {
+    // Non-finite reverts to the committed value, the same way
+    // `case::sanitize_domain` treats the domain fields. Schlieren arrives
+    // renormalised every frame, so with guardrails on there is nothing to edit.
+    if !v.is_finite() || (field == FieldKind::Schlieren && !free) {
+        return None;
+    }
+    let cand = if field.is_signed() && !free {
+        // Symmetric about zero: moving one end moves the other to match, so
+        // zero stays on the diverging map's light point.
+        let m = v.abs();
+        (-m, m)
+    } else if min_end {
+        (v, cur.1)
+    } else {
+        (cur.0, v)
+    };
+    // Rejected, not clamped: an inverted range is a question, not a typo to
+    // guess at.
+    (cand.0 < cand.1).then_some(cand)
+}
+
+/// The re-lock rule for one field. Auto ranges are overwritten; a manual one
+/// survives and is flagged instead.
+fn relock_field(kind: FieldKind, st: &mut RangeState, locked: &mut (f32, f32), fresh: (f32, f32)) {
+    if st.manual {
+        st.stale = true;
+    } else {
+        *locked = lock_range(kind, fresh);
     }
 }
 
@@ -1296,14 +1666,41 @@ fn warning_box(ui: &mut egui::Ui, color: Color32, title: &str, body: &str) {
 }
 
 fn preset_tooltip(p: &case::EnginePreset) -> String {
+    let shape = match p.contour_kind {
+        ContourKind::Conical => "15° cone".to_string(),
+        ContourKind::ParabolicBell => format!("{:.0}% parabolic bell", p.bell_percent * 100.0),
+        ContourKind::MeasuredBell {
+            theta_n_deg,
+            theta_e_deg,
+        } => format!(
+            "measured bell, θ_n {theta_n_deg:.1}° / θ_e {theta_e_deg:.1}° on a \
+             {:.3} R_t throat arc, {:.0}% length",
+            p.throat_arc_down,
+            p.bell_percent * 100.0
+        ),
+    };
     let mut s = format!(
-        "{} · ε {} · p₀ {:.0} bar · r_t {:.0} mm\n≈{:.1}× Merlin 1D run time",
+        "{} · ε {} · p₀ {:.0} bar · r_t {:.0} mm\n{shape} — {}\n≈{:.1}× Merlin 1D run time",
         p.propellant,
         p.area_ratio,
         p.p0_pa / 1e5,
         p.r_throat_m * 1e3,
+        p.bell_source,
         p.relative_cost()
     );
+    // The Rao θ_n/θ_e table is digitised at γ ≈ 1.23–1.25
+    // (docs/physics-reference.md §6, §10); an engine running well outside that
+    // band inherits the mismatch in its wall shape — a small one: Rao (1958)
+    // has γ barely moving the contour at fixed length and area ratio, worth
+    // well under a degree of exit angle. Only table bells can inherit it at
+    // all; a measured-angle contour never consults the table.
+    if p.contour_kind == ContourKind::ParabolicBell && (p.gamma < 1.23 || p.gamma > 1.25) {
+        s.push_str(&format!(
+            "\nBell angles from the Rao table, digitised at γ 1.23–1.25; this \
+             engine runs γ {} — the wall shape inherits that mismatch (sub-degree).",
+            p.gamma
+        ));
+    }
     if !p.note.is_empty() {
         s.push('\n');
         s.push_str(p.note);
@@ -1431,4 +1828,267 @@ fn altitude_slider(
         );
     }
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SIGNED: FieldKind = FieldKind::VelocityZ;
+    const UNSIGNED: FieldKind = FieldKind::Mach;
+
+    #[test]
+    fn lock_range_applies_the_style_guide_rules() {
+        // Schlieren is pinned regardless of what the frame reports.
+        assert_eq!(lock_range(FieldKind::Schlieren, (-3.0, 900.0)), (0.0, 1.0));
+        // Signed fields come back symmetric about zero.
+        assert_eq!(lock_range(SIGNED, (-120.0, 40.0)), (-120.0, 120.0));
+        assert_eq!(lock_range(SIGNED, (10.0, 90.0)), (-90.0, 90.0));
+        // Unsigned fields pass through, with a degenerate range widened.
+        assert_eq!(lock_range(UNSIGNED, (0.0, 4.0)), (0.0, 4.0));
+        assert_eq!(lock_range(UNSIGNED, (2.0, 2.0)), (2.0, 3.0));
+    }
+
+    #[test]
+    fn guardrails_keep_a_signed_field_symmetric_under_a_one_ended_edit() {
+        // Editing only the max moves the min to match.
+        let r = edited_range(SIGNED, false, (-100.0, 100.0), false, 250.0).unwrap();
+        assert_eq!(r, (-250.0, 250.0));
+        // ... and editing only the min does the same, sign-independently.
+        let r = edited_range(SIGNED, false, (-100.0, 100.0), true, -30.0).unwrap();
+        assert_eq!(r, (-30.0, 30.0));
+        let r = edited_range(SIGNED, false, (-100.0, 100.0), true, 30.0).unwrap();
+        assert_eq!(r, (-30.0, 30.0));
+    }
+
+    #[test]
+    fn free_range_lets_a_signed_field_go_asymmetric() {
+        let r = edited_range(SIGNED, true, (-100.0, 100.0), false, 250.0).unwrap();
+        assert_eq!(r, (-100.0, 250.0), "the untouched end must not move");
+        let r = edited_range(SIGNED, true, (-100.0, 100.0), true, -5.0).unwrap();
+        assert_eq!(r, (-5.0, 100.0));
+    }
+
+    #[test]
+    fn schlieren_is_pinned_until_free_range_is_on() {
+        assert_eq!(
+            edited_range(FieldKind::Schlieren, false, (0.0, 1.0), false, 4.0),
+            None
+        );
+        assert_eq!(
+            edited_range(FieldKind::Schlieren, true, (0.0, 1.0), false, 4.0),
+            Some((0.0, 4.0))
+        );
+    }
+
+    #[test]
+    fn non_finite_and_inverted_edits_are_rejected_not_clamped() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(edited_range(UNSIGNED, false, (0.0, 4.0), true, bad), None);
+            assert_eq!(edited_range(UNSIGNED, false, (0.0, 4.0), false, bad), None);
+        }
+        // min pushed past max, and max pulled below min: both rejected whole,
+        // never silently clamped to the other end.
+        assert_eq!(edited_range(UNSIGNED, false, (0.0, 4.0), true, 9.0), None);
+        assert_eq!(edited_range(UNSIGNED, false, (0.0, 4.0), false, -9.0), None);
+        // An empty range is rejected at the boundary too.
+        assert_eq!(edited_range(UNSIGNED, false, (0.0, 4.0), true, 4.0), None);
+        // A symmetric edit of zero width is empty, so it is rejected as well.
+        assert_eq!(edited_range(SIGNED, false, (-1.0, 1.0), false, 0.0), None);
+    }
+
+    #[test]
+    fn relock_overwrites_auto_ranges_and_spares_manual_ones() {
+        // Auto: overwritten by the fresh scales, and stays unflagged.
+        let mut st = RangeState::default();
+        let mut locked = (0.0, 4.0);
+        relock_field(UNSIGNED, &mut st, &mut locked, (0.0, 140.0));
+        assert_eq!(locked, (0.0, 140.0));
+        assert!(!st.stale, "an auto range has nothing to go stale");
+        assert!(!st.manual);
+
+        // Manual: survives the relock untouched, and is flagged instead.
+        let mut st = RangeState {
+            manual: true,
+            ..RangeState::default()
+        };
+        let mut locked = (0.0, 4.0);
+        relock_field(UNSIGNED, &mut st, &mut locked, (0.0, 140.0));
+        assert_eq!(locked, (0.0, 4.0), "a typed range must not be discarded");
+        assert!(st.stale, "a surviving manual range must be flagged");
+    }
+
+    fn defaults() -> [Preset; 8] {
+        let mut d = [Preset::Viridis; 8];
+        for k in FieldKind::ALL {
+            d[k as usize] = Preset::default_for(k);
+        }
+        d
+    }
+
+    #[test]
+    fn no_stored_presets_leaves_the_defaults_alone() {
+        assert_eq!(restore_presets(None, defaults()), defaults());
+    }
+
+    #[test]
+    fn stored_presets_round_trip_through_discriminants() {
+        let mut want = defaults();
+        want[FieldKind::Mach as usize] = Preset::Turbo;
+        want[FieldKind::Density as usize] = Preset::Grayscale;
+        // Exactly what `save` writes.
+        let ids = want.map(|p| p as u8);
+        assert_eq!(restore_presets(Some(ids), defaults()), want);
+    }
+
+    #[test]
+    fn an_unknown_stored_preset_falls_back_per_field() {
+        // A settings file from a newer build: one index this build does not
+        // know. That field reverts to its default; the rest must survive.
+        let mut ids = defaults().map(|p| p as u8);
+        ids[FieldKind::Mach as usize] = 200;
+        ids[FieldKind::Pressure as usize] = Preset::Turbo as u8;
+
+        let got = restore_presets(Some(ids), defaults());
+        assert_eq!(
+            got[FieldKind::Mach as usize],
+            Preset::default_for(FieldKind::Mach),
+            "unknown index must fall back to the default"
+        );
+        assert_eq!(
+            got[FieldKind::Pressure as usize],
+            Preset::Turbo,
+            "one bad entry must not discard the others"
+        );
+    }
+
+    /// A headless app on the Preview extents. The mock is what makes this
+    /// cheap — the keyboard path never touches the solver, and a real one
+    /// would spend the whole test building a grid nobody steps.
+    fn headless_app() -> (CfdApp, std::sync::mpsc::Receiver<UiCommand>) {
+        let (lz_rt, lr_rt, cells_per_rt, dz_over_dr) = DomainPreset::Preview.values();
+        let params = CaseParams {
+            lz_rt,
+            lr_rt,
+            cells_per_rt,
+            dz_over_dr,
+            ..CaseParams::default()
+        };
+        let wall = case::nozzle_contour(&params);
+        let setup = case::make_setup(&params, &wall.points);
+        let solver = cfd_core::MockSolver::new(setup).expect("mock rejected the preview case");
+        let info = cfd_contract::StepInfo {
+            step: 0,
+            time: 0.0,
+            dt: 0.0,
+            residual: f64::NAN,
+            converged: false,
+            floor_activations: 0,
+        };
+        let initial = crate::worker::make_frame(&solver, info);
+        let (_in, out) = triple_buffer::triple_buffer(&initial);
+        let (tx, rx) = std::sync::mpsc::channel();
+        // The receiver goes back to the caller: `cmd` swallows a send error, so
+        // dropping it would hide a shortcut that did fire.
+        (CfdApp::new(out, tx, initial, params, wall, true, None), rx)
+    }
+
+    /// One egui pass containing a `DragValue`, with `key` pressed. Returns the
+    /// widget's id so a later pass can hand focus back or take it away.
+    fn pass_with_a_number_field(
+        ctx: &egui::Context,
+        value: &mut f64,
+        key: Key,
+        take_focus: bool,
+    ) -> egui::Id {
+        let mut id = egui::Id::NULL;
+        let raw = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        // The pass output is the tessellated frame — nothing to paint here,
+        // only the input and focus bookkeeping it leaves in the context.
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                id = ui.add(egui::DragValue::new(value)).id;
+                if take_focus {
+                    ui.memory_mut(|m| m.request_focus(id));
+                }
+            });
+        });
+        id
+    }
+
+    /// The bug: every shortcut is also a character you type into a number.
+    /// Typing 3 into a field switched the display to Pressure, and the "." in
+    /// 1.5 paused the solver and single-stepped it.
+    ///
+    /// This pins both halves — the gate in `handle_keys`, and the egui
+    /// behaviour it rests on, which is the half a version bump can move: a
+    /// focused `DragValue` is a `DragValue` in text-entry mode, so
+    /// `wants_keyboard_input` is true exactly while the player is typing.
+    #[test]
+    fn typing_in_a_field_does_not_fire_the_shortcuts() {
+        let (mut app, _rx) = headless_app();
+        let ctx = egui::Context::default();
+        let mut v = 32.0_f64;
+
+        // Nothing focused: the shortcuts are live. Half the fix — a gate that
+        // swallowed every key would satisfy the other half on its own.
+        app.field = FieldKind::Mach;
+        let id = pass_with_a_number_field(&ctx, &mut v, Key::Num3, false);
+        assert!(!keyboard_is_captured(&ctx), "no field is being typed into");
+        app.handle_keys(&ctx);
+        assert_eq!(app.field, FieldKind::Pressure, "3 must pick Pressure");
+
+        // The same keystroke into a focused field: the display must not move.
+        app.field = FieldKind::Mach;
+        app.paused = false;
+        pass_with_a_number_field(&ctx, &mut v, Key::Num3, true);
+        assert!(
+            keyboard_is_captured(&ctx),
+            "a DragValue in text-entry mode must own the keyboard"
+        );
+        app.handle_keys(&ctx);
+        assert_eq!(app.field, FieldKind::Mach, "typing 3 changed the display");
+
+        // ... and neither must the decimal point of "1.5" step the solver.
+        pass_with_a_number_field(&ctx, &mut v, Key::Period, true);
+        app.handle_keys(&ctx);
+        assert!(!app.paused, "typing . paused the solver");
+
+        // Focus released (Escape, Enter, a click elsewhere): shortcuts return.
+        ctx.memory_mut(|m| m.surrender_focus(id));
+        pass_with_a_number_field(&ctx, &mut v, Key::Num5, false);
+        app.handle_keys(&ctx);
+        assert_eq!(
+            app.field,
+            FieldKind::Density,
+            "shortcuts must come back when the field is done"
+        );
+    }
+
+    #[test]
+    fn editing_clears_the_stale_flag() {
+        // The flag means "typed against scales that have since moved". Any
+        // fresh edit re-answers that, so it must clear.
+        let mut st = RangeState {
+            manual: true,
+            stale: true,
+            ..RangeState::default()
+        };
+        let mut locked = (0.0, 4.0);
+        if let Some(r) = edited_range(UNSIGNED, st.free, locked, false, 12.0) {
+            locked = r;
+            st.stale = false;
+        }
+        assert_eq!(locked, (0.0, 12.0));
+        assert!(!st.stale);
+    }
 }
