@@ -1,10 +1,10 @@
 {
-  "commit": "f534ba7802dd0db0c550faff490db965b0e5b038",
-  "timestamp": "2026-08-16T21:07:41Z",
+  "commit": "141b69f38aafd9ab7bd97f9dfda1cdba7e92fff9",
+  "timestamp": "2026-08-16T22:39:06Z",
   "machine": "intel-xeon-4c",
   "tests": [
     {"id":"T0-disk","name":"rasterizer disk area, R in {3..20} cells","expected":"<= 5e-3","actual":0.000000005412779598310543,"units":"worst relative area error","pass":true},
-    {"id":"T0-throat","name":"rasterized nozzle throat area, 5 slider settings","expected":"<= 5e-3","actual":0.0015822280899842056,"units":"worst relative area error","pass":true},
+    {"id":"T0-throat","name":"rasterized nozzle throat area, 6 slider settings","expected":"<= 5e-3","actual":0.0015822280899842056,"units":"worst relative area error","pass":true},
     {"id":"T1","name":"free-stream preservation (planar uniform, 200 steps)","expected":"<= 1e-5","actual":0.0000054836273193359375,"units":"max abs state error","pass":true},
     {"id":"T1-graded","name":"free-stream preservation on a graded grid (growth 1.15/1.2)","expected":"<= 1e-5","actual":0.0000006556510925292969,"units":"max abs state error","pass":true},
     {"id":"T4","name":"Sod shock tube, N = 200 uniform strip","expected":"<= 6.0e-3","actual":0.0042654666994339395,"units":"L1(rho)","pass":true},
