@@ -72,3 +72,12 @@ Conventions:
   writes three rows (`T7-beta`, `T7-p`, `T7-mach`).
 - Recorded-but-not-asserted measurements go in `notes`, not in `tests` with a
   fake pass.
+- A row measured on a flow that has **not** converged must say so. Assert on a
+  mean over a **declared settled window**, never on one instant, and record in
+  `notes`: the window (steps and non-dimensional time), the residual at the end
+  against `RESIDUAL_CONVERGED`, `StepInfo::converged`, and the `Confidence` the
+  report carries. A window that carries an assert also needs its own steadiness
+  evidence — the drift of the window mean between its halves, and that the
+  residual is not growing — as separate rows. The RS-25 20 km C_f comparison is
+  the worked example: its single-instant ancestor read +0.0218 at step 5511 and
+  the opposite sign before step ~2000.

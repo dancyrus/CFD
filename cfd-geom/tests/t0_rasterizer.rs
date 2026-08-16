@@ -3,8 +3,10 @@
 //! 1. A disk of radius R cells centred on a cell corner must recover pi*R^2.
 //!    The error is SIGNED (point sampling measures +13.18% at R=3, +3.45% at
 //!    R=8, -0.97% at R=12), so the assertion takes the absolute value.
-//! 2. For the parametric nozzle at five slider settings, the throat area
-//!    recovered from the solid field is within 0.5% of the analytic value.
+//! 2. For the parametric nozzle at six slider settings — cone, Rao-table bell
+//!    and measured-angle bell, the last on its own 0.300 r_t throat arc — the
+//!    throat area recovered from the solid field is within 0.5% of the
+//!    analytic value.
 
 use cfd_contract::{GasModel, Grid, RefScales};
 use cfd_geom::{
@@ -100,38 +102,54 @@ fn t0_nozzle_throat_area_within_half_percent() {
     assert!((1.0 / dr as f64 - 40.0).abs() < 1e-4); // N_throat = 40 (f32 dr)
     let g = Grid::uniform(240, 220, 0.0724, dr);
 
-    // Five slider settings across both contour kinds.
-    let settings: [(ContourKind, f64); 5] = [
+    // Six slider settings across all three contour kinds — including the
+    // measured-angle bell, which brings its own (tighter) throat arc: the
+    // throat is what this test measures, so the arc must be part of the sweep
+    // rather than pinned at the parametric family's 0.382.
+    let settings: [(ContourKind, f64, f64); 6] = [
         (
             ContourKind::Conical {
                 half_angle_deg: 15.0,
             },
             4.0,
+            0.382,
         ),
         (
             ContourKind::Conical {
                 half_angle_deg: 15.0,
             },
             8.0,
+            0.382,
         ),
         (
             ContourKind::Conical {
                 half_angle_deg: 18.0,
             },
             16.0,
+            0.382,
         ),
-        (ContourKind::ParabolicBell { bell_percent: 0.8 }, 8.0),
-        (ContourKind::ParabolicBell { bell_percent: 0.8 }, 25.0),
+        (ContourKind::ParabolicBell { bell_percent: 0.8 }, 8.0, 0.382),
+        (ContourKind::ParabolicBell { bell_percent: 0.8 }, 25.0, 0.382),
+        (
+            // Raptor 2's published geometry (FAA AR 2019-001b Table 1).
+            ContourKind::DirectBell {
+                theta_n_deg: 32.0,
+                theta_e_deg: 6.0,
+                length_fraction: 0.76,
+            },
+            34.3,
+            0.300,
+        ),
     ];
 
-    for (contour, area_ratio) in settings {
+    for (contour, area_ratio, throat_arc_down) in settings {
         let spec = NozzleSpec {
             throat_radius_m: 0.05,
             area_ratio,
             contraction_ratio: 4.0,
             converge_half_angle_deg: 30.0,
             throat_arc_up: 1.5,
-            throat_arc_down: 0.382,
+            throat_arc_down,
             contour,
         };
         let profile = generate_contour(&spec, 512).unwrap();
@@ -162,6 +180,6 @@ fn t0_nozzle_throat_area_within_half_percent() {
             "{contour:?} eps={area_ratio}: recovered A/A_t = {min_rw2:.5}, rel err {rel:.2e}"
         );
     }
-    record("T0-throat", "rasterized nozzle throat area, 5 slider settings", "<= 5e-3",
+    record("T0-throat", "rasterized nozzle throat area, 6 slider settings", "<= 5e-3",
            worst, "worst relative area error", worst <= 5e-3);
 }

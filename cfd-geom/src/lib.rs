@@ -31,6 +31,23 @@ pub enum ContourKind {
     ParabolicBell {
         bell_percent: f64,
     },
+    /// Parabolic bell with MEASURED wall angles: theta_n and theta_e are taken
+    /// straight from published geometry instead of the Rao table, and the
+    /// downstream throat arc comes from `NozzleSpec::throat_arc_down` like any
+    /// other spec input. For engines the table cannot represent — Raptor 2's
+    /// published 32.0 deg / 6.0 deg pair sits on no single bell-percent row,
+    /// and its 0.300 R_t throat arc is not the 0.382 R_t of the Rao/TOP
+    /// construction.
+    ///
+    /// `length_fraction` is still the divergent length as a fraction of the
+    /// Huzel-Huang 15 deg reference cone: two wall angles and an exit radius
+    /// do not by themselves fix a length, so a bell always needs one. It is a
+    /// LENGTH parameter here, not a claim that the contour is a Rao bell.
+    DirectBell {
+        theta_n_deg: f64,
+        theta_e_deg: f64,
+        length_fraction: f64,
+    },
 }
 
 /// Parametric nozzle description. All lengths SI; arc radii in units of r_t.
@@ -116,6 +133,27 @@ impl NozzleSpec {
                     return Err(bad(format!(
                         "bell_percent = {bell_percent} (supported range 0.6..=0.9)"
                     )));
+                }
+            }
+            ContourKind::DirectBell {
+                theta_n_deg,
+                theta_e_deg,
+                length_fraction,
+            } => {
+                // No table to stay inside: the angles are the measurement. Only
+                // the geometry has to close — theta_n above theta_e (the Bezier
+                // control point divides by their tangent difference), both wall
+                // angles in the first quadrant, and a positive length.
+                if !(theta_n_deg > 0.0 && theta_n_deg < 90.0) {
+                    return Err(bad(format!("theta_n_deg = {theta_n_deg}")));
+                }
+                if !(theta_e_deg >= 0.0 && theta_e_deg < theta_n_deg) {
+                    return Err(bad(format!(
+                        "theta_e_deg = {theta_e_deg} (must be in 0..theta_n = {theta_n_deg})"
+                    )));
+                }
+                if !(length_fraction.is_finite() && length_fraction > 0.0) {
+                    return Err(bad(format!("length_fraction = {length_fraction}")));
                 }
             }
         }
