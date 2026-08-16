@@ -509,7 +509,16 @@ pub fn primitives(&self) -> Vec<Prim>;
 pub enum ContourKind {
     Conical { half_angle_deg: f64 },
     ParabolicBell { bell_percent: f64 },   // theta_n, theta_e from the Rao table
+    /// Measured geometry: the wall angles are inputs, the downstream throat arc is
+    /// the spec's. For hardware the Rao table cannot represent (Raptor 2).
+    /// `length_fraction` is the length as a fraction of the same 15 deg reference
+    /// cone the bell percent uses — two angles and an exit radius do not fix a length.
+    DirectBell { theta_n_deg: f64, theta_e_deg: f64, length_fraction: f64 },
 }
+// Bell length reference (both bell variants), physics-reference §10:
+//   L_c15 = ( r_t(sqrt(eps) - 1) + 1.5*r_t*(sec 15 - 1) ) / tan 15
+// 1.5 R_t is Huzel-Huang's REFERENCE-cone throat arc, a fixed part of the
+// definition of the percentage; it is NOT read from NozzleSpec::throat_arc_down.
 
 pub struct NozzleSpec {
     pub throat_radius_m: f64,

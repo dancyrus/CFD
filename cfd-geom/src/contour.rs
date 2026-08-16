@@ -12,6 +12,99 @@ use cfd_contract::{CfdError, Result};
 /// Chamber straight length, in units of r_t (session brief §1).
 const CHAMBER_LEN_RT: f64 = 2.0;
 
+/// Downstream throat-arc radius of Huzel–Huang's REFERENCE 15° cone, in r_t.
+///
+/// This is a fixed property of the definition of "N% bell" — H&H measure bell
+/// length against a 15° conical nozzle of the same throat area and area ratio
+/// **with a 1.5 R_t downstream throat arc** — not a property of the nozzle
+/// being generated. It happens to equal the family's `throat_arc_up`, but it
+/// is deliberately NOT read from the spec: an engine with a tighter throat arc
+/// (Raptor 2, 0.300 R_t) must still be measured against the same reference, or
+/// "80% bell" means a different length for every spec.
+const L_C15_REF_ARC_RT: f64 = 1.5;
+
+/// Append a point, dropping an exact-duplicate z (shared piece endpoints get
+/// pushed twice).
+fn push(pts: &mut Vec<[f64; 2]>, p: [f64; 2]) {
+    if pts.last().is_none_or(|q| p[0] - q[0] > 1e-12) {
+        pts.push(p);
+    }
+}
+
+/// Huzel–Huang reference length: the 15° cone this family measures bell
+/// percent against, in r_t, measured from the throat.
+fn l_c15(area_ratio: f64) -> f64 {
+    let s15 = 15.0f64.to_radians();
+    ((area_ratio.sqrt() - 1.0) + L_C15_REF_ARC_RT * (1.0 / s15.cos() - 1.0)) / s15.tan()
+}
+
+/// The diverging bell: downstream throat arc to wall angle `tn_deg`, then a
+/// quadratic Bézier to the exit lip at axial distance `l_n` from the throat
+/// meeting it at `te_deg`. Shared by the Rao-table and direct-angle paths —
+/// they differ only in where the two angles and the length come from.
+#[allow(clippy::too_many_arguments)]
+fn push_bell(
+    pts: &mut Vec<[f64; 2]>,
+    z_t: f64,
+    r2: f64,
+    re: f64,
+    l_n: f64,
+    tn_deg: f64,
+    te_deg: f64,
+    n_arc_dn: usize,
+    n_div: usize,
+) -> Result<()> {
+    let (tn, te) = (tn_deg.to_radians(), te_deg.to_radians());
+    if tn <= te {
+        // Cannot happen with the shipped table; guards division by zero in the
+        // Bézier control point below.
+        return Err(CfdError::Geometry(format!(
+            "theta_n ({tn_deg}) must exceed theta_e ({te_deg})"
+        )));
+    }
+    // Bézier endpoints (z relative to throat) and control point.
+    let nz = r2 * tn.sin();
+    let nr = 1.0 + r2 * (1.0 - tn.cos());
+    let (ez, er) = (l_n, re);
+    let (m1, m2) = (tn.tan(), te.tan());
+    let c1 = nr - m1 * nz;
+    let c2 = er - m2 * ez;
+    let qz = (c2 - c1) / (m1 - m2);
+    let qr = (m1 * c2 - m2 * c1) / (m1 - m2);
+    if !(nz < qz && qz < ez) {
+        // Which side failed says which way to move, and this message is now
+        // user-visible (the app shows it when it falls back to the cone).
+        // Q_z past the exit: the bell is too SHORT for the area ratio. Q_z
+        // behind the throat-arc tangency: too LONG. Telling someone to
+        // lengthen an already-overlong nozzle sends them the wrong way.
+        let which = if qz <= nz { "too long" } else { "too short" };
+        return Err(CfdError::Geometry(format!(
+            "bell control point out of order (N_z={nz:.4}, Q_z={qz:.4}, E_z={ez:.4}): \
+             length {l_n:.4} r_t is {which} for area ratio {:.4} at theta_n {tn_deg} / \
+             theta_e {te_deg}",
+            re * re
+        )));
+    }
+    // Downstream arc, wall angle 0 -> theta_n; ends exactly at N.
+    for k in 1..=n_arc_dn {
+        let phi = tn * k as f64 / n_arc_dn as f64;
+        push(pts, [z_t + r2 * phi.sin(), 1.0 + r2 * (1.0 - phi.cos())]);
+    }
+    // Quadratic Bézier N -> E. t is NOT proportional to z; the polyline just
+    // needs monotone z, which N_z < Q_z < E_z guarantees.
+    for k in 1..=n_div {
+        let t = k as f64 / n_div as f64;
+        let a = (1.0 - t) * (1.0 - t);
+        let b = 2.0 * t * (1.0 - t);
+        let c = t * t;
+        push(
+            pts,
+            [z_t + a * nz + b * qz + c * ez, a * nr + b * qr + c * er],
+        );
+    }
+    Ok(())
+}
+
 /// Generate the full wall contour as a polyline with roughly `samples` points
 /// (clamped to at least 64). The throat is exactly a vertex; `throat_index`
 /// points at it.
@@ -37,12 +130,6 @@ pub fn generate_contour(spec: &NozzleSpec, samples: usize) -> Result<WallProfile
     let n_div = n.saturating_sub(n_arc_up + n_arc_dn + 4).max(16);
 
     let mut pts: Vec<[f64; 2]> = Vec::with_capacity(n + 8);
-    // Shared piece endpoints are pushed twice; drop exact-duplicate z.
-    let push = |pts: &mut Vec<[f64; 2]>, p: [f64; 2]| {
-        if pts.last().is_none_or(|q| p[0] - q[0] > 1e-12) {
-            pts.push(p);
-        }
-    };
 
     // 1. Chamber straight.
     push(&mut pts, [0.0, rc]);
@@ -77,59 +164,44 @@ pub fn generate_contour(spec: &NozzleSpec, samples: usize) -> Result<WallProfile
             // Straight cone to the exit lip.
             push(&mut pts, [z_t + l_n, re]);
         }
+        // Huzel–Huang reference length, INCLUDING the throat-arc term, which
+        // that reference cone takes at 1.5 R_t (`L_C15_REF_ARC_RT`) — NOT at
+        // this nozzle's own downstream arc. The Aspirespace / bell_nozzle.py
+        // form drops the term entirely; the two differ by an ε-dependent
+        // amount (H&H longer by 2.89% at ε = 8, 1.32% at ε = 25, 0.72% at
+        // ε = 69, 0.45% at ε = 165), which makes "80% bell" ambiguous unqualified.
+        // This is the pinned definition (physics-reference §10).
         ContourKind::ParabolicBell { bell_percent } => {
             let (tn_deg, te_deg) = rao_angles(eps, bell_percent);
-            let (tn, te) = (tn_deg.to_radians(), te_deg.to_radians());
-            if tn <= te {
-                // Cannot happen with the shipped table; guards division by zero
-                // in the Bezier control point below.
-                return Err(CfdError::Geometry(format!(
-                    "theta_n ({tn_deg}) must exceed theta_e ({te_deg})"
-                )));
-            }
-            // Huzel–Huang reference length, INCLUDING the throat-arc term. The
-            // Aspirespace / bell_nozzle.py form drops it and differs by 0.337%,
-            // which makes "80% bell" ambiguous. This is the pinned definition.
-            let s15 = 15.0f64.to_radians();
-            let l_c15 = ((re - 1.0) + r2 * (1.0 / s15.cos() - 1.0)) / s15.tan();
-            let l_n = bell_percent * l_c15;
-
-            // Bezier endpoints (z relative to throat) and control point.
-            let nz = r2 * tn.sin();
-            let nr = 1.0 + r2 * (1.0 - tn.cos());
-            let ez = l_n;
-            let er = re;
-            let (m1, m2) = (tn.tan(), te.tan());
-            let c1 = nr - m1 * nz;
-            let c2 = er - m2 * ez;
-            let qz = (c2 - c1) / (m1 - m2);
-            let qr = (m1 * c2 - m2 * c1) / (m1 - m2);
-            if !(nz < qz && qz < ez) {
-                return Err(CfdError::Geometry(format!(
-                    "bell control point out of order (N_z={nz:.4}, Q_z={qz:.4}, E_z={ez:.4}): \
-                     bell_percent {bell_percent} is too short for area ratio {eps}"
-                )));
-            }
-            // Downstream arc, wall angle 0 -> theta_n; ends exactly at N.
-            for k in 1..=n_arc_dn {
-                let phi = tn * k as f64 / n_arc_dn as f64;
-                push(
-                    &mut pts,
-                    [z_t + r2 * phi.sin(), 1.0 + r2 * (1.0 - phi.cos())],
-                );
-            }
-            // Quadratic Bezier N -> E. t is NOT proportional to z; the polyline
-            // just needs monotone z, which N_z < Q_z < E_z guarantees.
-            for k in 1..=n_div {
-                let t = k as f64 / n_div as f64;
-                let a = (1.0 - t) * (1.0 - t);
-                let b = 2.0 * t * (1.0 - t);
-                let c = t * t;
-                push(
-                    &mut pts,
-                    [z_t + a * nz + b * qz + c * ez, a * nr + b * qr + c * er],
-                );
-            }
+            push_bell(
+                &mut pts,
+                z_t,
+                r2,
+                re,
+                bell_percent * l_c15(eps),
+                tn_deg,
+                te_deg,
+                n_arc_dn,
+                n_div,
+            )?;
+        }
+        // Measured geometry: the wall angles are inputs, not table lookups.
+        ContourKind::DirectBell {
+            theta_n_deg,
+            theta_e_deg,
+            length_fraction,
+        } => {
+            push_bell(
+                &mut pts,
+                z_t,
+                r2,
+                re,
+                length_fraction * l_c15(eps),
+                theta_n_deg,
+                theta_e_deg,
+                n_arc_dn,
+                n_div,
+            )?;
         }
     }
 
@@ -264,14 +336,192 @@ mod tests {
             "junction slope {m_n} vs tan(theta_n) {}",
             tn.to_radians().tan()
         );
-        // 80% bell is shorter than the equivalent 15-degree cone.
+        // 80% bell is shorter than the equivalent 15-degree cone. The
+        // reference cone is Huzel–Huang's: 1.5 R_t downstream throat arc, NOT
+        // this nozzle's 0.382 (the two differ by 0.98% at eps = 25).
         let s15 = 15.0f64.to_radians();
-        let l_c15 = ((5.0 - 1.0) + 0.382 * (1.0 / s15.cos() - 1.0)) / s15.tan();
+        let l_c15 = ((5.0 - 1.0) + 1.5 * (1.0 / s15.cos() - 1.0)) / s15.tan();
         let l_n = (last[0] - p.points[p.throat_index][0]) / rt;
         assert!(
             (l_n - 0.8 * l_c15).abs() < 1e-9,
             "L_n = {l_n}, L_c15 = {l_c15}"
         );
+    }
+
+    /// The H&H reference cone is a fixed definition (1.5 R_t arc): changing
+    /// the nozzle's OWN downstream arc must not move the length "80% bell"
+    /// means, or the percentage is not comparable between engines.
+    #[test]
+    fn bell_length_reference_is_independent_of_the_nozzle_throat_arc() {
+        let mut a = spec(ContourKind::ParabolicBell { bell_percent: 0.8 }, 25.0);
+        a.throat_arc_down = 0.382;
+        let mut b = a;
+        b.throat_arc_down = 0.300;
+        let len = |s: &NozzleSpec| {
+            let p = generate_contour(s, 512).unwrap();
+            (p.points.last().unwrap()[0] - p.points[p.throat_index][0]) / s.throat_radius_m
+        };
+        assert!((len(&a) - len(&b)).abs() < 1e-12, "{} vs {}", len(&a), len(&b));
+        // And it is the 1.5 R_t form, 0.98% longer than the 0.382 R_t one.
+        let s15 = 15.0f64.to_radians();
+        let with_own_arc = 0.8 * ((4.0) + 0.382 * (1.0 / s15.cos() - 1.0)) / s15.tan();
+        assert!(
+            (len(&a) / with_own_arc - 1.00983).abs() < 1e-4,
+            "ratio {}",
+            len(&a) / with_own_arc
+        );
+    }
+
+    /// The direct-angle path: wall angles are inputs, the throat arc is the
+    /// spec's (Raptor 2's 0.300 R_t, not the Rao construction's 0.382), and
+    /// the produced wall meets both angles exactly.
+    #[test]
+    fn direct_bell_reproduces_its_input_angles() {
+        let mut s = spec(
+            ContourKind::DirectBell {
+                theta_n_deg: 32.0,
+                theta_e_deg: 6.0,
+                length_fraction: 0.76,
+            },
+            34.3,
+        );
+        s.throat_arc_down = 0.300;
+        let p = generate_contour(&s, 4096).unwrap();
+        let rt = s.throat_radius_m;
+        let last = *p.points.last().unwrap();
+        assert!((last[1] / rt - 34.3f64.sqrt()).abs() < 1e-12);
+        // Exit slope is tan(theta_e) — the whole point of the path.
+        let m_exit = slope_at(&p, p.points.len() - 1);
+        assert!(
+            (m_exit.atan().to_degrees() - 6.0).abs() < 0.05,
+            "exit angle {} deg",
+            m_exit.atan().to_degrees()
+        );
+        // Slope at the arc/Bezier junction N is tan(theta_n).
+        let zt = p.points[p.throat_index][0] / rt;
+        let n_z = zt + 0.300 * 32.0f64.to_radians().sin();
+        let i = p
+            .points
+            .iter()
+            .enumerate()
+            .min_by(|a, b| {
+                let (da, db) = ((a.1[0] / rt - n_z).abs(), (b.1[0] / rt - n_z).abs());
+                da.partial_cmp(&db).unwrap()
+            })
+            .unwrap()
+            .0;
+        let m_n = slope_at(&p, i).atan().to_degrees();
+        assert!((m_n - 32.0).abs() < 0.5, "junction angle {m_n} deg");
+        // Length is the requested fraction of the H&H reference cone.
+        let l_n = (last[0] - p.points[p.throat_index][0]) / rt;
+        assert!((l_n - 0.76 * l_c15(34.3)).abs() < 1e-9, "L_n = {l_n}");
+    }
+
+    #[test]
+    fn direct_bell_rejects_impossible_angles() {
+        // theta_e >= theta_n: the Bezier control point divides by their
+        // tangent difference.
+        assert!(generate_contour(
+            &spec(
+                ContourKind::DirectBell {
+                    theta_n_deg: 6.0,
+                    theta_e_deg: 32.0,
+                    length_fraction: 0.76
+                },
+                34.3
+            ),
+            256
+        )
+        .is_err());
+        // A length far too short for the area ratio puts Q outside [N, E].
+        assert!(generate_contour(
+            &spec(
+                ContourKind::DirectBell {
+                    theta_n_deg: 32.0,
+                    theta_e_deg: 6.0,
+                    length_fraction: 0.2
+                },
+                34.3
+            ),
+            256
+        )
+        .is_err());
+        assert!(generate_contour(
+            &spec(
+                ContourKind::DirectBell {
+                    theta_n_deg: 32.0,
+                    theta_e_deg: 6.0,
+                    length_fraction: -1.0
+                },
+                34.3
+            ),
+            256
+        )
+        .is_err());
+        // theta_e = 0 is rejected because it UNBOUNDS the length: Q_z moves
+        // with E_z at rate tan(theta_e), so at zero the N_z < Q_z < E_z guard
+        // stops constraining the length at all and a 1e9 r_t "bell" validates.
+        for lf in [0.76, 1.0, 1.5] {
+            assert!(
+                generate_contour(
+                    &spec(
+                        ContourKind::DirectBell {
+                            theta_n_deg: 32.0,
+                            theta_e_deg: 0.0,
+                            length_fraction: lf
+                        },
+                        34.3
+                    ),
+                    256
+                )
+                .is_err(),
+                "theta_e = 0 accepted at length_fraction {lf}"
+            );
+        }
+        // …and an absurd length is rejected outright, so a near-zero exit
+        // angle cannot make the ordering guard toothless either.
+        assert!(generate_contour(
+            &spec(
+                ContourKind::DirectBell {
+                    theta_n_deg: 32.0,
+                    theta_e_deg: 0.001,
+                    length_fraction: 1e9
+                },
+                34.3
+            ),
+            256
+        )
+        .is_err());
+    }
+
+    /// The rejection message is user-visible now (cfd-ui shows it when the
+    /// generator falls back to the cone), so it must point the right way: Q_z
+    /// behind the tangency means too LONG, Q_z past the exit means too SHORT.
+    #[test]
+    fn bell_rejection_message_says_which_way_to_move() {
+        let msg = |eps: f64, tn: f64, te: f64, lf: f64| {
+            generate_contour(
+                &spec(
+                    ContourKind::DirectBell {
+                        theta_n_deg: tn,
+                        theta_e_deg: te,
+                        length_fraction: lf,
+                    },
+                    eps,
+                ),
+                256,
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        // Q_z past the exit: too short for this area ratio.
+        let short = msg(34.3, 32.0, 6.0, 0.2);
+        assert!(short.contains("too short"), "{short}");
+        // Q_z behind the throat-arc tangency: too long. Reached at a small
+        // area ratio, where the reference cone is short and the exit radius
+        // is close to the throat.
+        let long = msg(1.2, 20.0, 6.0, 1.5);
+        assert!(long.contains("too long"), "{long}");
     }
 
     #[test]

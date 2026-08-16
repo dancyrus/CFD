@@ -1,15 +1,17 @@
 //! The demo case and everything the UI derives from it: the US standard
-//! atmosphere behind the altitude slider, the parametric conical contour, a
-//! stub rasterizer (exact-fraction rasterization is session C's; this band
-//! rasterizer keeps the app alive until `cfd_geom::rasterize` lands), and the
-//! quasi-1D helpers the honesty surface needs (separation threshold, ideal C_f).
+//! atmosphere behind the altitude slider, the parametric wall contour
+//! (an adapter over `cfd_geom::generate_contour` — conical or Rao parabolic
+//! bell), and the quasi-1D helpers the honesty surface needs (separation
+//! threshold, ideal C_f).
 //!
 //! All wall geometry here is non-dimensional (units of throat radius); SI
-//! appears only in `CaseParams` and the atmosphere.
+//! appears only in `CaseParams` and the atmosphere. `cfd_geom` speaks SI
+//! metres, so `nozzle_contour` converts through `r_throat_m` at the boundary.
 
 use std::sync::Arc;
 
 use cfd_contract::{Ambient, Chamber, GasModel, Grid, Numerics, RefScales, SolidField, SolveSetup};
+use cfd_geom::NozzleSpec;
 
 /// The HISTORIC compact demo domain from docs/physics-reference.md §8:
 /// 46.4 x 10 r_t at 20 radial cells per throat radius -> the interactive
@@ -113,6 +115,43 @@ impl DomainPreset {
     }
 }
 
+/// Diverging-section shape selector. The UI-side twin of
+/// `cfd_geom::ContourKind` — the cone half-angle and the bell LENGTH are
+/// carried by the case (`CONE_HALF_ANGLE_DEG`, `CaseParams::bell_percent`)
+/// and joined back on in `nozzle_contour`; only the measured wall angles,
+/// which belong to one engine and to no table, ride on the variant.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ContourKind {
+    Conical,
+    /// theta_n, theta_e interpolated from the digitised Rao table.
+    ParabolicBell,
+    /// theta_n, theta_e straight from published geometry — for hardware the
+    /// Rao table cannot represent. `bell_percent` still carries the length.
+    MeasuredBell { theta_n_deg: f64, theta_e_deg: f64 },
+}
+
+impl ContourKind {
+    pub fn is_bell(self) -> bool {
+        !matches!(self, ContourKind::Conical)
+    }
+}
+
+/// The §10 parametric family shared by both contours: 30° converging cone,
+/// contraction ratio 4, 1.5 r_t upstream arc, 0.382 r_t downstream arc, and
+/// the 15° cone half-angle the demo case and the bell's length reference use.
+pub const CONE_HALF_ANGLE_DEG: f64 = 15.0;
+const CONTRACTION_RATIO: f64 = 4.0;
+const CONVERGE_HALF_ANGLE_DEG: f64 = 30.0;
+const THROAT_ARC_UP: f64 = 1.5;
+/// Downstream throat arc of the §10 family. Per-case since the direct-angle
+/// path exists: measured hardware comes with its own arc (Raptor 2, 0.300 r_t).
+pub const THROAT_ARC_DOWN: f64 = 0.382;
+/// Polyline density for the generated wall. At the coarsest preset grid the
+/// longest divergent section (Merlin Vac, ε = 165) spans ~230 axial cells;
+/// 256 samples keeps the piecewise-linear wall below the cell scale
+/// everywhere while the exact-fraction rasterizer stays cheap.
+const CONTOUR_SAMPLES: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CaseParams {
     pub p0_pa: f64,
@@ -121,6 +160,14 @@ pub struct CaseParams {
     pub r_specific_si: f64,
     pub r_throat_m: f64,
     pub area_ratio: f64,
+    /// Diverging-section shape; `bell_percent` participates only for the bell
+    /// kinds (length as a fraction of the Huzel–Huang 15° reference cone; the
+    /// Rao table itself is digitised over 0.6–0.9).
+    pub contour_kind: ContourKind,
+    pub bell_percent: f64,
+    /// Downstream throat-arc radius in r_t. The §10 family value is 0.382;
+    /// measured geometry brings its own (Raptor 2: 0.300).
+    pub throat_arc_down: f64,
     pub altitude_m: f64,
     /// Labelled vacuum mode: back pressure fixed at `VACUUM_P_FRAC * p0`,
     /// ignoring `altitude_m`. The region above the 58 km slider cap.
@@ -147,6 +194,11 @@ impl Default for CaseParams {
             r_specific_si: 378.0,
             r_throat_m: 0.05,
             area_ratio: 8.0,
+            // The demo case is the §10 15° cone; the bell percent is the
+            // value a switch to ParabolicBell would use.
+            contour_kind: ContourKind::Conical,
+            bell_percent: 0.8,
+            throat_arc_down: THROAT_ARC_DOWN,
             altitude_m: 0.0,
             vacuum: false,
             lz_rt: LZ_DEFAULT,
@@ -297,6 +349,20 @@ pub struct EnginePreset {
     pub t0_k: f64,
     pub mw_g_mol: f64,
     pub cells_per_rt: f64,
+    /// Diverging-section shape. Every real engine flies a bell; the demo/
+    /// custom case keeps the 15° cone.
+    pub contour_kind: ContourKind,
+    /// Bell length as a fraction of the Huzel–Huang 15° reference cone (the
+    /// Rao table is digitised over 0.6–0.9).
+    pub bell_percent: f64,
+    /// Downstream throat arc in r_t: the §10 family's 0.382 unless the
+    /// engine's own is published (Raptor 2, 0.300).
+    pub throat_arc_down: f64,
+    /// Where the contour parameters come from, surfaced in the tooltip
+    /// exactly like γ/T₀/MW are labelled propellant-class values:
+    /// "published" (RS-25 only), "measured geometry" (Raptor 2, whose wall
+    /// angles bypass the table entirely), or "design-class estimate".
+    pub bell_source: &'static str,
     /// Shown as "(slow)" in the selector: run time ≈12× Merlin 1D.
     pub slow: bool,
     /// Preset-specific honesty note, surfaced as a tooltip.
@@ -314,6 +380,10 @@ pub const PRESETS: [EnginePreset; 6] = [
         t0_k: 3600.0,
         mw_g_mol: 21.9,
         cells_per_rt: CELLS_PER_RT,
+        contour_kind: ContourKind::ParabolicBell,
+        throat_arc_down: THROAT_ARC_DOWN,
+        bell_percent: 0.78,
+        bell_source: "design-class estimate",
         slow: false,
         note: "",
     },
@@ -331,6 +401,10 @@ pub const PRESETS: [EnginePreset; 6] = [
         t0_k: 3600.0,
         mw_g_mol: 21.9,
         cells_per_rt: CELLS_PER_RT,
+        contour_kind: ContourKind::ParabolicBell,
+        throat_arc_down: THROAT_ARC_DOWN,
+        bell_percent: 0.75,
+        bell_source: "design-class estimate",
         slow: false,
         note: "Sits 3% inside the separation threshold at sea level by design \
                — γ is hard-coded at 1.24 so the marginal warning is a \
@@ -346,8 +420,26 @@ pub const PRESETS: [EnginePreset; 6] = [
         t0_k: 3600.0,
         mw_g_mol: 22.0,
         cells_per_rt: CELLS_PER_RT,
+        // Raptor 2 does NOT go through the Rao table. Its published geometry
+        // (FAA Analysis Report 2019-001b Table 1) is θ_n 32.0°, θ_e 6.0° on a
+        // 0.300 R_t downstream throat arc — not the 0.382 R_t of the Rao/TOP
+        // construction. At ε = 34.3 the table reproduces θ_n around a 75–76%
+        // bell but its θ_e is ~3.5° off there, and no bell percent satisfies
+        // both (a 6° exit sits on the 90% row): the table cannot represent
+        // this engine, so the wall angles are taken directly. `bell_percent`
+        // stays as the LENGTH (two angles and an exit radius do not fix one).
+        // Measured in `rao_table_cannot_represent_raptor2`; NOT a γ effect.
+        contour_kind: ContourKind::MeasuredBell {
+            theta_n_deg: 32.0,
+            theta_e_deg: 6.0,
+        },
+        throat_arc_down: 0.300,
+        bell_percent: 0.76,
+        bell_source: "measured geometry (FAA AR 2019-001b Table 1)",
         slow: false,
-        note: "",
+        note: "Wall angles are the published θ_n 32.0° / θ_e 6.0° on a \
+               0.300 R_t throat arc, not a Rao-table bell — no bell percent \
+               reproduces both angles. The 76% is the length only.",
     },
     EnginePreset {
         name: "AJ10-190",
@@ -359,6 +451,10 @@ pub const PRESETS: [EnginePreset; 6] = [
         t0_k: 3200.0,
         mw_g_mol: 21.5,
         cells_per_rt: CELLS_PER_RT,
+        contour_kind: ContourKind::ParabolicBell,
+        throat_arc_down: THROAT_ARC_DOWN,
+        bell_percent: 0.78,
+        bell_source: "design-class estimate",
         slow: false,
         note: "",
     },
@@ -372,6 +468,10 @@ pub const PRESETS: [EnginePreset; 6] = [
         t0_k: 3600.0,
         mw_g_mol: 13.5,
         cells_per_rt: CELLS_PER_RT,
+        contour_kind: ContourKind::ParabolicBell,
+        throat_arc_down: THROAT_ARC_DOWN,
+        bell_percent: 0.80,
+        bell_source: "published",
         slow: false,
         note: "Shows a separation warning at sea level: a known conservatism \
                of the criterion, not an error — the real engine runs on the \
@@ -390,10 +490,16 @@ pub const PRESETS: [EnginePreset; 6] = [
         // ε = 165 domain would run ~34× the Merlin 1D case. 14 cells/r_t
         // keeps it usable; the report's N_throat badge goes amber, honestly.
         cells_per_rt: 14.0,
+        contour_kind: ContourKind::ParabolicBell,
+        throat_arc_down: THROAT_ARC_DOWN,
+        bell_percent: 0.75,
+        bell_source: "design-class estimate",
         slow: true,
         note: "The costliest preset by far even at the reduced 14 cells per \
                throat radius (the mass-flow badge goes amber for that reason) \
-               — see the run-time multiple above.",
+               — see the run-time multiple above. ε = 165 is also past the end \
+               of the digitised Rao table (ε ≤ 100): the bell angles clamp to \
+               the ε = 100 row — see the amber flag.",
     },
 ];
 
@@ -410,6 +516,9 @@ impl EnginePreset {
             r_specific_si: R_UNIVERSAL_SI / self.mw_g_mol,
             r_throat_m: self.r_throat_m,
             area_ratio: self.area_ratio,
+            contour_kind: self.contour_kind,
+            bell_percent: self.bell_percent,
+            throat_arc_down: self.throat_arc_down,
             altitude_m,
             vacuum,
             lz_rt,
@@ -425,7 +534,11 @@ impl EnginePreset {
     pub fn relative_cost(&self) -> f64 {
         let cost = |e: &EnginePreset| {
             let c = e.case(0.0, false);
-            let est = estimate_cost(&c, &conical_contour(c.area_ratio), None);
+            // The preset's OWN wall, not the legacy cone: the grading rule
+            // reads its held span from the rasterized geometry, and a bell is
+            // shorter than the cone at the same area ratio, so costing the
+            // cone prices a nozzle this preset never solves.
+            let est = estimate_cost(&c, &nozzle_contour(&c).points, None);
             est.steps * est.cells as f64
         };
         cost(self) / cost(&PRESETS[0])
@@ -502,12 +615,80 @@ pub fn separation_altitude_m(p: &CaseParams) -> Option<f64> {
     Some(0.5 * (lo + hi))
 }
 
-/// 15° conical nozzle contour per docs/physics-reference.md §10, as a sparse
+/// A generated wall together with what it ACTUALLY is. The kind is not the
+/// request: when `generate_contour` rejects a spec the points are the fallback
+/// cone, and `kind` says `Conical` so the status line cannot go on claiming a
+/// bell over a cone. `fallback` carries the rejection message for the UI —
+/// `eprintln!` is invisible in a windowed app.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeneratedWall {
+    pub points: Vec<[f64; 2]>,
+    pub kind: ContourKind,
+    pub fallback: Option<String>,
+}
+
+/// The wall contour for this case as a polyline (z, r) in r_t units, from
+/// `cfd_geom::generate_contour` — the §10 15° cone, the Rao parabolic bell, or
+/// a measured-angle bell per `contour_kind`. `cfd_geom` speaks SI metres, so
+/// the spec is built with `r_throat_m` and the result divided back out.
+///
+/// Never panics: `generate_contour` validates its spec and a rejected one
+/// (hand-set params outside the bell table, degenerate area ratio) falls back
+/// to the legacy 15° cone, which is total. The vanished bell is visible; a
+/// crashed app is not — but only if the caller reports `kind`, not the request.
+pub fn nozzle_contour(p: &CaseParams) -> GeneratedWall {
+    let contour = match p.contour_kind {
+        ContourKind::Conical => cfd_geom::ContourKind::Conical {
+            half_angle_deg: CONE_HALF_ANGLE_DEG,
+        },
+        ContourKind::ParabolicBell => cfd_geom::ContourKind::ParabolicBell {
+            bell_percent: p.bell_percent,
+        },
+        ContourKind::MeasuredBell {
+            theta_n_deg,
+            theta_e_deg,
+        } => cfd_geom::ContourKind::DirectBell {
+            theta_n_deg,
+            theta_e_deg,
+            length_fraction: p.bell_percent,
+        },
+    };
+    let spec = NozzleSpec {
+        throat_radius_m: p.r_throat_m,
+        area_ratio: p.area_ratio,
+        contraction_ratio: CONTRACTION_RATIO,
+        converge_half_angle_deg: CONVERGE_HALF_ANGLE_DEG,
+        throat_arc_up: THROAT_ARC_UP,
+        throat_arc_down: p.throat_arc_down,
+        contour,
+    };
+    match cfd_geom::generate_contour(&spec, CONTOUR_SAMPLES) {
+        Ok(profile) => {
+            let inv = 1.0 / p.r_throat_m;
+            GeneratedWall {
+                points: profile.points.iter().map(|q| [q[0] * inv, q[1] * inv]).collect(),
+                kind: p.contour_kind,
+                fallback: None,
+            }
+        }
+        Err(e) => GeneratedWall {
+            points: fallback_cone(p.area_ratio),
+            kind: ContourKind::Conical,
+            fallback: Some(e.to_string()),
+        },
+    }
+}
+
+/// Legacy 15° conical contour per docs/physics-reference.md §10, as a sparse
 /// control polyline (z, r) in r_t units: chamber wall at r = 2 (contraction
 /// ratio 4), 30° converging cone, 1.5 r_t upstream arc, 0.382 r_t downstream
-/// arc, straight cone to r_e = sqrt(area_ratio). Sparse on purpose — these
-/// points double as the editor's control points.
-pub fn conical_contour(area_ratio: f64) -> Vec<[f64; 2]> {
+/// arc, straight cone to r_e = sqrt(area_ratio).
+///
+/// This was the app's only wall generator until `nozzle_contour` above wired
+/// in `cfd_geom::generate_contour`; it survives as (a) the infallible
+/// fallback for a rejected `NozzleSpec`, and (b) the independent reference
+/// the cone-equivalence test compares the new path against.
+fn fallback_cone(area_ratio: f64) -> Vec<[f64; 2]> {
     let alpha = 15f64.to_radians();
     let beta = 30f64.to_radians();
     let (r1, r2, r_c) = (1.5, 0.382, 2.0);
@@ -536,6 +717,14 @@ pub fn conical_contour(area_ratio: f64) -> Vec<[f64; 2]> {
     pts.push([za + 0.5 * l, ra + 0.5 * l * alpha.tan()]);
     pts.push([za + l, r_e]);
     pts
+}
+
+/// Test fixture: the legacy sparse cone under its historic name, so the
+/// existing tests (and the cone-equivalence test) keep an independent
+/// reference that does not go through `cfd_geom`.
+#[cfg(test)]
+pub fn conical_contour(area_ratio: f64) -> Vec<[f64; 2]> {
+    fallback_cone(area_ratio)
 }
 
 /// Wall radius at axial station z by linear interpolation, `None` outside the
@@ -836,21 +1025,40 @@ mod tests {
         // cost rises with area ratio among the full-resolution presets, and
         // Merlin Vac is the costliest.
         let costs: Vec<f64> = PRESETS.iter().map(|p| p.relative_cost()).collect();
+        println!("relative costs: {costs:?}");
         assert!((costs[0] - 1.0).abs() < 1e-12);
-        assert!((costs[1] - 1.0).abs() < 1e-12, "F-1 shares Merlin's domain");
+        // F-1 shares Merlin 1D's area ratio and therefore its domain. The
+        // costs are no longer bit-equal because the estimate now prices each
+        // preset's OWN wall (a 75% bell against Merlin's 78%), and the grading
+        // rule reads its held span from that wall — a few percent, not a tier.
+        assert!(
+            (costs[1] - costs[0]).abs() < 0.05,
+            "F-1 shares Merlin's domain: {costs:?}"
+        );
         assert!(costs[2] > 1.5 && costs[3] > costs[2] && costs[4] > costs[3],
                 "costs not increasing with area ratio: {costs:?}");
         assert!(costs[5] > costs[4] && costs[5] > 5.0, "Merlin Vac not costliest: {costs:?}");
         for p in PRESETS.iter() {
             let c = p.case(0.0, false);
-            let pts = conical_contour(c.area_ratio);
-            let end = pts.last().unwrap();
-            assert!(end[0] < c.lz_rt, "{}: nozzle longer than domain", p.name);
-            assert!(
-                end[1] + 0.4 < c.lr_rt, // bell exit clears the domain top with margin
-                "{}: bell exit outside domain",
-                p.name
-            );
+            // Both the preset's bell and the fallback cone must fit: the
+            // cone is what a rejected spec degrades to, so it may not
+            // overrun the domain either. The cone is the longer of the two.
+            assert!(c.contour_kind.is_bell(), "{}: preset is not a bell", p.name);
+            let bell = nozzle_contour(&c);
+            assert_eq!(bell.fallback, None, "{}: fell back to the cone", p.name);
+            for (which, pts) in [("bell", bell.points), ("cone", conical_contour(c.area_ratio))] {
+                let end = pts.last().unwrap();
+                assert!(
+                    end[0] < c.lz_rt,
+                    "{} ({which}): nozzle longer than domain",
+                    p.name
+                );
+                assert!(
+                    end[1] + 0.4 < c.lr_rt, // exit lip clears the domain top with margin
+                    "{} ({which}): exit outside domain",
+                    p.name
+                );
+            }
             // Ambient stays strictly above the positivity floor everywhere
             // on the slider, and in vacuum mode.
             for alt in [0.0, ALT_MAX_M] {
@@ -879,26 +1087,162 @@ mod tests {
         assert!((z_t - 4.13).abs() < 0.02, "throat at z = {z_t}");
     }
 
+    /// Rasterization of every wall the app can produce — the legacy cone
+    /// fixture AND the two bells, because no preset ships a cone and a
+    /// rasterizer test that only ever sees the cone tests a wall nobody runs.
+    /// The bells are the real preset walls (RS-25's table bell, Raptor 2's
+    /// measured-angle bell), each on its own preset grid.
     #[test]
     fn rasterized_throat_matches_the_contour() {
-        let g = base_grid(&CaseParams::default());
-        let pts = conical_contour(8.0);
-        let s = rasterize_wall(&pts, &g);
-        // Narrowest open radius across nozzle columns should be r_t = 1 +- dr.
-        let mut r_open_min = f64::INFINITY;
-        for iz in 0..g.nz {
-            let z = g.z_center(iz) as f64;
-            if wall_radius(&pts, z).is_none() {
-                continue;
+        let demo = CaseParams::default();
+        let rs25 = PRESETS.iter().find(|p| p.name == "RS-25").unwrap().case(0.0, false);
+        let raptor = PRESETS.iter().find(|p| p.name == "Raptor 2").unwrap().case(0.0, false);
+        let cases: [(&str, CaseParams, Vec<[f64; 2]>); 3] = [
+            ("legacy cone", demo, conical_contour(demo.area_ratio)),
+            ("RS-25 80% bell", rs25, nozzle_contour(&rs25).points),
+            ("Raptor 2 measured bell", raptor, nozzle_contour(&raptor).points),
+        ];
+        for (name, p, pts) in cases {
+            let g = base_grid(&p);
+            let s = rasterize_wall(&pts, &g);
+            // Narrowest open radius across nozzle columns should be r_t = 1 +- dr.
+            let mut r_open_min = f64::INFINITY;
+            for iz in 0..g.nz {
+                let z = g.z_center(iz) as f64;
+                if wall_radius(&pts, z).is_none() {
+                    continue;
+                }
+                if let Some(ir) = (0..g.nr).find(|&ir| s.is_solid(g.idx(iz, ir))) {
+                    r_open_min = r_open_min.min(g.r_face(ir) as f64);
+                }
             }
-            if let Some(ir) = (0..g.nr).find(|&ir| s.is_solid(g.idx(iz, ir))) {
-                r_open_min = r_open_min.min(g.r_face(ir) as f64);
-            }
+            assert!(
+                (r_open_min - 1.0).abs() <= g.dr(0) as f64,
+                "{name}: throat {r_open_min}"
+            );
+            // The wall is actually there: solid cells exist, and the exit lip
+            // column is open out to the exit radius (a bell that rasterized as
+            // a plug would still pass the throat check above).
+            assert!(
+                s.fraction.iter().any(|&f| f > 0.0),
+                "{name}: nothing rasterized"
+            );
+            let z_exit = pts.last().unwrap()[0];
+            let iz = (0..g.nz)
+                .rev()
+                .find(|&iz| (g.z_center(iz) as f64) < z_exit)
+                .unwrap();
+            let open = (0..g.nr).find(|&ir| s.is_solid(g.idx(iz, ir))).unwrap();
+            assert!(
+                (g.r_face(open) as f64 - p.area_ratio.sqrt()).abs() <= 2.0 * g.dr(0) as f64,
+                "{name}: exit-plane open radius {} vs r_e {}",
+                g.r_face(open),
+                p.area_ratio.sqrt()
+            );
         }
+    }
+
+    /// The grading rule reads its hold region from the RASTERIZED wall, so it
+    /// has to be exercised on a bell: a bell is shorter than the cone and its
+    /// exit lip sits at a different station, which is exactly what sets the
+    /// held span. Both bell kinds, at their preset domains.
+    #[test]
+    fn graded_grid_holds_base_across_a_preset_bell() {
+        for name in ["RS-25", "Raptor 2"] {
+            let pre = PRESETS.iter().find(|p| p.name == name).unwrap();
+            let p = pre.case(0.0, false);
+            let wall = nozzle_contour(&p);
+            assert_eq!(wall.fallback, None, "{name}: fell back to the cone");
+            assert!(wall.kind.is_bell());
+            let g = graded_grid(&p, &wall.points);
+            let (lz, lr) = (p.lz_rt, p.lr_rt);
+            assert!((g.lz() - lz).abs() < 1e-6 && (g.lr() - lr).abs() < 1e-6, "{name}: extents");
+            let dr = 1.0 / p.cells_per_rt;
+            let dz = p.dz_over_dr * dr;
+            // Finest spacing unchanged (dt is set by it) — to within the
+            // wall-fitted hold's integer-cell rounding, which can land base a
+            // fraction of a percent low (RS-25: 0.049994 against 0.05). That
+            // direction only ever shrinks dt, so dt-neutrality is preserved.
+            assert!(
+                g.dr_min() as f64 <= dr + 1e-9 && g.dr_min() as f64 > dr * 0.999,
+                "{name}: dr_min {} vs base {dr}",
+                g.dr_min()
+            );
+            assert!((g.dz_min() as f64 - dz).abs() < 1e-3, "{name}: dz_min {}", g.dz_min());
+            // … base resolution held across the whole bell in z. (Only in z:
+            // `rasterize_wall` closes the solid past the top of the domain, so
+            // the r solid span is the full height and the r-hold assert would
+            // be unfalsifiable. `dr_min` above is the r-axis check that bites.)
+            let z_end = wall.points.last().unwrap()[0];
+            for iz in 0..g.nz {
+                if g.z_edges()[iz + 1] <= z_end {
+                    assert!((g.dz(iz) as f64 - dz).abs() < 1e-3, "{name}: dz({iz}) = {}", g.dz(iz));
+                }
+            }
+            // … and the graded tail actually saves cells against uniform.
+            let uniform = (lz / dz).round() as usize * (lr / dr).round() as usize;
+            assert!(g.len() < uniform, "{name}: graded {} vs uniform {uniform}", g.len());
+            // The bell rasterizes onto the GRADED grid — the grid the solver
+            // actually runs on, not the base grid — with an open throat of the
+            // right radius. Non-emptiness alone would pass for a solid plug,
+            // which is exactly what a mis-wound polygon produces.
+            let s = rasterize_wall(&wall.points, &g);
+            assert!(s.fraction.iter().any(|&f| f > 0.0), "{name}: nothing rasterized");
+            assert!(s.fraction.iter().any(|&f| f < 1.0), "{name}: everything is solid");
+            let mut r_open_min = f64::INFINITY;
+            for iz in 0..g.nz {
+                if (g.z_center(iz) as f64) > z_end {
+                    break;
+                }
+                if let Some(ir) = (0..g.nr).find(|&ir| s.is_solid(g.idx(iz, ir))) {
+                    r_open_min = r_open_min.min(g.r_face(ir) as f64);
+                }
+            }
+            assert!(
+                (r_open_min - 1.0).abs() <= g.dr_min() as f64,
+                "{name}: graded-grid throat {r_open_min}"
+            );
+        }
+    }
+
+    /// The fallback path itself, which no reachable slider setting produces
+    /// (every shipped preset and every ε on the slider generates cleanly) and
+    /// which therefore only a test can exercise: a rejected spec must come
+    /// back labelled as the cone it actually drew, carrying the reason. This
+    /// is the assertion the old `Vec<[f64; 2]>` return type could not make —
+    /// the status line went on saying "80% bell" over the fallback cone.
+    #[test]
+    fn a_rejected_spec_reports_the_cone_it_actually_drew() {
+        // Bell percent below the digitised table: rejected by NozzleSpec::validate.
+        let p = CaseParams {
+            contour_kind: ContourKind::ParabolicBell,
+            bell_percent: 0.5,
+            ..CaseParams::default()
+        };
+        let w = nozzle_contour(&p);
+        assert_eq!(w.kind, ContourKind::Conical, "produced kind must be what was drawn");
+        assert!(w.fallback.is_some(), "the reason must reach the caller");
         assert!(
-            (r_open_min - 1.0).abs() <= g.dr(0) as f64,
-            "throat {r_open_min}"
+            w.fallback.as_deref().unwrap().contains("bell_percent"),
+            "reason should name the offending parameter: {:?}",
+            w.fallback
         );
+        assert_eq!(w.points, conical_contour(p.area_ratio), "must BE the fallback cone");
+        // Same for a measured-angle bell whose angles cannot close a contour.
+        let p = CaseParams {
+            contour_kind: ContourKind::MeasuredBell {
+                theta_n_deg: 6.0,
+                theta_e_deg: 32.0,
+            },
+            ..CaseParams::default()
+        };
+        let w = nozzle_contour(&p);
+        assert_eq!(w.kind, ContourKind::Conical);
+        assert!(w.fallback.is_some());
+        // And a spec that IS accepted must never claim a fallback.
+        let w = nozzle_contour(&CaseParams::default());
+        assert_eq!(w.kind, ContourKind::Conical);
+        assert_eq!(w.fallback, None);
     }
 
     #[test]
@@ -928,6 +1272,259 @@ mod tests {
             "p_e {}",
             pr * 5.0e6
         );
+    }
+}
+
+/// The contour-generator swap: cfd_geom::generate_contour replacing the
+/// legacy in-crate cone. Results go to docs/results/contour-<machine>.json
+/// (CLAUDE.md: results get committed, not reported in chat).
+#[cfg(test)]
+mod contour_swap {
+    use super::*;
+
+    const SUITE: &str = "contour";
+
+    /// Wall slope of the polyline's last segment, as an angle in degrees.
+    fn exit_angle_deg(pts: &[[f64; 2]]) -> f64 {
+        let n = pts.len();
+        let (a, b) = (pts[n - 2], pts[n - 1]);
+        ((b[1] - a[1]) / (b[0] - a[0])).atan().to_degrees()
+    }
+
+    /// Steepest wall angle downstream of the throat, in degrees — θ_n for a
+    /// bell, which peaks exactly at the throat-arc/Bézier junction. Central
+    /// differences: the junction vertex straddles two pieces that are both
+    /// tangent to θ_n there, so the chord through its neighbours recovers the
+    /// angle to second order (a one-sided chord would read ~0.5° low).
+    fn max_wall_angle_deg(pts: &[[f64; 2]]) -> f64 {
+        let t = throat_index(pts);
+        (t + 1..pts.len() - 1)
+            .map(|i| {
+                let (a, b) = (pts[i - 1], pts[i + 1]);
+                ((b[1] - a[1]) / (b[0] - a[0])).atan().to_degrees()
+            })
+            .fold(f64::NEG_INFINITY, f64::max)
+    }
+
+    /// Index of the throat (minimum-radius) vertex.
+    fn throat_index(pts: &[[f64; 2]]) -> usize {
+        pts.iter()
+            .enumerate()
+            .min_by(|a, b| a.1[1].partial_cmp(&b.1[1]).unwrap())
+            .unwrap()
+            .0
+    }
+
+    /// The gate for everything else: the new path with `Conical` must BE the
+    /// old cone. Every vertex of the sparse legacy polyline is either an
+    /// exact sample point of the dense generated one (arc endpoints and
+    /// midpoints land on the shared φ-grid) or lies on one of its straight
+    /// segments, so linear interpolation on the new polyline must reproduce
+    /// the old vertices to float roundoff. 1e-9 r_t is ~5 decades above
+    /// roundoff and ~7 below a cell.
+    #[test]
+    fn cone_equivalence_new_path_vs_legacy() {
+        let mut worst = 0.0f64;
+        // Every shipped preset's (ε, r_t), read from PRESETS rather than
+        // copied — a test that hard-codes a preset's numbers stops testing the
+        // preset the day it changes — plus the demo case and the ε slider's
+        // bottom stop.
+        let settings: Vec<(f64, f64)> = [(2.0, 0.05), (8.0, 0.05)]
+            .into_iter()
+            .chain(PRESETS.iter().map(|p| (p.area_ratio, p.r_throat_m)))
+            .collect();
+        for (eps, rt) in settings {
+            let p = CaseParams {
+                area_ratio: eps,
+                r_throat_m: rt,
+                contour_kind: ContourKind::Conical,
+                ..CaseParams::default()
+            };
+            let new = nozzle_contour(&p).points;
+            let old = conical_contour(eps);
+            // Same span in z…
+            worst = worst.max((new[0][0] - old[0][0]).abs());
+            let (ne, oe) = (new.last().unwrap(), old.last().unwrap());
+            worst = worst.max((ne[0] - oe[0]).abs()).max((ne[1] - oe[1]).abs());
+            // …and every legacy vertex on the new wall. The legacy exit z can
+            // land an ulp past the new polyline's (algebraically identical)
+            // exit z, where wall_radius returns None — clamp into the new
+            // span before sampling. Nothing is hidden: the endpoint z's were
+            // compared against the same tolerance above.
+            let (z_lo, z_hi) = (new[0][0], new.last().unwrap()[0]);
+            for q in &old {
+                let r = wall_radius(&new, q[0].clamp(z_lo, z_hi))
+                    .expect("legacy vertex outside new wall");
+                worst = worst.max((r - q[1]).abs());
+            }
+        }
+        cfd_results::record_test(SUITE, cfd_results::TestResult {
+            id: "cone-equivalence".into(),
+            name: "generate_contour(Conical) vs legacy cone at eps 2, 8 and every preset".into(),
+            expected: "<= 1e-9".into(),
+            actual: worst.into(),
+            units: "max |dr| (r_t)".into(),
+            pass: worst <= 1e-9,
+        });
+        assert!(worst <= 1e-9, "worst deviation {worst:.3e} r_t");
+    }
+
+    /// First contact between the bell generator and published hardware:
+    /// RS-25, the one preset whose bell percent is actually published (80%).
+    /// Nozzle length 121 in on a 10.88 in throat diameter -> 11.12 diameters;
+    /// exit wall angle ≈ 7°.
+    #[test]
+    fn rs25_bell_matches_published_geometry() {
+        let pre = PRESETS.iter().find(|p| p.name == "RS-25").unwrap();
+        let c = pre.case(0.0, false);
+        let pts = nozzle_contour(&c).points;
+        let z_t = pts[throat_index(&pts)][0];
+        let len_dia = (pts.last().unwrap()[0] - z_t) / 2.0; // r_t -> throat diameters
+        let published_dia = 121.0 / 10.88; // 11.12
+        let len_err = (len_dia / published_dia - 1.0).abs();
+        cfd_results::record_test(SUITE, cfd_results::TestResult {
+            id: "rs25-bell-length".into(),
+            name: "RS-25 80% bell nozzle length vs published 121 in / 10.88 in".into(),
+            expected: "11.12 +/- 2%".into(),
+            actual: len_dia.into(),
+            units: "throat diameters".into(),
+            pass: len_err <= 0.02,
+        });
+        let exit_deg = exit_angle_deg(&pts);
+        cfd_results::record_test(SUITE, cfd_results::TestResult {
+            id: "rs25-bell-exit-angle".into(),
+            name: "RS-25 80% bell exit wall angle vs published ~7 deg".into(),
+            expected: "7 +/- 1".into(),
+            actual: exit_deg.into(),
+            units: "deg".into(),
+            pass: (exit_deg - 7.0).abs() <= 1.0,
+        });
+        assert!(len_err <= 0.02, "nozzle length {len_dia:.3} dia vs {published_dia:.3}");
+        assert!((exit_deg - 7.0).abs() <= 1.0, "exit angle {exit_deg:.2} deg");
+    }
+
+    /// Raptor 2 against its published geometry (FAA Analysis Report
+    /// 2019-001b Table 1: θ_n 32.0°, θ_e 6.0°, downstream throat arc
+    /// 0.300 R_t). Measured off the wall the APP actually builds — through
+    /// `nozzle_contour`, at the shipped preset, no hand-copied parameters —
+    /// because a test that calls `rao_angles` directly cannot tell you what
+    /// the app draws.
+    ///
+    /// Both angles are asserted now: Raptor 2 no longer goes through the Rao
+    /// table. `rao_table_cannot_represent_raptor2` below is the standing
+    /// record of why it must not.
+    #[test]
+    fn raptor2_bell_angles_vs_published() {
+        let pre = PRESETS.iter().find(|p| p.name == "Raptor 2").unwrap();
+        let wall = nozzle_contour(&pre.case(0.0, false));
+        assert_eq!(wall.fallback, None, "Raptor 2 fell back to the cone");
+        let (tn, te) = (
+            max_wall_angle_deg(&wall.points),
+            exit_angle_deg(&wall.points),
+        );
+        for (id, name, actual, want) in [
+            ("raptor2-theta-n", "Raptor 2 measured-geometry theta_n vs FAA AR 2019-001b 32.0 deg", tn, 32.0),
+            ("raptor2-theta-e", "Raptor 2 measured-geometry theta_e vs FAA AR 2019-001b 6.0 deg", te, 6.0),
+        ] {
+            cfd_results::record_test(SUITE, cfd_results::TestResult {
+                id: id.into(),
+                name: name.into(),
+                expected: format!("{want:.1} +/- 0.5").as_str().into(),
+                actual: actual.into(),
+                units: "deg".into(),
+                pass: (actual - want).abs() <= 0.5,
+            });
+        }
+        assert!((tn - 32.0).abs() <= 0.5, "theta_n {tn:.2} deg");
+        assert!((te - 6.0).abs() <= 0.5, "theta_e {te:.2} deg");
+    }
+
+    /// Why Raptor 2 bypasses the Rao table, kept as an executable record: at
+    /// ε = 34.3 NO bell percent in the digitised range reproduces both
+    /// published angles. θ_n alone is fine (75.6% lands 0.16° off), θ_e is
+    /// off by 3.47° there and only reaches 6° on the 90% row, where θ_n is
+    /// wrong by ~3°. Do not "fix" this by re-fitting a bell percent.
+    ///
+    /// Not a γ effect, and the note says so: Rao (1958) has γ barely moving
+    /// the contour at fixed length and area ratio, and the sign is inverted —
+    /// Raptor's γ 1.16 against the chart's ~1.23 makes the exit angle LARGER,
+    /// not smaller, by well under 0.7°. The gap is 3.47° and points the other
+    /// way; it is a contour-family mismatch, not a gas-property one.
+    #[test]
+    fn rao_table_cannot_represent_raptor2() {
+        let pre = PRESETS.iter().find(|p| p.name == "Raptor 2").unwrap();
+        // Sweep the whole digitised range: the percent that best satisfies
+        // BOTH angles (worst-of-the-two error), and the percent that matches
+        // theta_n alone — where theta_e is then free to be as wrong as it is.
+        let (mut best_bp, mut best_err) = (f64::NAN, f64::INFINITY);
+        let (mut tn_bp, mut tn_err, mut te_there) = (f64::NAN, f64::INFINITY, f64::NAN);
+        for k in 0..=300 {
+            let bp = 0.6 + 0.3 * k as f64 / 300.0;
+            let (tn, te) = cfd_geom::rao_angles(pre.area_ratio, bp);
+            if (tn - 32.0).abs().max((te - 6.0).abs()) < best_err {
+                best_err = (tn - 32.0).abs().max((te - 6.0).abs());
+                best_bp = bp;
+            }
+            if (tn - 32.0).abs() < tn_err {
+                tn_err = (tn - 32.0).abs();
+                tn_bp = bp;
+                te_there = te;
+            }
+        }
+        cfd_results::record_note(SUITE, "raptor2-rao-table-mismatch", &format!(
+            "Raptor 2 is NOT routed through the Rao table. Published geometry (FAA \
+             Analysis Report 2019-001b Table 1): theta_n 32.0 deg, theta_e 6.0 deg, \
+             downstream throat arc 0.300 R_t (the Rao/TOP construction's 0.382 R_t \
+             does not apply). At eps 34.3 the table matches theta_n at {tn_bp:.3} \
+             ({tn_err:.2} deg off) but theta_e is {:.2} deg off there, and the percent \
+             minimising the WORSE of the two angles ({best_bp:.3}) still misses by \
+             {best_err:.2} deg — no bell \
+             percent satisfies both, so the table cannot represent this engine. This \
+             is a contour-family mismatch, NOT a gamma effect: Rao (1958) states gamma \
+             barely moves the contour at fixed length and area ratio, and the sign is \
+             inverted (gamma 1.16 vs the chart's ~1.23 makes the exit angle larger, \
+             worth under 0.7 deg). The app now takes the two angles directly \
+             (ContourKind::DirectBell); 76% remains the LENGTH only.",
+            (te_there - 6.0).abs()));
+        assert!(
+            best_err > 1.0,
+            "a {best_bp:.3} bell reproduces both published angles to {best_err:.2} deg \
+             — the direct-angle path is no longer needed for Raptor 2"
+        );
+    }
+
+    /// Every preset's production wall is the bell (not the silent fallback
+    /// cone): the generator reports the bell kind it was asked for, the wall
+    /// is strictly shorter than the 15° cone at the same area ratio, and its
+    /// exit angle is well under 15°.
+    #[test]
+    fn presets_actually_get_bells() {
+        for pre in &PRESETS {
+            let c = pre.case(0.0, false);
+            let wall = nozzle_contour(&c);
+            // The kind PRODUCED, not the kind requested: a rejected spec
+            // silently returns the fallback cone, and this is the assert that
+            // catches it (the status line reads the same field).
+            assert_eq!(
+                wall.fallback, None,
+                "{}: contour generation fell back to the cone",
+                pre.name
+            );
+            assert!(wall.kind.is_bell(), "{}: produced {:?}", pre.name, wall.kind);
+            let bell = wall.points;
+            let cone = conical_contour(c.area_ratio);
+            assert!(
+                bell.last().unwrap()[0] < cone.last().unwrap()[0] - 1.0,
+                "{}: wall is not shorter than the cone — fallback engaged?",
+                pre.name
+            );
+            let exit_deg = exit_angle_deg(&bell);
+            assert!(
+                exit_deg < 12.0,
+                "{}: exit angle {exit_deg:.1} deg is not a bell",
+                pre.name
+            );
+        }
     }
 }
 
@@ -1176,6 +1773,323 @@ mod grading_bench {
     }
 }
 
+/// The payoff measurement for the contour swap: RS-25, 15° cone (what the app
+/// drew before) vs the published 80% bell (what it draws now), at sea level
+/// and at 20 km.
+#[cfg(test)]
+mod contour_before_after {
+    use super::*;
+    use cfd_contract::{Confidence, Solver};
+
+    /// Total steps per run. Long enough that the last half is many domain
+    /// flush times past the startup front.
+    const TOTAL_STEPS: u64 = 12_000;
+    /// THE DECLARED SETTLED WINDOW: the second half of every run, by rule,
+    /// not by hand-picking. Everything asserted here is a mean over it.
+    const WINDOW_START: u64 = TOTAL_STEPS / 2;
+    /// Report sampling cadence inside the whole run.
+    const SAMPLE_EVERY: u64 = 25;
+
+    #[derive(Clone, Copy)]
+    struct Sample {
+        step: u64,
+        time: f64,
+        residual: f64,
+        cf: f64,
+        mdot: f64,
+    }
+
+    struct Trace {
+        samples: Vec<Sample>,
+        /// The last StepInfo — residual and `converged` as the solver reports
+        /// them, not as the test wishes them to be.
+        info: cfd_contract::StepInfo,
+        confidence: Confidence,
+        cells: (usize, usize),
+    }
+
+    impl Trace {
+        fn window(&self) -> &[Sample] {
+            let k = self
+                .samples
+                .partition_point(|s| s.step < WINDOW_START);
+            &self.samples[k..]
+        }
+        /// Mean of `f` over a fraction of the settled window: (0.0, 0.5) is
+        /// its first half, (0.5, 1.0) its second, (0.0, 1.0) the whole.
+        fn mean(&self, lo: f64, hi: f64, f: impl Fn(&Sample) -> f64) -> f64 {
+            let w = self.window();
+            let (a, b) = ((w.len() as f64 * lo) as usize, (w.len() as f64 * hi) as usize);
+            // f64 accumulation, as every reduction in this build must be.
+            let acc: f64 = w[a..b].iter().map(&f).sum();
+            acc / (b - a) as f64
+        }
+        fn span(&self, f: impl Fn(&Sample) -> f64 + Copy) -> (f64, f64) {
+            self.window().iter().fold((f64::MAX, f64::MIN), |(lo, hi), s| {
+                (lo.min(f(s)), hi.max(f(s)))
+            })
+        }
+        fn window_time(&self) -> (f64, f64) {
+            let w = self.window();
+            (w[0].time, w[w.len() - 1].time)
+        }
+    }
+
+    /// Run one case for `TOTAL_STEPS`, sampling the report on the way. The
+    /// solver's own signals (`StepInfo::residual`, `.converged`, `.time`) are
+    /// carried out with the samples: what "settled" means here is measured,
+    /// not assumed.
+    fn run_traced(label: &str, c: &CaseParams, wall: &[[f64; 2]]) -> Trace {
+        let setup = make_setup(c, wall);
+        let (nz, nr) = (setup.grid.nz, setup.grid.nr);
+        let mut s = cfd_core::EulerSolver::new(setup).unwrap();
+        let mut samples = Vec::with_capacity((TOTAL_STEPS / SAMPLE_EVERY) as usize + 1);
+        let mut info = s.step().unwrap();
+        while info.step < TOTAL_STEPS {
+            info = s.step().unwrap();
+            if info.step % SAMPLE_EVERY == 0 {
+                let r = s.report();
+                samples.push(Sample {
+                    step: info.step,
+                    time: info.time,
+                    residual: info.residual,
+                    cf: r.thrust_coefficient,
+                    mdot: r.mass_flow_kg_s,
+                });
+            }
+            if info.step % 2000 == 0 {
+                println!(
+                    "  {label}: step {} | t {:.2} | residual {:.3e} | converged {}",
+                    info.step, info.time, info.residual, info.converged
+                );
+            }
+        }
+        let rep = s.report();
+        Trace {
+            samples,
+            info,
+            confidence: rep.confidence,
+            cells: (nz, nr),
+        }
+    }
+
+    /// Cone-vs-bell report comparison, ~25 min of solver time; run explicitly:
+    ///
+    ///     cargo test -p cfd-ui rs25_before_after -- --include-ignored --nocapture
+    ///
+    /// Two operating points, two roles:
+    ///
+    /// **Sea level** is the tasked report, and it is RECORDED, NOT ASSERTED.
+    /// RS-25 at sea level is overexpanded (p_e/p_a ≈ 0.21 at the preset's
+    /// γ = 1.20, under the 0.40 separation threshold) and a 30k-step probe
+    /// found no steady state for either contour: the shock system breathes in
+    /// and out of the divergent section (the §9 "shock inside the nozzle moves
+    /// slowly" exception, taken to its limit) and every exit-plane readout
+    /// oscillates with O(1) amplitude. "C_f rises with the bell" rests on the
+    /// divergence-factor argument, which assumes attached full flow — at sea
+    /// level it is untestable in this model, which is precisely what the §13
+    /// separation warning ("readouts are not valid in this regime") says.
+    ///
+    /// **20 km** (p_a ≈ 5.5 kPa, p_e/p_a ≈ 3.9 — attached, strongly
+    /// underexpanded) is where the claim is testable, and asserted: the cone's
+    /// 15° exit loses ~1.7% of axial momentum to divergence ((1+cos 15°)/2)
+    /// against the bell's ~7.3° exit (~0.4%), so C_f must rise.
+    ///
+    /// **What is asserted, and on what.** Neither contour CONVERGES: at 12k
+    /// steps both sit well above `RESIDUAL_CONVERGED` (1e-3) and every
+    /// `Report` carries `Confidence::NotConverged` — recorded, in the results
+    /// file, in those words. So nothing here is asserted on an instant. Every
+    /// asserted number is a mean over the DECLARED SETTLED WINDOW (the second
+    /// half of the run, steps 6k–12k), and the window is qualified by a
+    /// time-based steadiness check before the physics claim is read out of it:
+    /// the drift of the window mean between its own halves must be small
+    /// against the effect being claimed, and the residual must not be growing.
+    /// A single-instant read is exactly what this test used to do, and it
+    /// flipped sign before ~step 2000.
+    ///
+    /// COMPACT extents for all runs: these are exit-plane quantities, and the
+    /// plume tail past the lip does not move them — it only costs solver time.
+    /// The configurable-domain work order folded the plume extension into
+    /// `preset_domain`, so the compact sizing (§8: 3(√ε−1) + 20 long, 2.5√ε
+    /// high) is set explicitly here rather than selected by a tier.
+    /// Model-to-model comparison, not a pad prediction.
+    #[test]
+    #[ignore = "solver benchmark: ~25 min; run explicitly with --include-ignored"]
+    fn rs25_before_after() {
+        let pre = PRESETS.iter().find(|p| p.name == "RS-25").unwrap();
+        let mut c = pre.case(0.0, false);
+        let s = c.area_ratio.sqrt();
+        c.lz_rt = 3.0 * (s - 1.0) + 20.0;
+        c.lr_rt = (2.5 * s).max(10.0);
+        let walls = [
+            ("15 deg cone (before)", conical_contour(c.area_ratio)),
+            ("80% bell (after)", nozzle_contour(&c).points),
+        ];
+
+        // Sea level: record the tasked before/after, as window statistics of a
+        // limit cycle rather than a single instant — there is no steady state
+        // to snapshot.
+        for (setting, wall) in &walls {
+            let t = run_traced(setting, &c, wall);
+            let (t0, t1) = t.window_time();
+            let (cf_lo, cf_hi) = t.span(|s| s.cf);
+            let (m_lo, m_hi) = t.span(|s| s.mdot);
+            cfd_results::record_note("contour", &format!("rs25-sea-level-{setting}"), &format!(
+                "RS-25 sea level, {setting}: over the settled window (steps {WINDOW_START}-{TOTAL_STEPS}, \
+                 nd time {t0:.2}-{t1:.2}) mass flow {:.1} kg/s mean (range {m_lo:.1}-{m_hi:.1}), \
+                 C_f {:.4} mean (range {cf_lo:.4}-{cf_hi:.4}), residual {:.2e} at the end, \
+                 converged {}, confidence {:?} ({} x {} cells, Compact plume, floors {}). \
+                 THE WINDOW IS A LIMIT CYCLE, not a steady state — see the \
+                 rs25-sea-level-unsteady note.",
+                t.mean(0.0, 1.0, |s| s.mdot), t.mean(0.0, 1.0, |s| s.cf),
+                t.info.residual, t.info.converged, t.confidence,
+                t.cells.0, t.cells.1, t.info.floor_activations));
+            println!(
+                "sea level, {setting}: mdot {:.1} kg/s | C_f {:.4} (range {cf_lo:.4}-{cf_hi:.4}) \
+                 | residual {:.2e} | {:?}",
+                t.mean(0.0, 1.0, |s| s.mdot), t.mean(0.0, 1.0, |s| s.cf),
+                t.info.residual, t.confidence
+            );
+        }
+        cfd_results::record_note("contour", "rs25-sea-level-unsteady",
+            "RS-25 at sea level is overexpanded (p_e/p_a ~ 0.21 at the preset's gamma \
+             1.20 — quasi-1D p_e ~ 21.6 kPa against 101.3 kPa ambient, below the 0.40 \
+             separation threshold, the SS13 separation-warning regime) and has NO steady \
+             state in this inviscid model: a 30k-step probe of both contours shows the \
+             shock system breathing in and out of the nozzle, with exit-plane readouts \
+             oscillating over mdot 291-738 kg/s (cone) / 48-895 (bell), exit Mach \
+             0.58-2.97 / 0.77-3.59, C_f 1.41-1.86 / 1.43-1.79. The cone-vs-bell C_f \
+             comparison is therefore asserted at 20 km (attached flow), not at sea level.");
+
+        // 20 km: attached flow — the assertable comparison.
+        c.altitude_m = 20_000.0;
+        let mut tr = Vec::new();
+        for (setting, wall) in &walls {
+            let t = run_traced(setting, &c, wall);
+            let (t0, t1) = t.window_time();
+            let (cf_lo, cf_hi) = t.span(|s| s.cf);
+            cfd_results::record_note("contour", &format!("rs25-20km-{setting}"), &format!(
+                "RS-25 at 20 km, {setting}: over the settled window (steps {WINDOW_START}-{TOTAL_STEPS}, \
+                 nd time {t0:.2}-{t1:.2}) mass flow {:.1} kg/s mean, C_f {:.4} mean \
+                 (range {cf_lo:.4}-{cf_hi:.4}, half-window drift {:+.4}), residual {:.2e} \
+                 at the end ({:.0}x RESIDUAL_CONVERGED = 1e-3), converged {}, confidence \
+                 {:?} ({} x {} cells, Compact plume, floors {}).",
+                t.mean(0.0, 1.0, |s| s.mdot), t.mean(0.0, 1.0, |s| s.cf),
+                t.mean(0.5, 1.0, |s| s.cf) - t.mean(0.0, 0.5, |s| s.cf),
+                t.info.residual, t.info.residual / 1e-3, t.info.converged, t.confidence,
+                t.cells.0, t.cells.1, t.info.floor_activations));
+            println!(
+                "20 km, {setting}: mdot {:.1} kg/s | C_f {:.4} (range {cf_lo:.4}-{cf_hi:.4}) \
+                 | residual {:.2e} | converged {} | {:?}",
+                t.mean(0.0, 1.0, |s| s.mdot), t.mean(0.0, 1.0, |s| s.cf),
+                t.info.residual, t.info.converged, t.confidence
+            );
+            tr.push(t);
+        }
+        let (cone, bell) = (&tr[0], &tr[1]);
+
+        // ---- 1. Is the window steady enough to carry a mean? A REAL
+        // time-based check, from the solver's own signals: over the declared
+        // window the residual must not be growing, and the drift of the C_f
+        // mean between the window's two halves must be small against the
+        // effect being claimed. (The old "steadiness guard" compared two runs
+        // at ONE instant, which tests a choked-flow identity, not time.)
+        let d_cf = bell.mean(0.0, 1.0, |s| s.cf) - cone.mean(0.0, 1.0, |s| s.cf);
+        let drift = |t: &Trace| t.mean(0.5, 1.0, |s| s.cf) - t.mean(0.0, 0.5, |s| s.cf);
+        let drift_ratio = drift(cone).abs().max(drift(bell).abs()) / d_cf.abs();
+        let res_growth = |t: &Trace| {
+            t.mean(0.5, 1.0, |s| s.residual) / t.mean(0.0, 0.5, |s| s.residual)
+        };
+        let worst_growth = res_growth(cone).max(res_growth(bell));
+        cfd_results::record_test("contour", cfd_results::TestResult {
+            id: "rs25-cf-window-steady-20km".into(),
+            name: format!(
+                "RS-25 20 km settled window (steps {WINDOW_START}-{TOTAL_STEPS}): C_f half-window \
+                 drift vs the claimed cone-to-bell rise"
+            ).as_str().into(),
+            expected: "<= 0.5".into(),
+            actual: drift_ratio.into(),
+            units: "|drift| / |delta C_f|".into(),
+            pass: drift_ratio <= 0.5,
+        });
+        cfd_results::record_test("contour", cfd_results::TestResult {
+            id: "rs25-residual-not-growing-20km".into(),
+            name: "RS-25 20 km settled window: residual second half / first half".into(),
+            expected: "<= 1.2".into(),
+            actual: worst_growth.into(),
+            units: "ratio".into(),
+            pass: worst_growth <= 1.2,
+        });
+        cfd_results::record_note("contour", "rs25-20km-not-converged", &format!(
+            "NEITHER 20 km run converges, and nothing here is asserted as if it did: at \
+             step {TOTAL_STEPS} the residual is {:.2e} (cone) / {:.2e} (bell) against \
+             RESIDUAL_CONVERGED = 1e-3 — {:.0}x / {:.0}x above it — StepInfo.converged is \
+             false for both and every Report carries Confidence::{:?}. What IS asserted \
+             is the mean over the declared settled window (steps {WINDOW_START}-{TOTAL_STEPS}, \
+             nd time {:.2}-{:.2}), qualified first by a time-based steadiness check on \
+             the same window: C_f half-window drift {:.4} / {:.4} (cone/bell) against a \
+             cone-to-bell difference of {d_cf:.4}, and residual second-half/first-half \
+             {:.2} / {:.2}. The single-instant version of this assert read +0.0218 at \
+             step 5511 and NEGATIVE before step ~2000 — it was a snapshot of a wobble.",
+            cone.info.residual, bell.info.residual,
+            cone.info.residual / 1e-3, bell.info.residual / 1e-3, cone.confidence,
+            cone.window_time().0, cone.window_time().1,
+            drift(cone), drift(bell), res_growth(cone), res_growth(bell)));
+
+        // ---- 2. Same throat, same chamber, same gas: the exit-plane mass
+        // flow must agree. A choked-flow identity, NOT a steadiness check —
+        // it holds at any instant of any choked flow, which is why it could
+        // never have guarded steadiness. On window means, not an instant.
+        let (m_cone, m_bell) = (cone.mean(0.0, 1.0, |s| s.mdot), bell.mean(0.0, 1.0, |s| s.mdot));
+        let mdot_mismatch = (m_bell / m_cone - 1.0).abs();
+        cfd_results::record_test("contour", cfd_results::TestResult {
+            id: "rs25-mdot-agree-20km".into(),
+            name: "RS-25 20 km mass flow, bell vs cone (same throat: choked-flow identity, \
+                   NOT a steadiness check)".into(),
+            expected: "<= 5% mismatch".into(),
+            actual: mdot_mismatch.into(),
+            units: "relative mismatch of window means".into(),
+            pass: mdot_mismatch <= 0.05,
+        });
+
+        // ---- 3. The physics claim, on the settled-window mean.
+        cfd_results::record_test("contour", cfd_results::TestResult {
+            id: "rs25-cf-rise-20km".into(),
+            name: format!(
+                "RS-25 20 km C_f, 80% bell vs 15 deg cone (mean over the declared settled \
+                 window, steps {WINDOW_START}-{TOTAL_STEPS})"
+            ).as_str().into(),
+            expected: "bell > cone".into(),
+            actual: d_cf.into(),
+            units: "delta C_f (window means)".into(),
+            pass: d_cf > 0.0,
+        });
+
+        assert!(
+            drift_ratio <= 0.5,
+            "the settled window is not settled: C_f half-window drift is {drift_ratio:.2} of \
+             the claimed rise (cone {:+.4}, bell {:+.4}, delta {d_cf:+.4}) — the window mean \
+             cannot carry the claim",
+            drift(cone), drift(bell)
+        );
+        assert!(
+            worst_growth <= 1.2,
+            "residual is growing across the settled window (worst second/first half ratio \
+             {worst_growth:.2})"
+        );
+        assert!(
+            mdot_mismatch <= 0.05,
+            "same-throat mass flow disagrees at 20 km: cone {m_cone} vs bell {m_bell} kg/s"
+        );
+        assert!(
+            d_cf > 0.0,
+            "C_f did not rise with the bell at 20 km: cone {:.4} vs bell {:.4} (window means)",
+            cone.mean(0.0, 1.0, |s| s.cf),
+            bell.mean(0.0, 1.0, |s| s.cf)
+        );
+    }
+}
+
 #[cfg(test)]
 mod floor_diag {
     use super::*;
@@ -1217,3 +2131,4 @@ mod floor_diag {
         println!("total floors {prev}");
     }
 }
+
