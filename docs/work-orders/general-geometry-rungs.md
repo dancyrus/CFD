@@ -387,7 +387,12 @@ rate. Both the magnitude (C_d = 0.71 at the one steady level, against an exact
 | G3 | subsonic pocket behind the stem | **pass** — min Mach 0.454 |
 | G0 | floors = 0, shock-free | **pass** |
 | G0 | flow is steady, so d'Alembert applies | **fail** — settles only at h = 0.1 |
-| G0 | C_d falls at first order or better | **not reached** — the premise fails first |
+| G0 | C_d falls at first order or better | **fail** — order 0.298, and the premise fails first |
+| G0 | C_d at h = 0.025 (exact 0) | **fail** — +5.25e-1, and not a measurement while unsteady |
+
+Recorded in `docs/results/ladder-intel-xeon-4c.json` at commit `f534ba7`:
+T0–T8 and the graded-grid guards all pass unchanged, and 7 of the 13 new
+assertions pass.
 
 Nothing was fixed in this session and no tolerance was weakened. T0–T8 were
 re-run unchanged as the contract-change rule requires; their results are in

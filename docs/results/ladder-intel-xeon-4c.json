@@ -1,6 +1,6 @@
 {
-  "commit": "a55ffa0cfee98cdf16324be831ae9a4390d95c02",
-  "timestamp": "2026-08-16T20:58:04Z",
+  "commit": "f534ba7802dd0db0c550faff490db965b0e5b038",
+  "timestamp": "2026-08-16T21:07:41Z",
   "machine": "intel-xeon-4c",
   "tests": [
     {"id":"T0-disk","name":"rasterizer disk area, R in {3..20} cells","expected":"<= 5e-3","actual":0.000000005412779598310543,"units":"worst relative area error","pass":true},
@@ -13,7 +13,7 @@
     {"id":"WB-graded","name":"well-balanced on a graded radial grid (growth 1.2)","expected":"<= 1e-7","actual":0,"units":"max abs drift","pass":true},
     {"id":"G0-steady","name":"d'Alembert negative control: the flow is steady, so the paradox applies (residual < 1e-3, physics-reference §9)","expected":"< 1e-3 at every level","actual":0.00574637199970374,"units":"normalized residual","pass":false},
     {"id":"G0-order","name":"d'Alembert negative control: order of C_d decay under refinement","expected":">= 1.0","actual":0.29830977284057775,"units":"convergence order","pass":false},
-    {"id":"G0-cd","name":"d'Alembert negative control: C_d at h = 0.025 (exact 0)","expected":0,"actual":0.5247398018637702,"units":"C_d","pass":true},
+    {"id":"G0-cd","name":"d'Alembert negative control: C_d at h = 0.025 (exact 0)","expected":0,"actual":0.5247398018637702,"units":"C_d","pass":false},
     {"id":"G1-bodies","name":"double wedge: disconnected solid components","expected":2,"actual":2,"units":"components","pass":true},
     {"id":"G1-p3","name":"double wedge: regular-reflection pressure ratio p3/p1","expected":"2.8032 +/- 13.1%","actual":3.840997816721598,"units":"p3/p1","pass":false},
     {"id":"G1-reflect","name":"double wedge: reflection point on the midplane","expected":"1.5212 +/- 0.063","actual":1.2843382749178474,"units":"z","pass":false},
