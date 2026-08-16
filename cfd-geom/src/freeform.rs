@@ -104,10 +104,29 @@ impl FreeformEditor {
         self.bounds
     }
 
-    /// Presets and the domain fields resize the box; the wall stays where it is
-    /// until the next edit touches it.
+    /// Presets and the domain fields resize the box. Points outside the new
+    /// box are pulled into it.
+    ///
+    /// Re-clamping moves the wall, which is unwelcome — but the alternative is
+    /// worse in a way the user cannot see. `rasterize_solid_polygon` clips
+    /// against the grid, so a point left outside the domain produces a SOLVED
+    /// wall that differs from the DRAWN one with nothing on screen saying so.
+    /// It also produced a spike: the first drag of any out-of-box point snapped
+    /// it to the new ceiling while its neighbours stayed where they were.
     pub fn set_bounds(&mut self, bounds: FreeformBounds) {
         self.bounds = bounds;
+        for p in &mut self.points {
+            p[0] = p[0].clamp(0.0, bounds.lz);
+            p[1] = bounds.clamp_r(p[1]);
+        }
+        // Clamping z can collapse neighbours; restore strict monotonicity by
+        // spreading any run that lands on the same station.
+        for i in 1..self.points.len() {
+            let lo = self.points[i - 1][0] + bounds.z_gap;
+            if self.points[i][0] < lo {
+                self.points[i][0] = lo;
+            }
+        }
     }
 
     /// Nearest control point within `tol`, or None.
@@ -282,6 +301,35 @@ mod tests {
         while e.remove(1) {}
         assert_eq!(e.points().len(), MIN_POINTS);
         assert!(e.to_profile().is_ok());
+    }
+
+    /// A domain that shrinks under a drawn wall must pull the wall in, and the
+    /// result must still be a valid profile — the rasterizer clips silently, so
+    /// a wall left hanging outside the box is solved as something other than
+    /// what is drawn.
+    #[test]
+    fn shrinking_the_domain_pulls_the_wall_inside_it() {
+        let mut e = FreeformEditor::new(
+            vec![[0.0, 8.3], [4.0, 1.0], [10.0, 8.3], [40.0, 8.3]],
+            FreeformBounds::for_domain(46.4, 27.0),
+        );
+        assert!(e.to_profile().is_ok());
+        e.set_bounds(FreeformBounds::for_domain(12.0, 5.0));
+        let b = e.bounds();
+        for p in e.points() {
+            assert!(p[0] >= 0.0 && p[0] <= b.lz + 1e-9, "z {} outside [0, {}]", p[0], b.lz);
+            assert!(
+                p[1] >= b.r_min - 1e-12 && p[1] <= b.lr - b.r_margin + 1e-12,
+                "r {} outside the box",
+                p[1]
+            );
+        }
+        // Two points were at z 10 and 40, both now clamped to lz = 12 — they
+        // must not have collapsed onto each other.
+        for w in e.points().windows(2) {
+            assert!(w[1][0] > w[0][0], "z collapsed at {:?}", w);
+        }
+        assert!(e.to_profile().is_ok(), "still a valid profile after the shrink");
     }
 
     #[test]

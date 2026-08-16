@@ -1818,14 +1818,23 @@ mod contour_swap {
 
     /// **THE STEP 2 GATE.** Two claims, both measured:
     ///
-    /// 1. The tessellation has CONVERGED at the default tolerance — halving it
-    ///    (and the turn cap) moves the rasterized throat area by under 0.1%.
-    ///    Throat area, not vertex positions, because that is the quantity every
-    ///    downstream number is built on: mass flow, c*, C_f.
+    /// 1. The tessellation has CONVERGED at the default settings — halving them
+    ///    moves the rasterized throat area by under 0.1%. Throat area, not
+    ///    vertex positions, because that is the quantity every downstream
+    ///    number is built on: mass flow, c*, C_f.
     /// 2. The polyline is much cheaper than the 256-sample constant it
     ///    replaces, at the same or better fidelity.
+    ///
+    /// **The two knobs are recorded separately.** Halving both at once is the
+    /// stronger test and it is what the gate asserts, but a single combined
+    /// number attributes the movement to whichever knob the reader assumes.
+    /// They are not comparable: at the default settings the throat arcs are
+    /// TURN-CAP bound and the Bezier is CHORD bound, so halving the turn cap
+    /// alone accounts for essentially all of the movement (Merlin Vac 0.0235%)
+    /// while halving the chord tolerance alone moves it ~17x less (0.0014%
+    /// worst, and exactly zero for Merlin Vac, whose throat arcs do not move).
     #[test]
-    fn halving_the_chord_tolerance_does_not_move_the_throat_area() {
+    fn halving_the_tessellation_settings_does_not_move_the_throat_area() {
         /// Rasterized open (fluid) area of the narrowest column, in r_t².
         fn throat_area(p: &CaseParams, pts: &[[f64; 2]]) -> f64 {
             let g = base_grid(p);
@@ -1849,15 +1858,15 @@ mod contour_swap {
             best
         }
 
-        let mut worst_rel = 0.0f64;
+        let (mut worst_both, mut worst_tol, mut worst_turn) = (0.0f64, 0.0f64, 0.0f64);
         let mut counts = Vec::new();
         for pre in &PRESETS {
             let c = pre.case(0.0, false);
             let curve = nozzle_curve(&c);
             let base = tessellation(&c);
-            let fine = cfd_geom::Tessellation {
-                chord_tol_m: base.chord_tol_m * 0.5,
-                max_turn_deg: base.max_turn_deg * 0.5,
+            let refine = |tol: f64, turn: f64| cfd_geom::Tessellation {
+                chord_tol_m: base.chord_tol_m * tol,
+                max_turn_deg: base.max_turn_deg * turn,
                 ..base
             };
             let inv = 1.0 / c.r_throat_m;
@@ -1870,41 +1879,78 @@ mod contour_swap {
                     .map(|q| [q[0] * inv, q[1] * inv])
                     .collect()
             };
-            let (pa, pb) = (pts(&base), pts(&fine));
-            let (aa, ab) = (throat_area(&c, &pa), throat_area(&c, &pb));
-            let rel = (ab / aa - 1.0).abs();
+            let pa = pts(&base);
+            let aa = throat_area(&c, &pa);
+            let rel = |t: &cfd_geom::Tessellation| (throat_area(&c, &pts(t)) / aa - 1.0).abs();
+            let (r_both, r_tol, r_turn) = (
+                rel(&refine(0.5, 0.5)),
+                rel(&refine(0.5, 1.0)),
+                rel(&refine(1.0, 0.5)),
+            );
             println!(
-                "{}: {} -> {} points on halving | throat area {aa:.6} -> {ab:.6} r_t^2 ({:.4}%)",
+                "{}: {} -> {} points | throat area {aa:.6} r_t^2 | moved {:.4}% (both), \
+                 {:.4}% (tolerance only), {:.4}% (turn cap only)",
                 pre.name,
                 pa.len(),
-                pb.len(),
-                100.0 * rel
+                pts(&refine(0.5, 0.5)).len(),
+                100.0 * r_both,
+                100.0 * r_tol,
+                100.0 * r_turn
             );
             counts.push((pre.name, pa.len()));
-            worst_rel = worst_rel.max(rel);
+            worst_both = worst_both.max(r_both);
+            worst_tol = worst_tol.max(r_tol);
+            worst_turn = worst_turn.max(r_turn);
             assert!(
                 pa.len() < 256,
-                "{}: {} points is no cheaper than the 256-sample constant",
+                "{}: {} points at its own resolution is no cheaper than the \
+                 256-sample constant",
                 pre.name,
                 pa.len()
             );
         }
-        cfd_results::record_test(SUITE, cfd_results::TestResult {
-            id: "tessellation-throat-area-convergence".into(),
-            name: "rasterized throat area change on halving the chord tolerance, every preset"
-                .into(),
-            expected: "< 0.1%".into(),
-            actual: (100.0 * worst_rel).into(),
-            units: "% of throat area".into(),
-            pass: worst_rel < 1e-3,
-        });
+        let worst_rel = worst_both;
+        for (id, name, v) in [
+            (
+                "tessellation-throat-area-convergence",
+                "rasterized throat area change on halving BOTH tessellation settings \
+                 (chord tolerance and turn cap), worst of every preset",
+                worst_both,
+            ),
+            (
+                "tessellation-throat-area-convergence-tolerance-only",
+                "…on halving the chord tolerance alone (the Bezier refines, the \
+                 turn-cap-bound throat arcs do not)",
+                worst_tol,
+            ),
+            (
+                "tessellation-throat-area-convergence-turn-cap-only",
+                "…on halving the turn cap alone (the throat arcs refine; this is \
+                 where essentially all of the combined movement comes from)",
+                worst_turn,
+            ),
+        ] {
+            cfd_results::record_test(SUITE, cfd_results::TestResult {
+                id: id.into(),
+                name: name.into(),
+                expected: "< 0.1%".into(),
+                actual: (100.0 * v).into(),
+                units: "% of throat area".into(),
+                pass: v < 1e-3,
+            });
+        }
         cfd_results::record_note(
             SUITE,
             "tessellation-point-counts",
             &format!(
                 "Adaptive tessellation at 1% of the base cell spacing, 2 deg turn cap, replacing \
-                 the fixed 256 samples: {}. The turn cap sets the count on the throat arcs and \
-                 the chord tolerance sets it on the Bezier.",
+                 the fixed 256 samples, at each preset's OWN resolution: {}. The turn cap \
+                 sets the count on the throat arcs and the chord tolerance sets it on the \
+                 Bezier. The comparison against 256 belongs to the default resolutions only: \
+                 the mesh sets the tolerance, so a user who raises the resolution to the \
+                 160 cells/r_t top of the range correctly gets a FINER wall than the old \
+                 constant (Merlin Vac 268 points, RS-25 215) — that is the adaptive rule \
+                 working, not a regression.",
                 counts
                     .iter()
                     .map(|(n, k)| format!("{n} {k}"))

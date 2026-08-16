@@ -504,6 +504,14 @@ impl Tessellation {
     /// sub-cell area fractions from the polyline, so chord error a hundredth of
     /// a cell is already invisible in the solid field, and paying for more is
     /// paying for nothing.
+    ///
+    /// **In practice this is a function of `dr_m` alone**, and correctly so.
+    /// The tolerance bounds a RADIAL gap, and a cell's relative area error from
+    /// that gap is `∫|Δr| dz / (dz·dr) = Δr/dr` — genuinely independent of dz.
+    /// `cfd-ui` also only ever passes `dz >= dr` (the aspect ratio's range
+    /// starts at 1.0), so `min` never selects dz on any reachable path. It is
+    /// kept as a floor rather than dropped: a caller with dz < dr gets a
+    /// needlessly fine wall, which is safe, instead of a coarse one.
     pub fn from_cell_size(dz_m: f64, dr_m: f64) -> Self {
         Tessellation {
             chord_tol_m: Self::TOL_FRACTION * dz_m.min(dr_m).abs().max(f64::MIN_POSITIVE),
