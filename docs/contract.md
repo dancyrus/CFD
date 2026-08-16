@@ -1,6 +1,6 @@
 # The Contract
 
-The single artifact that lets four Claude Code sessions build four crates at once without talking to each other. The coordinator session transcribes this into real files during the blocking phase. The parallel-build freeze is over; changes now follow the CLAUDE.md contract-change rule (mirror this file and the physics reference in the same commit, re-run the full acceptance ladder). Applied changes so far: the `P_MIN_ABS` raise, and the graded tensor-product grid (`docs/work-orders/grid-grading.md`) — `Grid` now carries arbitrary per-axis cell-edge lists, and the reconstruction/flux kernels carry stencil geometry and interface pressures.
+The single artifact that lets four Claude Code sessions build four crates at once without talking to each other. The coordinator session transcribes this into real files during the blocking phase. The parallel-build freeze is over; changes now follow the CLAUDE.md contract-change rule (mirror this file and the physics reference in the same commit, re-run the full acceptance ladder). Applied changes so far: the `P_MIN_ABS` raise; the graded tensor-product grid (`docs/work-orders/grid-grading.md`) — `Grid` now carries arbitrary per-axis cell-edge lists, and the reconstruction/flux kernels carry stencil geometry and interface pressures; and `cfd-core::forces` plus `EulerSolver::primitives` (`docs/work-orders/general-geometry-rungs.md`), which add body forces without touching any existing signature.
 
 Signatures below are the agreement. Sessions code against these names, and they are correct today — no session has to wait to find out what a type is called.
 
@@ -443,6 +443,62 @@ pub struct FlipLedger { pub mass: f64, pub energy: f64 }
 pub fn apply_geometry_change(u: &mut [Cons], g: &Grid, old: &SolidField,
                              new: &SolidField, gas: &GasModel,
                              ambient: &Ambient, ledger: &mut FlipLedger);
+```
+
+---
+
+## `cfd-core/src/forces.rs` — body forces on immersed geometry
+
+`Report` is an exit-plane control volume, which is the defensible definition
+for a nozzle and meaningless for an arbitrary drawn body — there is no lip, no
+throat and no exit plane. This module is the other half. Added by the
+general-geometry ladder work order (`docs/work-orders/general-geometry-rungs.md`);
+rung G2 asserts a wave-drag coefficient through it and rung G3 closes a
+momentum balance with it.
+
+```rust
+/// Axisymmetric forces carry the full 2*pi (whole rings); planar forces are
+/// per unit depth. Non-dimensional, like the rest of the solver.
+pub struct SurfaceForce { pub f_z: f64, pub f_r: f64, pub area: f64, pub faces: usize }
+impl SurfaceForce {
+    pub fn to_si(self, refs: &RefScales) -> SurfaceForce;
+    pub fn coefficient(component: f64, q: f64, a_ref: f64) -> f64;
+}
+
+/// Connected components of the solid field, 4-connected on interior indices —
+/// the same neighbourhood the fluxes use, so corner-touching blocks are two
+/// bodies exactly as no flux couples them. The sandbox may hold any number of
+/// disconnected bodies and a per-body force has to know which cells are which.
+pub struct Bodies { /* label per interior cell, cell counts */ }
+impl Bodies {
+    pub fn count(&self) -> usize;
+    pub fn label(&self, idx: usize) -> Option<usize>;   // None = fluid
+    pub fn cells(&self, body: usize) -> usize;
+    pub fn selector(&self, body: usize) -> impl Fn(usize) -> bool + '_;
+    pub fn by_size(&self) -> Vec<usize>;
+}
+pub fn label_bodies(solid: &SolidField) -> Bodies;
+
+/// Pressure force on the solid cells `body` selects, over their fluid/solid
+/// faces. `w` is interior-only canonical primitives, `grid.len()` long.
+pub fn surface_pressure_force(
+    w: &[Prim], solid: &SolidField, gas: &GasModel, geometry: Geometry,
+    body: impl Fn(usize) -> bool,
+) -> SurfaceForce;
+```
+
+The integrand is **not** a re-derived `p·n`: it is `physics::wall_flux_{z,r}`,
+the same oriented wall momentum flux the sweeps subtract from the adjacent
+fluid cell, area-weighted. Definition and sign convention:
+docs/physics-reference.md §11.
+
+`EulerSolver` gains the one accessor this needs:
+
+```rust
+/// Interior primitives in the SOLVER's units — non-dimensional, canonical
+/// [rho, u_z, u_r, p], grid.len() long, ghosts stripped. `Snapshot` is the SI
+/// display copy; this is the input `surface_pressure_force` wants.
+pub fn primitives(&self) -> Vec<Prim>;
 ```
 
 ---

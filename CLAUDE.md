@@ -19,6 +19,7 @@ which session you are, ask.
 |---|---|
 | `cfd-contract/` | coordinator — changeable, see the contract-change rule below |
 | `cfd-core/src/lib.rs`, `step.rs` | coordinator — changeable, see the contract-change rule below |
+| `cfd-core/src/forces.rs` | coordinator — body forces on immersed geometry, same contract-change rule |
 | `cfd-core/src/kernel.rs` | session A — sweeps, dt, rayon, positivity |
 | `cfd-core/src/physics.rs` | session B — axisym source, wall, BCs, sponge, init |
 | `cfd-geom/` | session C — contours, rasterizer, editor data model. No egui. |
@@ -36,7 +37,17 @@ now allowed, under two conditions, both non-negotiable:
    not commit unless it is green.
 
 Precedent: the `P_MIN_ABS` raise from 1e-8 to 1e-6 (real-engine presets) did
-exactly this — constant, both docs, and T1–T8 re-run with floors = 0.
+exactly this — constant, both docs, and T1–T8 re-run with floors = 0. Second
+precedent: `cfd-core/src/forces.rs` and `EulerSolver::primitives`
+(docs/work-orders/general-geometry-rungs.md) — additive only, both docs
+mirrored, full ladder re-run.
+
+**The ladder is T0–T8 plus G0–G3.** The G rungs (general geometry: multi-body,
+thin-body, never-steady, and a d'Alembert negative control) are what makes
+"optimizations must never be tuned for nozzles" testable rather than promised.
+T6 and T7 are the only other non-nozzle rungs and both bodies are single,
+thick, steady and attached to the domain edge, so they miss every assumption a
+general sandbox breaks. Do not optimize against T0–T8 alone.
 
 ## Conventions that cause silent bugs if broken
 
