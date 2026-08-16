@@ -17,6 +17,10 @@ One file per suite per machine: `<suite>-<machine>.json`.
   -- --include-ignored` and `cargo test -p cfd-geom --test t0_rasterizer`.
 - `grading-bench-<machine>.json` — the grid-grading benchmark, written by
   `cargo test -p cfd-ui grading_bench -- --include-ignored`.
+- `contour-<machine>.json` — the contour-generator swap (cone equivalence,
+  bell vs published geometry, RS-25 cone-vs-bell report), written by
+  `cargo test -p cfd-ui contour` plus the slow before/after comparison
+  `cargo test -p cfd-ui rs25_before_after -- --include-ignored`.
 
 The **machine label is derived from the hardware** (CPU brand + logical core
 count, slugged — e.g. `apple-m1-8c`), never from a flag or hostname, so the
@@ -68,3 +72,12 @@ Conventions:
   writes three rows (`T7-beta`, `T7-p`, `T7-mach`).
 - Recorded-but-not-asserted measurements go in `notes`, not in `tests` with a
   fake pass.
+- A row measured on a flow that has **not** converged must say so. Assert on a
+  mean over a **declared settled window**, never on one instant, and record in
+  `notes`: the window (steps and non-dimensional time), the residual at the end
+  against `RESIDUAL_CONVERGED`, `StepInfo::converged`, and the `Confidence` the
+  report carries. A window that carries an assert also needs its own steadiness
+  evidence — the drift of the window mean between its halves, and that the
+  residual is not growing — as separate rows. The RS-25 20 km C_f comparison is
+  the worked example: its single-instant ancestor read +0.0218 at step 5511 and
+  the opposite sign before step ~2000.
