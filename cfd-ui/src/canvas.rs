@@ -16,7 +16,7 @@ use eframe::egui::{
 
 use cfd_contract::{FieldKind, Grid, Snapshot};
 
-use crate::colormap::{lut_for, SOLID_RGBA};
+use crate::colormap::{lut_for, Preset, SOLID_RGBA};
 use crate::editor::EditorBackend;
 use crate::worker::UiFrame;
 
@@ -60,10 +60,16 @@ impl View {
 }
 
 /// What changed since the last texture upload.
-#[derive(PartialEq, Clone, Copy)]
+///
+/// `preset` is part of the key because the colormap is now chosen independently
+/// of the field: without it, changing the colormap while the sim is paused
+/// changes nothing on screen until the next `frame_gen` bump, which reads as a
+/// broken picker rather than a stale cache.
+#[derive(PartialEq, Clone, Copy, Debug)]
 struct UploadKey {
     frame_gen: u64,
     field: FieldKind,
+    preset: Preset,
     range: (f32, f32),
     smooth: bool,
 }
@@ -153,6 +159,7 @@ impl Canvas {
         frame: &UiFrame,
         frame_gen: u64,
         field: FieldKind,
+        preset: Preset,
         range: (f32, f32),
         smooth: bool,
         editor: &mut dyn EditorBackend,
@@ -274,11 +281,12 @@ impl Canvas {
         let key = UploadKey {
             frame_gen,
             field,
+            preset,
             range,
             smooth,
         };
         if self.uploaded != Some(key) || self.tex.is_none() {
-            self.upload(ui.ctx(), &frame.snapshot, field, range, smooth);
+            self.upload(ui.ctx(), &frame.snapshot, field, preset, range, smooth);
             self.uploaded = Some(key);
         }
 
@@ -337,6 +345,7 @@ impl Canvas {
         ctx: &egui::Context,
         snap: &Snapshot,
         field: FieldKind,
+        preset: Preset,
         range: (f32, f32),
         smooth: bool,
     ) {
@@ -346,7 +355,7 @@ impl Canvas {
         // one-texel-per-cell image would squash the graded tail).
         let (nx, ny) = self.ensure_luts(&g);
         self.rgba.resize(nx * ny * 4, 0);
-        let lut = lut_for(field);
+        let lut = lut_for(preset);
         let data = snap.field(field);
         let solid = &snap.solid;
         let (lo, hi) = range;
@@ -458,11 +467,84 @@ pub fn fmt_value(v: f32) -> String {
     }
 }
 
-/// Vertical colorbar strip with min/max labels, painted from the same LUT the
-/// texture used. The allocation includes the label rows so nothing clips.
-pub fn colorbar(ui: &mut egui::Ui, field: FieldKind, range: (f32, f32), height: f32) {
+/// Which end of a range an editor touched. `None` covers the common case of a
+/// frame where nobody typed anything.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum RangeEdit {
+    None,
+    Min(f32),
+    Max(f32),
+}
+
+/// Ends whose last edit was rejected, so every editor can highlight the same
+/// one. Rejection reverts the value; the highlight is what stops that from
+/// looking like the widget swallowed the input.
+#[derive(Clone, Copy, PartialEq, Default, Debug)]
+pub struct RangeInvalid {
+    pub min: bool,
+    pub max: bool,
+}
+
+impl RangeInvalid {
+    pub fn set(&mut self, min: bool, v: bool) {
+        if min {
+            self.min = v;
+        } else {
+            self.max = v;
+        }
+    }
+}
+
+/// A range editor styled to sit exactly where a colorbar label sits: same
+/// monospace face and size, same `fmt_value` formatting, so switching between
+/// reading and typing does not reflow or reformat the number under the cursor.
+pub fn range_drag(
+    ui: &mut egui::Ui,
+    value: f32,
+    span: f32,
+    invalid: bool,
+    rect: Option<Rect>,
+) -> Option<f32> {
+    let mut v = value;
+    let drag = egui::DragValue::new(&mut v)
+        // Drag resolution scales with the range, so one pixel is a sensible
+        // step whether the field is Mach 0-4 or pressure 0-7e6.
+        .speed((span.abs() as f64 * 0.005).max(1e-9))
+        .custom_formatter(|n, _| fmt_value(n as f32));
+
+    let prev_font = ui.style().override_font_id.clone();
+    ui.style_mut().override_font_id = Some(FontId::monospace(10.0));
+    if invalid {
+        let w = &mut ui.style_mut().visuals.widgets;
+        w.inactive.bg_stroke = Stroke::new(1.0, WALL_GHOST);
+        w.hovered.bg_stroke = Stroke::new(1.0, WALL_GHOST);
+    }
+    let r = match rect {
+        Some(rect) => ui.put(rect, drag),
+        None => ui.add(drag),
+    };
+    ui.style_mut().override_font_id = prev_font;
+    ui.style_mut().visuals.widgets = egui::style::Widgets::default();
+
+    r.changed().then_some(v)
+}
+
+/// Vertical colorbar strip, painted from the same LUT the texture used, with
+/// the min/max labels doubling as in-place editors. The allocation includes the
+/// label rows so nothing clips.
+///
+/// Returns what the user typed; it is the caller's job to validate and commit,
+/// so that this and the explicit min/max row stay two views of one value rather
+/// than two states.
+pub fn colorbar(
+    ui: &mut egui::Ui,
+    preset: Preset,
+    range: (f32, f32),
+    height: f32,
+    invalid: RangeInvalid,
+) -> RangeEdit {
     const LABEL_H: f32 = 14.0;
-    let lut = lut_for(field);
+    let lut = lut_for(preset);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(56.0, height + 2.0 * LABEL_H), Sense::hover());
     let strip = Rect::from_min_max(
         Pos2::new(rect.center().x - 9.0, rect.top() + LABEL_H),
@@ -486,18 +568,71 @@ pub fn colorbar(ui: &mut egui::Ui, field: FieldKind, range: (f32, f32), height: 
         Stroke::new(1.0, Color32::from_gray(90)),
         StrokeKind::Outside,
     );
-    painter.text(
-        strip.center_top() - Vec2::new(0.0, 3.0),
-        egui::Align2::CENTER_BOTTOM,
-        fmt_value(range.1),
-        FontId::monospace(10.0),
-        ui.visuals().text_color(),
+    // The two labels ARE the editors — click to type, drag to scrub, in place.
+    let span = range.1 - range.0;
+    let max_rect = Rect::from_min_max(
+        Pos2::new(rect.left(), rect.top()),
+        Pos2::new(rect.right(), rect.top() + LABEL_H),
     );
-    painter.text(
-        strip.center_bottom() + Vec2::new(0.0, 3.0),
-        egui::Align2::CENTER_TOP,
-        fmt_value(range.0),
-        FontId::monospace(10.0),
-        ui.visuals().text_color(),
+    let min_rect = Rect::from_min_max(
+        Pos2::new(rect.left(), rect.bottom() - LABEL_H),
+        Pos2::new(rect.right(), rect.bottom()),
     );
+    let mut edit = RangeEdit::None;
+    if let Some(v) = range_drag(ui, range.1, span, invalid.max, Some(max_rect)) {
+        edit = RangeEdit::Max(v);
+    }
+    if let Some(v) = range_drag(ui, range.0, span, invalid.min, Some(min_rect)) {
+        edit = RangeEdit::Min(v);
+    }
+    edit
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Task-1 cache bug, pinned. Before `preset` joined the key, changing
+    /// the colormap while the sim was paused left the texture untouched until
+    /// the next `frame_gen` bump — which reads as a broken picker, not a stale
+    /// cache. Everything else is held constant here on purpose.
+    #[test]
+    fn upload_key_notices_a_preset_change_on_its_own() {
+        let base = UploadKey {
+            frame_gen: 7,
+            field: FieldKind::Mach,
+            preset: Preset::Batlow,
+            range: (0.0, 4.0),
+            smooth: false,
+        };
+        let recoloured = UploadKey {
+            preset: Preset::Turbo,
+            ..base
+        };
+        assert_ne!(
+            base, recoloured,
+            "a preset change alone must invalidate the texture cache"
+        );
+        // And the key is still equal to itself, so this does not pass by
+        // accident of some other field differing.
+        assert_eq!(base, UploadKey { ..base });
+    }
+
+    /// Every preset must be reachable through the key, so no colormap can be
+    /// silently aliased onto another by the cache.
+    #[test]
+    fn upload_key_separates_every_preset() {
+        let key = |p| UploadKey {
+            frame_gen: 0,
+            field: FieldKind::Density,
+            preset: p,
+            range: (0.0, 1.0),
+            smooth: true,
+        };
+        for (i, a) in Preset::ALL.iter().enumerate() {
+            for b in &Preset::ALL[i + 1..] {
+                assert_ne!(key(*a), key(*b), "{} aliases {}", a.name(), b.name());
+            }
+        }
+    }
 }

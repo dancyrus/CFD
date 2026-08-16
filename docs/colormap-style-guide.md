@@ -32,7 +32,13 @@ deuteranopia simulation, CIELAB L\* profile, and ΔE00 step size between adjacen
 LUT entries. A flat red trace is a perceptually uniform map. The sawtooth on
 `repo schlieren` is the duplicated-entry collapse described in §5.*
 
-## 2. Field → preset assignment
+## 2. Field → preset defaults
+
+These are **defaults, not fixed assignments.** Colormap identity is a `Preset`,
+independent of `FieldKind`; the player can put any preset on any field from the
+Display panel, and that choice is theirs to keep. The table is what the field
+starts as and what it returns to, and the rationale below is why — a player
+overriding it should be overriding a reasoned position, not an arbitrary one.
 
 The canvas is a **flat 2D image**, not a shaded 3D surface. Nothing else is
 using lightness, so we use the full black→white range. That is why the
@@ -40,7 +46,7 @@ using lightness, so we use the full black→white range. That is why the
 bounded-lightness family (`fast`, `smooth-cool-warm`) that ParaView defaults to
 for 3D scenes.
 
-| `FieldKind` | Type | Preset | Centre / range |
+| `FieldKind` | Type | Default preset | Centre / range |
 |---|---|---|---|
 | `Density` | sequential | **`viridis`** | data range, zero-anchored |
 | `Pressure` | sequential | **`inferno`** | data range |
@@ -75,12 +81,60 @@ Rationale for the ones that are not obvious:
 
 **Not used, deliberately:** `jet`, `hsv`, any hand-rolled rainbow. See §7.
 
+### What the player can change
+
+Three controls in the Display panel, all per field.
+
+**The picker.** Every preset is offered for every field. The list is *not*
+filtered by `PresetKind` — a diverging map on `Mach` centred at 1.0 is a
+legitimate transonic view, and a filter that silently removed it would be
+wrong more often than the mistake it prevents. Guidance is carried by a weak
+inline warning instead: selecting a diverging preset for a field that is not
+signed says so, because the light band then lands wherever the range happens to
+put it and reads as a feature that is not there. Warn, never prevent.
+
+**The guardrail toggle ("free range").** §8's range rules — Schlieren pinned to
+[0, 1], signed fields symmetric about zero — are enforced by default, and
+editing one end of a signed field's range moves the other to match. The toggle
+suspends them for that field and names what is no longer enforced, e.g.
+*asymmetric — zero is off the colormap's light point*. It appears only on the
+fields that have a rule to suspend. Turning it back off re-imposes the rule
+immediately; leaving an asymmetric range under a toggle that claims symmetry
+would make the control a lie.
+
+**Auto vs manual ranges.** A range is *auto* while `lock_range` owns it and
+becomes *manual* the moment it is typed or dragged. The distinction only matters
+at the re-lock that follows a rebuild: auto ranges are overwritten with the new
+scales, manual ones are left exactly as the player set them and flagged
+*scales changed — range may be stale*, cleared by Refit or by any further edit.
+
+The flag is the whole point. A p₀ change can move the reference scales by 35×,
+so a range chosen against the old ones can render as a solid block of one
+colour. Discarding what the player typed loses their work; showing them the
+solid block with no explanation loses their trust. Flagging is the only option
+that loses neither.
+
+Edits are **rejected, not clamped**: a non-finite entry or an inverted range
+reverts to the last committed value and highlights the offending end. A silently
+clamped range misreports what was asked for, which is the same class of error as
+a silently rescaling colorbar.
+
+**What persists.** The preset choice survives a restart; the range does not, and
+resets to `lock_range`. A range belongs to the case that produced it — restoring
+one against a different p₀ would paint a solid block on launch, which is the
+failure this section exists to prevent. Presets are stored as their
+discriminants, so those are a persisted format: **add to the end of the enum,
+never renumber**, or every saved field silently changes colour. An index a build
+does not recognise falls back to that field's default and leaves the rest alone.
+
 ## 3. Preset control points
 
 Positions are normalised 0→1 and are **not evenly spaced**. Each set is the
 *minimal* number of anchors that reproduces the reference map to
 **max ΔE00 ≤ 2.0** (about one just-noticeable difference) under
-`colormap.rs`'s piecewise-linear-in-sRGB `build()`. Copy them exactly.
+`colormap.rs`'s piecewise-linear-in-sRGB `build()` — including `build()`'s
+rounding of every entry to `u8`, which the tool models, so the figure quoted
+here is the one the shipped LUT actually measures. Copy them exactly.
 Regenerate rather than hand-edit — `docs/tools/verify_colormap.py` emits these
 tables:
 
@@ -92,37 +146,39 @@ python docs/tools/verify_colormap.py --diverging 59,76,192 180,4,38
 ```
 
 ### `viridis` — Density
-7 anchors · max ΔE00 1.50 · L\* 14.9→90.9 · step CV 1.2%
+7 anchors · max ΔE00 1.69 · L\* 14.9→90.9 · step CV 1.2%
 
 | pos | rgb |
 |---|---|
 | 0.0000 | 68, 1, 84 |
-| 0.1725 | 68, 59, 132 |
-| 0.4157 | 40, 124, 142 |
-| 0.5647 | 31, 160, 136 |
-| 0.7059 | 70, 192, 111 |
-| 0.8784 | 173, 220, 48 |
+| 0.1765 | 67, 61, 132 |
+| 0.4196 | 40, 125, 142 |
+| 0.5882 | 33, 165, 133 |
+| 0.7098 | 72, 193, 110 |
+| 0.8863 | 178, 221, 45 |
 | 1.0000 | 253, 231, 37 |
 
 ### `inferno` — Pressure, Speed
-11 anchors · max ΔE00 1.96 · L\* 0.1→97.9 · step CV 1.1%
+12 anchors · max ΔE00 1.96 · L\* 0.1→97.9 · step CV 1.1%
 
 | pos | rgb |
 |---|---|
 | 0.0000 | 0, 0, 4 |
-| 0.0627 | 11, 7, 36 |
-| 0.1647 | 50, 10, 94 |
-| 0.2824 | 100, 21, 110 |
-| 0.4314 | 160, 42, 99 |
-| 0.5961 | 219, 80, 59 |
-| 0.7294 | 247, 132, 16 |
-| 0.8235 | 252, 176, 20 |
-| 0.9059 | 245, 217, 73 |
+| 0.0667 | 12, 8, 38 |
+| 0.1176 | 30, 12, 69 |
+| 0.1686 | 52, 10, 95 |
+| 0.2980 | 106, 23, 110 |
+| 0.4275 | 159, 42, 99 |
+| 0.5922 | 218, 78, 60 |
+| 0.7255 | 247, 130, 18 |
+| 0.8157 | 252, 172, 17 |
+| 0.9020 | 246, 215, 70 |
 | 0.9569 | 241, 241, 121 |
 | 1.0000 | 252, 255, 164 |
 
 ### `black-body` — Temperature
-7 anchors · max ΔE00 1.94 · L\* 0.0→100.0 · linear in L\*
+7 anchors · max ΔE00 1.94 (**float fit, not re-measured** — see below) ·
+L\* 0.0→100.0 · linear in L\*
 
 | pos | rgb |
 |---|---|
@@ -139,61 +195,104 @@ defect — the map is designed for *linear L\**, not constant ΔE00, and the
 spikes sit at the near-black end where 8-bit quantisation dominates. Accepted
 tradeoff for the heat semantics.
 
+**Outstanding:** every other table on this page was re-fitted after
+`verify_colormap.py` was corrected to round each LUT entry to `u8` the way
+`build()` does. `black-body` was not, because its reference map is not
+reproducible from the tool — it is neither a matplotlib nor a `cmcrameri` name,
+and no anchor CSV for it is checked in. Its 1.94 is therefore the old float-fit
+figure and the shipped LUT is likely a little above it, by the same ~0.1–0.2
+the other maps moved. The table itself is unchanged and in use. Closing this
+means checking in the source table it was fitted from, then re-running the tool.
+
 ### `batlow` — Mach
-7 anchors · max ΔE00 1.80 · L\* 12.2→87.2 · step CV 8.9%
+9 anchors · max ΔE00 1.23 · L\* 12.2→87.2 · step CV 8.9%
 
 | pos | rgb |
 |---|---|
 | 0.0000 | 1, 25, 89 |
-| 0.1137 | 16, 64, 96 |
-| 0.2745 | 40, 100, 95 |
+| 0.1255 | 17, 67, 96 |
+| 0.2706 | 39, 99, 95 |
+| 0.4392 | 103, 123, 62 |
 | 0.5569 | 157, 137, 43 |
 | 0.6627 | 209, 147, 66 |
-| 0.7608 | 244, 159, 114 |
+| 0.7529 | 242, 157, 109 |
+| 0.8196 | 252, 169, 149 |
 | 1.0000 | 250, 204, 250 |
 
 ### `vik` — VelocityZ, VelocityR
-9 anchors · max ΔE00 1.27 · L\* 11.2→91.6 (apex at 0.49)→16.3 · step CV 17.6%
+9 anchors · max ΔE00 1.72 · L\* 11.2→91.6 (apex at 0.49)→16.3 · step CV 17.6%
 
 | pos | rgb |
 |---|---|
 | 0.0000 | 0, 18, 97 |
-| 0.1686 | 6, 86, 140 |
-| 0.2549 | 51, 127, 168 |
+| 0.1765 | 8, 89, 143 |
+| 0.2588 | 54, 129, 169 |
 | 0.4314 | 192, 216, 228 |
-| 0.4902 | 232, 231, 229 |
-| 0.5490 | 236, 209, 195 |
+| 0.4863 | 231, 231, 231 |
+| 0.5647 | 233, 202, 184 |
 | 0.8118 | 179, 83, 31 |
-| 0.8824 | 143, 43, 6 |
+| 0.8784 | 145, 45, 6 |
 | 1.0000 | 89, 0, 8 |
 
-The anchor at **0.4902** is not decoration. It is the light apex; drop it and
+The anchor at **0.4863** is not decoration. It is the light apex; drop it and
 the lightness derivative flips sign discontinuously and the eye reads a hard
 edge at exactly `u = 0` — a shear layer that is not there. See §4.
 
 ### Alternate diverging: `smooth-cool-warm`
 Keep available as a settings option for players who expect ParaView's classic
-blue-white-red. 10 anchors · max ΔE00 1.11 · step CV 19.2%.
+blue-white-red. 10 anchors · max ΔE00 1.47 · step CV 19.2%.
 
 | pos | rgb |
 |---|---|
 | 0.0000 | 59, 76, 192 |
-| 0.1412 | 103, 136, 238 |
-| 0.2706 | 148, 182, 255 |
-| 0.3922 | 190, 211, 246 |
-| 0.5020 | 221, 220, 220 |
-| 0.6314 | 245, 195, 170 |
-| 0.7686 | 242, 146, 116 |
-| 0.8980 | 215, 84, 69 |
-| 0.9529 | 198, 52, 52 |
+| 0.1451 | 105, 138, 239 |
+| 0.2627 | 146, 180, 254 |
+| 0.3804 | 186, 209, 248 |
+| 0.4980 | 220, 221, 221 |
+| 0.6275 | 245, 196, 172 |
+| 0.7490 | 244, 154, 123 |
+| 0.8941 | 216, 86, 70 |
+| 0.9490 | 199, 54, 52 |
 | 1.0000 | 180, 4, 38 |
 
-## 4. Why the current LUTs are wrong
+### Rainbow option: `turbo`
+Not the default for any field (§7); shipped so the "Turbo (classic)" picker
+entry is real turbo rather than a resample of it. 12 anchors · max ΔE00 1.99 ·
+1 L\* reversal · deuteranopia min step 0.081.
+
+| pos | rgb |
+|---|---|
+| 0.0000 | 48, 18, 59 |
+| 0.0863 | 68, 81, 191 |
+| 0.1882 | 66, 148, 255 |
+| 0.2471 | 42, 185, 238 |
+| 0.3373 | 28, 230, 180 |
+| 0.4706 | 139, 255, 75 |
+| 0.5451 | 193, 243, 52 |
+| 0.6353 | 241, 203, 58 |
+| 0.6980 | 254, 167, 50 |
+| 0.7686 | 248, 114, 28 |
+| 0.8706 | 212, 51, 5 |
+| 1.0000 | 122, 4, 3 |
+
+The CVD and step-CV numbers here fail the §10 gate on purpose — that is what
+§7 means by "conditional". They are recorded so the cost of choosing it is
+visible, not so it can be presented as an equal option.
+
+## 4. Why the old LUTs were wrong
+
+**Closed.** `colormap.rs` now builds every preset from the §3 tables. This
+section is kept because the measurements are the reason the tables look the way
+they do — anyone tempted to "tidy" the anchor positions into even spacing is
+about to reintroduce exactly this.
 
 Measured against the true reference maps, over 256 entries, max ΔE00 in
-CAM02-UCS. These are the numbers that justify changing `colormap.rs`.
+CAM02-UCS. These are the numbers that justified changing `colormap.rs`. They
+predate the `u8`-rounding correction to the tool and so understate the error
+slightly — re-measured, turbo is 21.78 and coolwarm 6.61. The verdicts do not
+move.
 
-| current LUT | max ΔE00 vs reference | verdict |
+| superseded LUT | max ΔE00 vs reference | verdict |
 |---|---|---|
 | 9 even-spaced viridis anchors | **1.10** | fine — keep the map, use the 7-anchor table anyway (fewer points, same fidelity) |
 | 9 even-spaced inferno anchors | **3.14** | marginal; visible as a soft false band in the smooth plume |
@@ -265,8 +364,10 @@ things fall out:
    exponential in the snapshot runs ~26× fewer times than it would per pixel.
    The per-pixel path stays a pure LUT index either way.
 
-Until that lands, at minimum round instead of truncating: `as u8` on
-`245.0 * exp(...)` biases every level down by up to one code.
+Until that lands, at minimum round instead of truncating: a bare `as u8` on
+`245.0 * exp(...)` biases every level down by up to one code. **Done** — the
+`grayscale` preset rounds. The root-cause fix is still open: it crosses into
+`cfd-core`, so it stays a separate work order.
 
 ## 6. Wall, NaN, and out-of-range
 
@@ -321,7 +422,7 @@ The position is not "rainbow is banned."
 So: **not the default for any field.** A settings toggle labelled
 "Classic (rainbow)" is a legitimate affordance for players trained on Fluent and
 EnSight, both of which still ship rainbow defaults. If we ship it, ship real
-turbo from the 13-anchor table, not the 9-point resample that is 21.6 ΔE00 away
+turbo from the 12-anchor table in §3, not the 9-point resample that is 21.6 ΔE00 away
 from it.
 
 Note for credibility with the target audience: ParaView moved off rainbow
