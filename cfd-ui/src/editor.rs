@@ -12,7 +12,7 @@
 //! DIRECTIONS, and the canvas decides how many pixels along a direction a dot
 //! goes. `cfd-geom` has no idea what a pixel is.
 
-use cfd_geom::{HandleKind, NozzleCurve, Tessellation};
+use cfd_geom::{FreeformBounds, FreeformEditor, HandleKind, NozzleCurve, Tessellation};
 
 use crate::case::CaseParams;
 
@@ -32,8 +32,8 @@ pub struct EditHandle {
 
 /// Whatever is currently editing the wall.
 ///
-/// Two implementations: [`ParametricEditor`] (handles on a curve) and, once the
-/// user breaks the parametric link, the freeform point editor.
+/// Two implementations: [`ParametricEditor`] (handles on a curve) and
+/// [`FreeformWall`] (every point a handle), reached by the one-way break.
 pub trait WallEditor {
     /// The polyline the solver and the rasterizer get, r_t.
     fn polyline(&self) -> &[[f64; 2]];
@@ -255,6 +255,100 @@ mod tests {
         assert!(swept > 3000, "only {swept} positions swept");
     }
 
+    /// **THE STEP 4 GATE, part 1.** The break keeps the shape EXACTLY, is
+    /// one-way, and is the only thing that raises the sandbox badge.
+    #[test]
+    fn the_break_is_one_way_and_the_shape_does_not_move() {
+        for pre in PRESETS.iter() {
+            let p = pre.case(0.0, false);
+            let mut w = WallState::parametric(&p);
+            let before = w.editor().polyline().to_vec();
+            assert!(!w.is_freeform(), "{}: starts parametric", pre.name);
+
+            // A handle drag does NOT raise the badge — that is the provenance
+            // rule: a hand-tuned bell is still a member of the contour family.
+            let n = w.editor().handles().len();
+            for i in 0..n {
+                let a = w.editor().handles()[i].anchor;
+                if w.editor().handles()[i].pickable {
+                    w.editor_mut().drag(i, [a[0] + 0.4, a[1] + 0.4]);
+                }
+                assert!(!w.is_freeform(), "{}: a drag raised the sandbox badge", pre.name);
+            }
+
+            // The break preserves the polyline it was given, vertex for vertex.
+            let at_break = w.editor().polyline().to_vec();
+            assert!(w.break_to_freeform(p.lz_rt, p.lr_rt));
+            assert!(w.is_freeform());
+            assert_eq!(
+                w.editor().polyline(),
+                at_break,
+                "{}: the shape moved on conversion",
+                pre.name
+            );
+            // One-way: a second break is a no-op, and there is no way back
+            // except regenerating (which is a different wall by definition).
+            assert!(!w.break_to_freeform(p.lz_rt, p.lr_rt));
+            assert!(w.is_freeform());
+            // Freeform has no handles-vs-points distinction and no control
+            // polygon: every point is a control point again, deliberately.
+            assert_eq!(w.editor().handles().len(), at_break.len());
+            assert!(w.editor().control_polygon().is_none());
+            assert!(w.editor_mut().insert([before[1][0] + 0.01, 1.5]));
+            assert!(w.editor().polyline().len() == at_break.len() + 1);
+        }
+    }
+
+    /// **THE STEP 4 GATE, part 2.** Regenerating from a preset restores a
+    /// parametric wall — the one escape hatch, and the reason the app asks
+    /// before taking it.
+    #[test]
+    fn regenerating_restores_a_parametric_wall() {
+        let p = PRESETS[2].case(0.0, false); // Raptor 2
+        let mut w = WallState::parametric(&p);
+        w.break_to_freeform(p.lz_rt, p.lr_rt);
+        assert!(w.is_freeform());
+        w = WallState::parametric(&p);
+        assert!(!w.is_freeform());
+        assert_eq!(w.editor().handles().len(), 9);
+        assert!(w.editor().control_polygon().is_some());
+        assert_eq!(w.editor().polyline(), crate::case::nozzle_contour(&p).points);
+    }
+
+    /// **THE STEP 4 GATE, part 3.** A hand-tuned bell stops showing the
+    /// Rao-table clamp warning: its angles came from the user, not the table,
+    /// so a warning about table extrapolation would describe a lookup that did
+    /// not happen.
+    #[test]
+    fn a_hand_tuned_bell_stops_claiming_a_clamped_rao_table() {
+        use crate::case::rao_clamp_warning;
+        // Merlin Vac: eps 165, past the table's eps = 100 end, so the warning
+        // fires while it is a table bell.
+        let mut p = PRESETS[5].case(0.0, false);
+        assert_eq!(p.contour_kind, ContourKind::ParabolicBell);
+        assert!(rao_clamp_warning(Some(p.contour_kind), p.area_ratio).is_some());
+
+        // Drag theta_e; the wall becomes a measured bell and the warning goes.
+        let mut e = ParametricEditor::new(&p);
+        let i = e.handles().iter().position(|h| h.label == "theta_e").unwrap();
+        let h = e.handles()[i];
+        let want = (h.value + 1.0).to_radians();
+        e.drag(i, [h.anchor[0] - want.cos(), h.anchor[1] - want.sin()]);
+        crate::case::apply_curve(&mut p, e.curve());
+        assert!(matches!(p.contour_kind, ContourKind::MeasuredBell { .. }));
+        assert!(
+            rao_clamp_warning(Some(p.contour_kind), p.area_ratio).is_none(),
+            "a measured bell must not claim a clamped table lookup"
+        );
+        // A drawn wall has no contour kind at all, so it cannot either.
+        assert!(rao_clamp_warning(None, p.area_ratio).is_none());
+        // …and the warning still fires for a genuine table bell out of range.
+        assert_eq!(
+            rao_clamp_warning(Some(ContourKind::ParabolicBell), 2.0),
+            Some((4.0, "starts at"))
+        );
+    }
+
     /// Ctrl+click and right-click are refused, which is the signal the app uses
     /// to offer the one-way break instead of silently doing nothing.
     #[test]
@@ -263,5 +357,140 @@ mod tests {
         assert!(!e.insert([5.0, 1.4]));
         assert!(!e.remove(0));
         assert_eq!(e.handles().len(), 6);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Freeform
+// ---------------------------------------------------------------------------
+
+/// A drawn wall: `cfd_geom::FreeformEditor` behind the same trait, with one
+/// handle per control point.
+///
+/// The polyline IS the model here — which is exactly the conflation the
+/// parametric path exists to avoid, and exactly what is wanted once the user
+/// has decided their shape is not a member of any contour family. The
+/// difference is that it is now a deliberate MODE with a badge on it, not the
+/// only representation there is.
+pub struct FreeformWall {
+    inner: FreeformEditor,
+    handles: Vec<EditHandle>,
+}
+
+impl FreeformWall {
+    /// Take over from a polyline. **The shape does not move**: these are
+    /// exactly the points that were on screen when the break happened.
+    pub fn new(points: Vec<[f64; 2]>, lz: f64, lr: f64) -> Self {
+        let mut w = FreeformWall {
+            inner: FreeformEditor::new(points, FreeformBounds::for_domain(lz, lr)),
+            handles: Vec::new(),
+        };
+        w.rebuild();
+        w
+    }
+
+    /// The validation gate, for the app to refuse to commit a broken wall.
+    pub fn validate(&self) -> Result<(), String> {
+        self.inner.to_profile().map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    fn rebuild(&mut self) {
+        self.handles = self
+            .inner
+            .points()
+            .iter()
+            .map(|p| EditHandle {
+                anchor: *p,
+                kind: HandleKind::Point,
+                label: "point",
+                value: p[1],
+                unit: "r_t",
+                pickable: true,
+            })
+            .collect();
+    }
+}
+
+impl WallEditor for FreeformWall {
+    fn polyline(&self) -> &[[f64; 2]] {
+        self.inner.points()
+    }
+
+    fn handles(&self) -> &[EditHandle] {
+        &self.handles
+    }
+
+    fn drag(&mut self, i: usize, folded: [f64; 2]) -> Option<String> {
+        self.inner.drag(i, folded);
+        self.rebuild();
+        None // a drawn point has no parametric constraint to clamp against
+    }
+
+    fn insert(&mut self, folded: [f64; 2]) -> bool {
+        self.inner.insert(folded);
+        self.rebuild();
+        true
+    }
+
+    fn remove(&mut self, i: usize) -> bool {
+        let ok = self.inner.remove(i);
+        self.rebuild();
+        ok
+    }
+
+    fn control_polygon(&self) -> Option<Vec<[f64; 2]>> {
+        None
+    }
+
+    fn set_domain(&mut self, lz: f64, lr: f64) {
+        self.inner.set_bounds(FreeformBounds::for_domain(lz, lr));
+    }
+}
+
+/// Which representation the wall is in.
+///
+/// **The break is ONE-WAY.** There is no fit-a-curve-to-a-polyline step and
+/// there should not be: fitting is a research problem with no unique answer,
+/// and a bad fit silently changes the user's shape while claiming to preserve
+/// it. Regenerating from a preset or the area-ratio slider is the escape hatch
+/// — and because that DISCARDS the drawing, the app asks first.
+pub enum WallState {
+    Parametric(ParametricEditor),
+    Freeform(FreeformWall),
+}
+
+impl WallState {
+    pub fn parametric(p: &CaseParams) -> Self {
+        WallState::Parametric(ParametricEditor::new(p))
+    }
+
+    pub fn is_freeform(&self) -> bool {
+        matches!(self, WallState::Freeform(_))
+    }
+
+    pub fn editor(&self) -> &dyn WallEditor {
+        match self {
+            WallState::Parametric(e) => e,
+            WallState::Freeform(e) => e,
+        }
+    }
+
+    pub fn editor_mut(&mut self) -> &mut dyn WallEditor {
+        match self {
+            WallState::Parametric(e) => e,
+            WallState::Freeform(e) => e,
+        }
+    }
+
+    /// Break the parametric link, keeping the wall EXACTLY where it is. A no-op
+    /// if already freeform.
+    pub fn break_to_freeform(&mut self, lz: f64, lr: f64) -> bool {
+        match self {
+            WallState::Freeform(_) => false,
+            WallState::Parametric(e) => {
+                *self = WallState::Freeform(FreeformWall::new(e.polyline().to_vec(), lz, lr));
+                true
+            }
+        }
     }
 }

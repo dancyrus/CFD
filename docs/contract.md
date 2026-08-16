@@ -591,15 +591,32 @@ pub fn rao_angles(area_ratio: f64, bell_percent: f64) -> (f64, f64);
 /// EXACT sub-cell area fractions. Point sampling is unacceptable.
 pub fn rasterize(p: &WallProfile, g: &Grid, refs: &RefScales) -> Result<SolidField>;
 
-/// Editor data model. No egui dependency.
-pub struct Editor { /* control points, selection, hit radius */ }
-impl Editor {
-    pub fn from_profile(p: &WallProfile) -> Self;
-    pub fn to_profile(&self) -> Result<WallProfile>;
+/// FREEFORM (drawn) wall editor. No egui dependency. The merge of the old
+/// cfd_geom::Editor (which had the validation gate but no idea the domain had
+/// edges) and cfd_ui::StubEditor (which had the domain clamp and endpoint
+/// protection but no gate) — neither was a superset, so the bounds the app used
+/// to hard-code are now INJECTED and the two are one type. Units are the
+/// caller's; cfd-ui passes r_t.
+pub struct FreeformBounds { pub lz: f64, pub lr: f64, pub r_min: f64,
+                            pub r_margin: f64, pub z_gap: f64 }
+impl FreeformBounds {
+    pub const R_MIN: f64 = 0.15;      // keep the wall off the axis
+    pub const R_MARGIN: f64 = 1.5;    // keep it clear of the radial sponge
+    pub const Z_GAP: f64 = 1e-3;
+    pub fn for_domain(lz: f64, lr: f64) -> Self;
+}
+pub struct FreeformEditor { /* points, selection, bounds */ }
+impl FreeformEditor {
+    pub fn new(points: Vec<[f64; 2]>, bounds: FreeformBounds) -> Self;
+    pub fn points(&self) -> &[[f64; 2]];
+    pub fn selection(&self) -> Option<usize>;
+    pub fn bounds(&self) -> FreeformBounds;
+    pub fn set_bounds(&mut self, bounds: FreeformBounds);
     pub fn hit_test(&self, world: [f64; 2], tol: f64) -> Option<usize>;
     pub fn drag(&mut self, i: usize, world: [f64; 2]);
-    pub fn insert(&mut self, world: [f64; 2]);
-    pub fn remove(&mut self, i: usize);
+    pub fn insert(&mut self, world: [f64; 2]) -> usize;
+    pub fn remove(&mut self, i: usize) -> bool;   // endpoints protected, min 3 points
+    pub fn to_profile(&self) -> Result<WallProfile>;   // gate + throat = argmin r
 }
 ```
 

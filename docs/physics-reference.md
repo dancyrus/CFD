@@ -385,6 +385,32 @@ Verified for r_t = 50 mm, ε = 25, 80%: wall angle is exactly θ_n at t = 0 and 
 
 ⚠ The commonly-published digitized 60% column is non-monotonic (θ_n goes 37.1° at ε = 40 → 35.0° at ε = 50 — a digitization typo). It does not affect an 80% bell, but if the UI exposes bell percent, interpolating that row produces a nozzle whose divergence angle *decreases* with area ratio.
 
+### The curve, and the polyline derived from it
+
+The wall is a **parametric curve** — two straight pieces, two throat arcs parameterized by local wall angle, and (for a bell) the quadratic Bézier above. The polyline the rasterizer and the solver see is TESSELLATED from it and is never the model. Until 2026-08 there was no such split: a fixed 256-point polyline was simultaneously the solver's input and the editor's control-point set, which put a drag handle every ~0.1 r_t and left every wall angle to be inferred from a chord slope.
+
+Consequences that are now rules:
+
+- **Wall angles are read from the curve, never from a chord.** `divergent_angles_deg()` returns θ_n and θ_e exactly. Chord slopes carry a tessellation bias of up to the turn cap (2°), which is the same order as the tolerances the published-geometry comparisons use — RS-25's exit angle is asserted to ±1°, Raptor 2's angles to ±0.5°, and the chord readings were spending 0.30° of that on discretization.
+- **Tessellation is sized to the MESH, not to a constant:** chord tolerance 1% of `min(dz, dr)` at the case's base spacing, a 2° turn cap per segment, a floor of 2 segments per curved piece, and a cap of 4096 points. Measured: 63–100 points per preset against the old 256, and halving the tolerance moves the rasterized throat area by 0.014–0.024%.
+- **The chord tolerance is RADIAL** — the gap in r between chord and curve at the same z — not the perpendicular distance. The rasterizer integrates exact sub-cell areas under the polyline, so an area error is `∫|Δr| dz`. The two differ by `sec(wall angle)`, up to 1.2 on a 35° bell.
+- Exact bounds, both used: a circular arc split into n equal-angle pieces deviates by at most `R Δφ²/(8n²)` perpendicular; a quadratic Bézier split at n equal-t intervals satisfies `B(t) − chord(t) = −t(1−t)·D/n²` with `D = N − 2Q + E`, peaking at `|D|/(4n²)`.
+- `cfd_geom::generate_contour` keeps the ORIGINAL fixed-sample loops, bit-identical, because `cfd-core`'s acceptance ladder and diagnostics call it and their committed results are only comparable while it does. `cfd-geom/tests/golden_contour.rs` freezes a verbatim copy of the pre-curve generator and asserts bit equality (`to_bits`) for the demo spec and all six preset specs.
+
+### Editing the parametric wall
+
+Nine handles for a bell, six for a cone — chamber radius, chamber end, converging half-angle β, throat arc R1, throat arc R2, θ_n, θ_e, exit lip, and the derived control point Q.
+
+**Q is not draggable, and that is a physics decision, not a UI one.** Q is the intersection of the two tangent lines: once θ_n, θ_e, N and E are fixed it has zero remaining degrees of freedom. Moving it would break the G1 tangency at N, and θ_n is a wall angle only because of that tangency — a wall that leaves the throat arc at some other angle is not a bell with that θ_n, it is a wall with a kink. It is drawn as a hollow diamond on a dashed N–Q–E control polygon, so the construction is visible and untouchable.
+
+**The `N_z < Q_z < E_z` guard is a per-handle bisection clamp, not an error.** A rejected spec makes the app fall back to the 15° cone, so as an error the guard made the user's nozzle vanish mid-drag and reappear when they dragged back. The clamp bisects to the feasible boundary in 40 halvings and surfaces the guard's own message — which already names the infeasible direction, "too long" or "too short" — as the clamp tooltip.
+
+A θ_n or θ_e drag converts the contour from `ParabolicBell` to `DirectBell`. The Rao table maps (area ratio, bell percent) to a pair of angles; a hand-set angle is no longer that lookup, so the wall becomes a measured bell — the same kind Raptor 2 flies — and the table-clamp disclosure correctly goes quiet, because no table lookup happened.
+
+**Provenance.** A parametric handle edit is still a member of this family: the same construction with different numbers, and the acceptance tests cover the family. It KEEPS the engineering report and shows its live angles ("measured bell · θ_n 34.2° θ_e 5.1°"); it clears the preset NAME, because an RS-25 with a hand-tuned θ_n is not RS-25. Only a **drawn** wall raises "SANDBOX — drawn geometry, qualitative only" (§13), because only a drawing is outside every contour family any acceptance test covers.
+
+**The break to drawn geometry is one-way**, and the shape does not move across it — the freeform editor starts from exactly the tessellated points that were on screen. There is deliberately no fit-a-curve-to-a-polyline step: fitting is not an inverse, and a fit would silently change the user's shape while claiming to preserve it. Regenerating from a preset or the area-ratio slider is the escape hatch, and because it discards the drawing the app asks first.
+
 **Divergence factor:** `λ = (1 + cos θ_e)/2` for a bell, `(1 + cos α)/2` for a cone. Verified: the momentum-weighted integral `2∫₀¹ s·cos(θ_e s) ds` differs from `(1+cos θ_e)/2` by `−θ⁴/144`, which is 3.7e-6 at θ_e = 8.72°. The alternative `(1+cos((θ_n+θ_e)/2))/2` has no traceable primary source and gives a 2.75% loss against an accepted 0.5–1.5%. Note the two candidates differ by 1.1% and the product refuses to display efficiencies to better than 1%, so this is settled — do not let a session spend time on it.
 
 ---

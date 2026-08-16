@@ -632,6 +632,26 @@ pub fn separation_altitude_m(p: &CaseParams) -> Option<f64> {
     Some(0.5 * (lo + hi))
 }
 
+/// The Rao-table clamp disclosure: the digitised table runs ε = 4..100 and
+/// `rao_angles` CLAMPS at both ends rather than extrapolating, so outside that
+/// range the bell is the end row's angles stretched to this exit radius.
+/// Returns `(table end, wording)` when it applies.
+///
+/// Keyed on the PRODUCED contour kind, which is what makes a hand-tuned bell go
+/// quiet: a theta_n or theta_e drag converts the wall to `MeasuredBell`, whose
+/// angles came from the user and never touched the table, so a warning about
+/// table extrapolation would be describing a lookup that did not happen.
+pub fn rao_clamp_warning(kind: Option<ContourKind>, area_ratio: f64) -> Option<(f64, &'static str)> {
+    if kind != Some(ContourKind::ParabolicBell) || (4.0..=100.0).contains(&area_ratio) {
+        return None;
+    }
+    Some(if area_ratio > 100.0 {
+        (100.0, "ends at")
+    } else {
+        (4.0, "starts at")
+    })
+}
+
 /// A generated wall together with what it ACTUALLY is. The kind is not the
 /// request: when the curve rejects a spec the points are the fallback cone, and
 /// `kind` says `Conical` so the status line cannot go on claiming a bell over a

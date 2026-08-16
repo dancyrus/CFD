@@ -114,7 +114,11 @@ Inviscid Euler · γ = 1.24 · no boundary layer · no chemistry · no heat tran
 
 ### 5. Geometry editor
 
-Consume session C's `Editor` data model **behind a trait** so you can stub it until it lands. You supply: mouse picking, drag, hover highlight, the world/screen transform, and a ghost preview before commit. C supplies hit testing and validation.
+⚠ **Superseded by the parametric-wall work (2026-08).** The original instruction was to consume session C's `Editor` data model behind a trait, stubbing it until C's crate landed. The stub (`StubEditor`) shipped and the swap never happened, so for the life of the project the app edited walls through a polyline model with no validation gate while C's validated one sat unused. Both are now gone, merged into `cfd_geom::FreeformEditor` with the domain bounds injected — neither was a superset: C's had the validation gate and no idea the domain had edges, the app's had the domain clamp, `R_MIN`, `R_MARGIN` and endpoint protection and no gate.
+
+What replaced it: the wall is a **parametric curve** (`cfd_geom::NozzleCurve`) edited through **CAD handles** — nine markers for a bell, six for a cone, one per degree of freedom — and the polyline the solver eats is tessellated from it. The old model made the polyline serve as both the solver's input and the editor's control points, which put a drag handle every ~0.1 r_t and made wall editing unusable. Drawn geometry is now a deliberate MODE (`WallState::Freeform`) reached by a one-way break, not the only representation there is.
+
+The trait (`WallEditor`) survives and both editors implement it. The UI still supplies mouse picking, drag, hover highlight, the world/screen transform and a ghost preview before commit — and now ALL of the pixels: `cfd-geom` returns anchors in r_t and tangent directions only. `cfd-geom` supplies the constraints (a per-handle bisection clamp) and the validation gate.
 
 On commit, send `SolverCommand::SetGeometry`. Rate-limit to pointer-up or one per 100 ms — the flip refill is a multi-pass BFS.
 

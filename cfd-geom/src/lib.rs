@@ -1,7 +1,8 @@
 //! Nozzle contours, rasterizer, editor data model. Session C owns this crate.
 //! No egui dependency — ever. See docs/sessions/C-geom.md and docs/contract.md.
 //!
-//! Lengths in `NozzleSpec`, `WallProfile` and `Editor` are SI metres.
+//! Lengths in `NozzleSpec` and `WallProfile` are SI metres; `FreeformEditor`
+//! works in whatever units its caller supplies (`cfd-ui` passes r_t).
 //! `rasterize` converts to the non-dimensional grid (units of throat radius)
 //! through `RefScales`; nothing else in this crate touches units.
 
@@ -9,7 +10,7 @@
 
 mod contour;
 mod curve;
-mod editor;
+mod freeform;
 mod grade;
 mod handles;
 mod rao;
@@ -17,8 +18,8 @@ mod raster;
 
 pub use contour::generate_contour;
 pub use curve::{BellGeometry, NozzleCurve, Piece, Tessellation, CHAMBER_LEN_RT};
+pub use freeform::{FreeformBounds, FreeformEditor};
 pub use handles::{DragOutcome, Handle, HandleId, HandleKind};
-pub use editor::Editor;
 pub use grade::{grade_from_solid, GradeSpec};
 pub use rao::rao_angles;
 pub use raster::{rasterize, rasterize_solid_polygon};
