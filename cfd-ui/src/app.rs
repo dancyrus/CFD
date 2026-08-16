@@ -13,9 +13,9 @@ use cfd_contract::{FieldKind, SolverCommand};
 
 use crate::canvas::{colorbar, fmt_value, range_drag, Canvas, RangeEdit, RangeInvalid, BG};
 use crate::case::{
-    self, ambient_nd, atmosphere, conical_contour, ideal_cf, make_setup, rasterize_wall,
-    separation_altitude_m, separation_threshold, CaseParams, DomainPreset, ALT_MAX_M, PRESETS,
-    R_UNIVERSAL_SI, VACUUM_P_FRAC,
+    self, ambient_nd, atmosphere, ideal_cf, make_setup, nozzle_contour, rasterize_wall,
+    separation_altitude_m, separation_threshold, CaseParams, ContourKind, DomainPreset, ALT_MAX_M,
+    PRESETS, R_UNIVERSAL_SI, VACUUM_P_FRAC,
 };
 use crate::colormap::{Preset, PresetKind};
 use crate::editor::{EditorBackend, StubEditor};
@@ -118,6 +118,14 @@ pub struct CfdApp {
     editor: StubEditor,
     editor_on: bool,
     committed_wall: Vec<[f64; 2]>,
+    /// The contour kind the generator ACTUALLY produced for `committed_wall`,
+    /// and the rejection message when it fell back to the cone. Never the
+    /// requested kind: `params.contour_kind` is a request, and reading the
+    /// status line off it printed "80% bell" over a fallback cone. `None` is
+    /// a wall no generator produced — a hand-dragged one — which has no
+    /// contour family and no wall angles to name.
+    wall_kind: Option<ContourKind>,
+    wall_fallback: Option<String>,
     /// True once the user has edited the wall by hand — flips the whole
     /// report into "sandbox — qualitative only".
     geometry_custom: bool,
@@ -153,7 +161,7 @@ impl CfdApp {
         tx: Sender<UiCommand>,
         initial: UiFrame,
         params: CaseParams,
-        wall: Vec<[f64; 2]>,
+        wall: case::GeneratedWall,
         watermark: bool,
         storage: Option<&dyn eframe::Storage>,
     ) -> Self {
@@ -164,7 +172,7 @@ impl CfdApp {
             cmap[k as usize] = Preset::default_for(k);
         }
         cmap = restore_presets(storage.and_then(|s| eframe::get_value(s, CMAP_KEY)), cmap);
-        let mut editor = StubEditor::new(wall.clone());
+        let mut editor = StubEditor::new(wall.points.clone());
         editor.set_domain(params.lz_rt, params.lr_rt);
         CfdApp {
             out,
@@ -193,7 +201,9 @@ impl CfdApp {
             canvas: Canvas::new(),
             editor,
             editor_on: false,
-            committed_wall: wall,
+            committed_wall: wall.points,
+            wall_kind: Some(wall.kind),
+            wall_fallback: wall.fallback,
             geometry_custom: false,
             space_panned: false,
             hover_text: String::new(),
@@ -218,6 +228,12 @@ impl CfdApp {
         self.committed_wall = self.editor.points().to_vec();
         self.geometry_custom = true;
         self.preset = None; // hand-drawn walls are no named engine
+        // …and no contour family either. This is the fourth writer of
+        // `committed_wall`; leaving the generator's provenance behind here
+        // would put "measured bell · θ_n 32.0°" over a wall the user dragged
+        // by hand, which is the same lie as naming a bell over a fallback cone.
+        self.wall_kind = None;
+        self.wall_fallback = None;
         // Mid-run edits rasterize onto the solver's CURRENT (graded) grid —
         // that is the cheap-to-overwrite-mask property the sandbox rests on.
         // The grading itself is only recomputed on a rebuild (preset, p0 or
@@ -233,9 +249,11 @@ impl CfdApp {
             self.preset = None; // partial change: no longer the named engine
         }
         self.params.area_ratio = self.ui_area_ratio;
-        let wall = conical_contour(self.params.area_ratio);
-        self.editor.set_points(wall.clone());
-        self.committed_wall = wall;
+        let wall = nozzle_contour(&self.params);
+        self.editor.set_points(wall.points.clone());
+        self.committed_wall = wall.points;
+        self.wall_kind = Some(wall.kind);
+        self.wall_fallback = wall.fallback;
         self.geometry_custom = false;
         let solid = rasterize_wall(&self.committed_wall, &self.latest.snapshot.grid);
         self.cmd(SolverCommand::SetGeometry(Arc::new(solid)));
@@ -271,10 +289,12 @@ impl CfdApp {
         self.ui_area_ratio = self.params.area_ratio;
         self.ui_p0_mpa = self.params.p0_pa / 1e6;
         self.sync_domain_fields();
-        let wall = conical_contour(self.params.area_ratio);
+        let wall = nozzle_contour(&self.params);
         self.editor.set_domain(self.params.lz_rt, self.params.lr_rt);
-        self.editor.set_points(wall.clone());
-        self.committed_wall = wall;
+        self.editor.set_points(wall.points.clone());
+        self.committed_wall = wall.points;
+        self.wall_kind = Some(wall.kind);
+        self.wall_fallback = wall.fallback;
         self.geometry_custom = false;
         let setup = make_setup(&self.params, &self.committed_wall);
         let _ = self.tx.send(UiCommand::Rebuild(Box::new(setup)));
@@ -844,15 +864,79 @@ impl CfdApp {
             Some(i) => format!("{} · {}", PRESETS[i].name, PRESETS[i].propellant),
             None => "custom gas".to_string(),
         };
+        // What was PRODUCED, not what was asked for: on a rejected spec the
+        // wall is the fallback cone and `wall_kind` says so.
+        let source = match self.preset {
+            Some(i) => format!(" — {}", PRESETS[i].bell_source),
+            None => String::new(),
+        };
+        let contour_desc = match self.wall_kind {
+            None => "hand-drawn wall".to_string(),
+            Some(ContourKind::Conical) => "15° cone".to_string(),
+            Some(ContourKind::ParabolicBell) => {
+                format!("{:.0}% bell{source}", self.params.bell_percent * 100.0)
+            }
+            Some(ContourKind::MeasuredBell {
+                theta_n_deg,
+                theta_e_deg,
+            }) => format!(
+                "measured bell · θ_n {theta_n_deg:.1}° θ_e {theta_e_deg:.1}° · \
+                 {:.0}% length{source}",
+                self.params.bell_percent * 100.0
+            ),
+        };
         ui.label(
             RichText::new(format!(
-                "{head} · r_t {:.0} mm · ε {:.1}",
+                "{head} · r_t {:.0} mm · ε {:.1} · {contour_desc}",
                 self.params.r_throat_m * 1e3,
                 self.params.area_ratio
             ))
             .weak()
             .small(),
         );
+        // Honesty flag: the wall on screen is not the wall that was asked for.
+        // eprintln! into a windowed app's stdout is not a disclosure.
+        if let Some(why) = &self.wall_fallback {
+            ui.label(
+                RichText::new("contour rejected — showing the 15° fallback cone")
+                    .small()
+                    .color(AMBER),
+            )
+            .on_hover_text(format!(
+                "cfd_geom::generate_contour rejected this nozzle spec:\n{why}\n\n\
+                 The wall being solved is the legacy 15° cone, not the requested \
+                 contour. Every readout belongs to that cone.",
+            ));
+        }
+        // Honesty flag: the digitised Rao table runs ε = 4..100 and rao_angles
+        // CLAMPS at both ends rather than extrapolating — past either end the
+        // bell is the end row's angles stretched to this exit radius. Merlin
+        // Vac (ε = 165) lives above; the ε slider bottoms out at 2.0, below.
+        // Measured-angle bells never touch the table, so they never flag.
+        if self.wall_kind == Some(ContourKind::ParabolicBell)
+            && !(4.0..=100.0).contains(&self.params.area_ratio)
+        {
+            let (end, side) = if self.params.area_ratio > 100.0 {
+                (100.0, "ends at")
+            } else {
+                (4.0, "starts at")
+            };
+            ui.label(
+                RichText::new(format!(
+                    "bell angles clamped: Rao table {side} ε = {end:.0} (this nozzle is ε {:.1})",
+                    self.params.area_ratio
+                ))
+                .small()
+                .color(AMBER),
+            )
+            .on_hover_text(format!(
+                "θ_n and θ_e come from the digitised Rao table, which covers \
+                 ε = 4–100; outside it the angles clamp to the ε = {end:.0} row \
+                 instead of extrapolating (the published data does not support \
+                 extrapolation). The wall shown is that bell continued to this \
+                 exit radius — plausible, but not a tabulated Rao contour.",
+            ));
+        }
         ui.label(
             RichText::new(format!(
                 "γ {} · T₀ {:.0} K · MW {:.1} g/mol — propellant class, not measured",
@@ -1560,14 +1644,41 @@ fn warning_box(ui: &mut egui::Ui, color: Color32, title: &str, body: &str) {
 }
 
 fn preset_tooltip(p: &case::EnginePreset) -> String {
+    let shape = match p.contour_kind {
+        ContourKind::Conical => "15° cone".to_string(),
+        ContourKind::ParabolicBell => format!("{:.0}% parabolic bell", p.bell_percent * 100.0),
+        ContourKind::MeasuredBell {
+            theta_n_deg,
+            theta_e_deg,
+        } => format!(
+            "measured bell, θ_n {theta_n_deg:.1}° / θ_e {theta_e_deg:.1}° on a \
+             {:.3} R_t throat arc, {:.0}% length",
+            p.throat_arc_down,
+            p.bell_percent * 100.0
+        ),
+    };
     let mut s = format!(
-        "{} · ε {} · p₀ {:.0} bar · r_t {:.0} mm\n≈{:.1}× Merlin 1D run time",
+        "{} · ε {} · p₀ {:.0} bar · r_t {:.0} mm\n{shape} — {}\n≈{:.1}× Merlin 1D run time",
         p.propellant,
         p.area_ratio,
         p.p0_pa / 1e5,
         p.r_throat_m * 1e3,
+        p.bell_source,
         p.relative_cost()
     );
+    // The Rao θ_n/θ_e table is digitised at γ ≈ 1.23–1.25
+    // (docs/physics-reference.md §6, §10); an engine running well outside that
+    // band inherits the mismatch in its wall shape — a small one: Rao (1958)
+    // has γ barely moving the contour at fixed length and area ratio, worth
+    // well under a degree of exit angle. Only table bells can inherit it at
+    // all; a measured-angle contour never consults the table.
+    if p.contour_kind == ContourKind::ParabolicBell && (p.gamma < 1.23 || p.gamma > 1.25) {
+        s.push_str(&format!(
+            "\nBell angles from the Rao table, digitised at γ 1.23–1.25; this \
+             engine runs γ {} — the wall shape inherits that mismatch (sub-degree).",
+            p.gamma
+        ));
+    }
     if !p.note.is_empty() {
         s.push('\n');
         s.push_str(p.note);
