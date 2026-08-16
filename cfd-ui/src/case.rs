@@ -140,9 +140,13 @@ impl ContourKind {
 /// contraction ratio 4, 1.5 r_t upstream arc, 0.382 r_t downstream arc, and
 /// the 15° cone half-angle the demo case and the bell's length reference use.
 pub const CONE_HALF_ANGLE_DEG: f64 = 15.0;
-const CONTRACTION_RATIO: f64 = 4.0;
-const CONVERGE_HALF_ANGLE_DEG: f64 = 30.0;
-const THROAT_ARC_UP: f64 = 1.5;
+/// Defaults of the four §10 family parameters that used to be hard-coded
+/// consts and are now per-case fields — the parametric editor puts a handle on
+/// every one of them, so they cannot be constants any more.
+pub const CONTRACTION_RATIO: f64 = 4.0;
+pub const CONVERGE_HALF_ANGLE_DEG: f64 = 30.0;
+pub const THROAT_ARC_UP: f64 = 1.5;
+pub const CHAMBER_LEN_RT: f64 = cfd_geom::CHAMBER_LEN_RT;
 /// Downstream throat arc of the §10 family. Per-case since the direct-angle
 /// path exists: measured hardware comes with its own arc (Raptor 2, 0.300 r_t).
 pub const THROAT_ARC_DOWN: f64 = 0.382;
@@ -163,6 +167,14 @@ pub struct CaseParams {
     /// Downstream throat-arc radius in r_t. The §10 family value is 0.382;
     /// measured geometry brings its own (Raptor 2: 0.300).
     pub throat_arc_down: f64,
+    /// The rest of the §10 converging family, per-case since the parametric
+    /// editor puts a drag handle on each: chamber radius (as a contraction
+    /// ratio), converging half-angle, upstream throat arc, and the chamber
+    /// straight length in r_t.
+    pub contraction_ratio: f64,
+    pub converge_half_angle_deg: f64,
+    pub throat_arc_up: f64,
+    pub chamber_len_rt: f64,
     pub altitude_m: f64,
     /// Labelled vacuum mode: back pressure fixed at `VACUUM_P_FRAC * p0`,
     /// ignoring `altitude_m`. The region above the 58 km slider cap.
@@ -194,6 +206,10 @@ impl Default for CaseParams {
             contour_kind: ContourKind::Conical,
             bell_percent: 0.8,
             throat_arc_down: THROAT_ARC_DOWN,
+            contraction_ratio: CONTRACTION_RATIO,
+            converge_half_angle_deg: CONVERGE_HALF_ANGLE_DEG,
+            throat_arc_up: THROAT_ARC_UP,
+            chamber_len_rt: CHAMBER_LEN_RT,
             altitude_m: 0.0,
             vacuum: false,
             lz_rt: LZ_DEFAULT,
@@ -514,6 +530,12 @@ impl EnginePreset {
             contour_kind: self.contour_kind,
             bell_percent: self.bell_percent,
             throat_arc_down: self.throat_arc_down,
+            // Every shipped engine uses the §10 converging family; only the
+            // divergent section and the downstream arc are per-engine.
+            contraction_ratio: CONTRACTION_RATIO,
+            converge_half_angle_deg: CONVERGE_HALF_ANGLE_DEG,
+            throat_arc_up: THROAT_ARC_UP,
+            chamber_len_rt: CHAMBER_LEN_RT,
             altitude_m,
             vacuum,
             lz_rt,
@@ -653,13 +675,51 @@ pub fn nozzle_curve(p: &CaseParams) -> cfd_geom::NozzleCurve {
     let spec = NozzleSpec {
         throat_radius_m: p.r_throat_m,
         area_ratio: p.area_ratio,
-        contraction_ratio: CONTRACTION_RATIO,
-        converge_half_angle_deg: CONVERGE_HALF_ANGLE_DEG,
-        throat_arc_up: THROAT_ARC_UP,
+        contraction_ratio: p.contraction_ratio,
+        converge_half_angle_deg: p.converge_half_angle_deg,
+        throat_arc_up: p.throat_arc_up,
         throat_arc_down: p.throat_arc_down,
         contour,
     };
-    cfd_geom::NozzleCurve::new(spec)
+    cfd_geom::NozzleCurve {
+        spec,
+        chamber_len_rt: p.chamber_len_rt,
+    }
+}
+
+/// Pull an edited curve's shape back into the case — the inverse of
+/// [`nozzle_curve`], run when a handle drag is committed.
+///
+/// The one asymmetry is the contour kind: `cfd_geom::ContourKind::DirectBell`
+/// comes back as `ContourKind::MeasuredBell`, which is how a theta_n or theta_e
+/// drag takes a Rao-table bell off the table. `bell_percent` keeps carrying the
+/// LENGTH in both cases.
+pub fn apply_curve(p: &mut CaseParams, c: &cfd_geom::NozzleCurve) {
+    p.r_throat_m = c.spec.throat_radius_m;
+    p.area_ratio = c.spec.area_ratio;
+    p.contraction_ratio = c.spec.contraction_ratio;
+    p.converge_half_angle_deg = c.spec.converge_half_angle_deg;
+    p.throat_arc_up = c.spec.throat_arc_up;
+    p.throat_arc_down = c.spec.throat_arc_down;
+    p.chamber_len_rt = c.chamber_len_rt;
+    match c.spec.contour {
+        cfd_geom::ContourKind::Conical { .. } => p.contour_kind = ContourKind::Conical,
+        cfd_geom::ContourKind::ParabolicBell { bell_percent } => {
+            p.contour_kind = ContourKind::ParabolicBell;
+            p.bell_percent = bell_percent;
+        }
+        cfd_geom::ContourKind::DirectBell {
+            theta_n_deg,
+            theta_e_deg,
+            length_fraction,
+        } => {
+            p.contour_kind = ContourKind::MeasuredBell {
+                theta_n_deg,
+                theta_e_deg,
+            };
+            p.bell_percent = length_fraction;
+        }
+    }
 }
 
 /// How finely this case's wall is tessellated: chord tolerance 1% of the base

@@ -11,11 +11,13 @@ mod contour;
 mod curve;
 mod editor;
 mod grade;
+mod handles;
 mod rao;
 mod raster;
 
 pub use contour::generate_contour;
 pub use curve::{BellGeometry, NozzleCurve, Piece, Tessellation, CHAMBER_LEN_RT};
+pub use handles::{DragOutcome, Handle, HandleId, HandleKind};
 pub use editor::Editor;
 pub use grade::{grade_from_solid, GradeSpec};
 pub use rao::rao_angles;

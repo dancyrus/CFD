@@ -15,15 +15,26 @@ use eframe::egui::{
 };
 
 use cfd_contract::{FieldKind, Grid, Snapshot};
+use cfd_geom::HandleKind;
 
 use crate::colormap::{lut_for, SOLID_RGBA};
-use crate::editor::EditorBackend;
+use crate::editor::WallEditor;
 use crate::worker::UiFrame;
 
 pub const BG: Color32 = Color32::from_gray(14);
 const WALL_COMMITTED: Color32 = Color32::from_rgb(150, 150, 160);
 const WALL_GHOST: Color32 = Color32::from_rgb(255, 196, 0);
-const ACCENT: Color32 = Color32::from_rgb(110, 170, 255);
+pub const ACCENT: Color32 = Color32::from_rgb(110, 170, 255);
+/// Derived markers (the Bézier control point Q and its control polygon) are
+/// drawn in a colour that reads as "annotation", never as "grab me".
+const DERIVED: Color32 = Color32::from_rgb(140, 130, 175);
+/// How far a tangent handle's dot sits from its anchor, in PIXELS. A wall angle
+/// has no natural length, so this offset cannot live in world units: at a fixed
+/// world offset the dot would leave the screen on a big nozzle and hide inside
+/// the wall on a small one.
+const TANGENT_DOT_PX: f32 = 34.0;
+/// Pick radius, pixels.
+const PICK_PX: f32 = 11.0;
 
 #[derive(Clone, Copy)]
 pub struct View {
@@ -84,6 +95,13 @@ pub struct CanvasOutput {
     /// A primary-button drag was consumed by the space-pan override this
     /// frame (the app uses it to suppress the play/pause toggle on release).
     pub space_panned: bool,
+    /// The handle under the pointer (hover) or being dragged, and the live
+    /// clamp message when a drag has hit a constraint.
+    pub active_handle: Option<usize>,
+    pub clamp: Option<String>,
+    /// Ctrl+click or right-click landed on an editor that refuses point edits
+    /// (a parametric wall). The app turns this into the one-way break.
+    pub wants_point_edit: bool,
 }
 
 pub struct Canvas {
@@ -93,6 +111,8 @@ pub struct Canvas {
     uploaded: Option<UploadKey>,
     drag_point: Option<usize>,
     hover_point: Option<usize>,
+    /// Live clamp message from the handle currently being dragged.
+    clamp: Option<String>,
     /// Display-resample LUTs for graded grids: the texture is uniform in
     /// WORLD coordinates (so the image is geometrically true), each texel
     /// gathering its containing cell. Rebuilt when the grid changes; on a
@@ -111,6 +131,7 @@ impl Canvas {
             uploaded: None,
             drag_point: None,
             hover_point: None,
+            clamp: None,
             lut_grid: None,
             lut_cols: Vec::new(),
             lut_rows: Vec::new(),
@@ -155,7 +176,7 @@ impl Canvas {
         field: FieldKind,
         range: (f32, f32),
         smooth: bool,
-        editor: &mut dyn EditorBackend,
+        editor: &mut dyn WallEditor,
         editor_on: bool,
         committed_wall: &[[f64; 2]],
         is_mock: bool,
@@ -184,20 +205,28 @@ impl Canvas {
             }
         }
 
-        // ---- editor interaction (picking and drag are the UI's job; the
-        // backend owns the points).
+        // ---- editor interaction. Picking and drag are the UI's job; the
+        // backend owns the parameters and their constraints.
+        //
+        // ALL of it happens in the FOLDED frame. The canvas mirrors the
+        // half-plane about the axis and handles are drawn only on the upper
+        // copy, so a cursor on the lower copy arrives with negative r. Picking
+        // has always folded (`w[1].abs()`); DRAG did not, and an angle handle
+        // computed from cursor-minus-anchor inverts on the mirrored copy — drag
+        // theta_n on the bottom half and the bell turns inside out. Fold once,
+        // here, and pass the folded point to both.
         let space_down = ui.input(|i| i.key_down(egui::Key::Space));
         let mods = ui.input(|i| i.modifiers);
         self.hover_point = None;
         let mut editor_grabbed = false;
         if editor_on {
-            let tol = (10.0 / view.scale) as f64;
-            let world = response.hover_pos().map(|p| {
+            let fold = |p: Pos2| {
                 let w = view.s2w(rect, p);
-                [w[0], w[1].abs()] // picking works on either mirror half
-            });
+                [w[0], w[1].abs()]
+            };
+            let world = response.hover_pos().map(fold);
             if let Some(w) = world {
-                self.hover_point = editor.hit_test(w, tol);
+                self.hover_point = pick(editor, &view, rect, w);
             }
             if !space_down {
                 // Grab on PRESS, not on egui's drag-start: by the time the
@@ -216,39 +245,45 @@ impl Canvas {
                 });
                 if pressed {
                     if let Some(po) = press_origin.filter(|po| rect.contains(*po)) {
-                        let w = view.s2w(rect, po);
-                        self.drag_point = editor.hit_test([w[0], w[1].abs()], tol);
+                        self.drag_point = pick(editor, &view, rect, fold(po));
                     }
                 }
                 if let (Some(i), Some(w), true) = (self.drag_point, world, down) {
-                    editor.drag(i, w);
+                    self.clamp = editor.drag(i, w);
                     editor_grabbed = true;
                 }
                 // Commit only if the wall actually changed — a motionless
-                // click on a point must not flip the app into sandbox mode.
-                if released && self.drag_point.take().is_some() && editor.points() != committed_wall
+                // click on a handle must not flip the app into a new state.
+                if released && self.drag_point.take().is_some() && editor.polyline() != committed_wall
                 {
                     out.commit_geometry = true;
+                    self.clamp = None;
                 }
                 if response.clicked() && mods.ctrl {
                     if let Some(w) = world {
-                        editor.insert(w);
-                        out.commit_geometry = true;
+                        if editor.insert(w) {
+                            out.commit_geometry = true;
+                        } else {
+                            out.wants_point_edit = true;
+                        }
                     }
                 }
                 if response.secondary_clicked() {
-                    if let Some(i) = self.hover_point {
-                        editor.remove(i);
-                        out.commit_geometry = true;
+                    match self.hover_point {
+                        Some(i) if editor.remove(i) => out.commit_geometry = true,
+                        _ => out.wants_point_edit = true,
                     }
                 }
             }
         } else {
             self.drag_point = None;
+            self.clamp = None;
         }
         if self.drag_point.is_some() {
             editor_grabbed = true;
         }
+        out.active_handle = self.drag_point.or(self.hover_point);
+        out.clamp = self.clamp.clone();
 
         // ---- pan: middle-drag always; primary-drag when space is held or
         // nothing in the editor wants the pointer.
@@ -386,7 +421,7 @@ impl Canvas {
         rect: Rect,
         view: View,
         committed: &[[f64; 2]],
-        editor: &dyn EditorBackend,
+        editor: &dyn WallEditor,
         editor_on: bool,
     ) {
         let to_screen = |pts: &[[f64; 2]], mirror: bool| -> Vec<Pos2> {
@@ -394,7 +429,7 @@ impl Canvas {
                 .map(|p| view.w2s(rect, [p[0], if mirror { -p[1] } else { p[1] }]))
                 .collect()
         };
-        let dragging = editor_on && editor.points() != committed;
+        let dragging = editor_on && editor.polyline() != committed;
         for mirror in [false, true] {
             let color = if dragging {
                 Color32::from_rgba_unmultiplied(150, 150, 160, 110)
@@ -408,22 +443,58 @@ impl Canvas {
             if editor_on && dragging {
                 // Ghost preview of the uncommitted wall.
                 painter.add(egui::Shape::line(
-                    to_screen(editor.points(), mirror),
+                    to_screen(editor.polyline(), mirror),
                     Stroke::new(1.5, WALL_GHOST),
                 ));
             }
         }
-        if editor_on {
-            for (i, p) in editor.points().iter().enumerate() {
-                let pos = view.w2s(rect, *p);
-                let (radius, fill) = if self.drag_point == Some(i) {
-                    (6.0, WALL_GHOST)
-                } else if self.hover_point == Some(i) {
-                    (6.0, ACCENT)
-                } else {
-                    (4.0, Color32::from_gray(30))
-                };
-                painter.circle(pos, radius, fill, Stroke::new(1.5, ACCENT));
+        if !editor_on {
+            return;
+        }
+        // ---- the dashed N-Q-E control polygon, upper half only. It explains
+        // where Q comes from; it is not geometry the user can touch.
+        if let Some(poly) = editor.control_polygon() {
+            let pts = to_screen(&poly, false);
+            for seg in pts.windows(2) {
+                dashed(painter, seg[0], seg[1], Stroke::new(1.0, DERIVED));
+            }
+        }
+        // ---- handles, upper half only. Picking folds, so the lower copy is
+        // still live; drawing both would double every marker on the axis.
+        for (i, h) in editor.handles().iter().enumerate() {
+            let pos = handle_screen(h, &view, rect);
+            let active = self.drag_point == Some(i);
+            let hover = self.hover_point == Some(i);
+            match h.kind {
+                HandleKind::Derived => {
+                    // Q: a hollow diamond, deliberately not a grab dot. It has
+                    // zero remaining degrees of freedom — dragging it would
+                    // break the G1 tangency at N that makes theta_n mean
+                    // anything — so it must not look like the others.
+                    let a = view.w2s(rect, h.anchor);
+                    let d = 6.0;
+                    painter.add(egui::Shape::closed_line(
+                        vec![
+                            Pos2::new(a.x, a.y - d),
+                            Pos2::new(a.x + d, a.y),
+                            Pos2::new(a.x, a.y + d),
+                            Pos2::new(a.x - d, a.y),
+                        ],
+                        Stroke::new(1.2, DERIVED),
+                    ));
+                }
+                HandleKind::Tangent { .. } => {
+                    // A stalk from the anchor to the dot, so it reads as an
+                    // angle about that point rather than a free point.
+                    let a = view.w2s(rect, h.anchor);
+                    painter.line_segment([a, pos], Stroke::new(1.0, ACCENT.gamma_multiply(0.7)));
+                    let (r, fill) = handle_style(active, hover);
+                    painter.circle(pos, r, fill, Stroke::new(1.5, ACCENT));
+                }
+                HandleKind::Point => {
+                    let (r, fill) = handle_style(active, hover);
+                    painter.circle(pos, r, fill, Stroke::new(1.5, ACCENT));
+                }
             }
         }
     }
@@ -500,4 +571,72 @@ pub fn colorbar(ui: &mut egui::Ui, field: FieldKind, range: (f32, f32), height: 
         FontId::monospace(10.0),
         ui.visuals().text_color(),
     );
+}
+
+/// Screen position of a handle's marker. Tangent handles sit a FIXED PIXEL
+/// distance along their direction, which is why this conversion lives here and
+/// not in `cfd-geom`.
+fn handle_screen(h: &crate::editor::EditHandle, view: &View, rect: Rect) -> Pos2 {
+    let a = view.w2s(rect, h.anchor);
+    match h.kind {
+        HandleKind::Tangent { dir } => {
+            // World (z, r) -> screen (x, y) flips r, and the transform is a
+            // uniform scale, so a unit world direction is a unit screen one.
+            let (dx, dy) = (dir[0] as f32, -dir[1] as f32);
+            let m = dx.hypot(dy).max(1e-6);
+            Pos2::new(
+                a.x + TANGENT_DOT_PX * dx / m,
+                a.y + TANGENT_DOT_PX * dy / m,
+            )
+        }
+        _ => a,
+    }
+}
+
+fn handle_style(active: bool, hover: bool) -> (f32, Color32) {
+    if active {
+        (6.0, WALL_GHOST)
+    } else if hover {
+        (6.0, ACCENT)
+    } else {
+        (4.0, Color32::from_gray(30))
+    }
+}
+
+/// Nearest pickable handle within `PICK_PX` of a FOLDED world point, or None.
+///
+/// Picking is done in screen space because tangent dots are placed in screen
+/// space: a world-space hit test would pick the anchor, not the dot the user
+/// can see, and the two are a nozzle-size-dependent distance apart.
+fn pick(editor: &dyn WallEditor, view: &View, rect: Rect, folded: [f64; 2]) -> Option<usize> {
+    let cursor = view.w2s(rect, folded);
+    let mut best: Option<(usize, f32)> = None;
+    for (i, h) in editor.handles().iter().enumerate() {
+        if !h.pickable {
+            continue;
+        }
+        let d = handle_screen(h, view, rect).distance_sq(cursor);
+        if d <= PICK_PX * PICK_PX && best.is_none_or(|(_, b)| d < b) {
+            best = Some((i, d));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+/// A dashed segment. egui 0.31 has no dashed stroke on `Painter::line_segment`.
+fn dashed(painter: &egui::Painter, a: Pos2, b: Pos2, stroke: Stroke) {
+    const DASH: f32 = 6.0;
+    const GAP: f32 = 4.0;
+    let d = b - a;
+    let len = d.length();
+    if len < 1e-3 {
+        return;
+    }
+    let step = DASH + GAP;
+    let mut t = 0.0;
+    while t < len {
+        let t1 = (t + DASH).min(len);
+        painter.line_segment([a + d * (t / len), a + d * (t1 / len)], stroke);
+        t += step;
+    }
 }

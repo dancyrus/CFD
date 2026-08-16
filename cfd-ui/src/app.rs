@@ -11,13 +11,13 @@ use eframe::egui::{
 
 use cfd_contract::{FieldKind, SolverCommand};
 
-use crate::canvas::{colorbar, fmt_value, Canvas, BG};
+use crate::canvas::{colorbar, fmt_value, Canvas, ACCENT, BG};
 use crate::case::{
-    self, ambient_nd, atmosphere, ideal_cf, make_setup, nozzle_contour, rasterize_wall,
-    separation_altitude_m, separation_threshold, CaseParams, ContourKind, DomainPreset, ALT_MAX_M,
-    PRESETS, R_UNIVERSAL_SI, VACUUM_P_FRAC,
+    self, ambient_nd, apply_curve, atmosphere, ideal_cf, make_setup, nozzle_contour,
+    rasterize_wall, separation_altitude_m, separation_threshold, CaseParams, ContourKind,
+    DomainPreset, ALT_MAX_M, PRESETS, R_UNIVERSAL_SI, VACUUM_P_FRAC,
 };
-use crate::editor::{EditorBackend, StubEditor};
+use crate::editor::{ParametricEditor, WallEditor};
 use crate::worker::{UiCommand, UiFrame};
 
 const TURBO_STEPS: [u32; 3] = [1, 4, 16];
@@ -86,8 +86,13 @@ pub struct CfdApp {
     smooth: bool,
 
     canvas: Canvas,
-    editor: StubEditor,
+    editor: ParametricEditor,
     editor_on: bool,
+    /// The handle under the pointer or being dragged, and the live clamp
+    /// message when a drag has reached a constraint. Both feed the sidebar's
+    /// handle readout — the number the user is actually setting.
+    active_handle: Option<usize>,
+    handle_clamp: Option<String>,
     committed_wall: Vec<[f64; 2]>,
     /// The contour kind the generator ACTUALLY produced for `committed_wall`,
     /// and the rejection message when it fell back to the cone. Never the
@@ -139,8 +144,7 @@ impl CfdApp {
         for k in FieldKind::ALL {
             locked[k as usize] = lock_range(k, initial.snapshot.range(k));
         }
-        let mut editor = StubEditor::new(wall.points.clone());
-        editor.set_domain(params.lz_rt, params.lr_rt);
+        let editor = ParametricEditor::new(&params);
         CfdApp {
             out,
             tx,
@@ -166,6 +170,8 @@ impl CfdApp {
             canvas: Canvas::new(),
             editor,
             editor_on: false,
+            active_handle: None,
+            handle_clamp: None,
             committed_wall: wall.points,
             wall_kind: Some(wall.kind),
             wall_fallback: wall.fallback,
@@ -189,15 +195,23 @@ impl CfdApp {
         self.cmd(SolverCommand::Pause(p));
     }
 
+    /// Commit a parametric handle drag.
+    ///
+    /// **Provenance.** A handle edit is still a member of the §10 contour
+    /// family — it is a bell with different numbers, not a drawing — so it
+    /// KEEPS the engineering report and it SETS the contour kind rather than
+    /// blanking it. What it clears is the preset NAME: an RS-25 with a
+    /// hand-tuned theta_n is no longer RS-25. Only the freeform editor raises
+    /// "SANDBOX — drawn geometry", because only a drawing is outside every
+    /// contour family the acceptance tests cover.
     fn commit_editor_geometry(&mut self) {
-        self.committed_wall = self.editor.points().to_vec();
-        self.geometry_custom = true;
-        self.preset = None; // hand-drawn walls are no named engine
-        // …and no contour family either. This is the fourth writer of
-        // `committed_wall`; leaving the generator's provenance behind here
-        // would put "measured bell · θ_n 32.0°" over a wall the user dragged
-        // by hand, which is the same lie as naming a bell over a fallback cone.
-        self.wall_kind = None;
+        self.committed_wall = self.editor.polyline().to_vec();
+        // Pull the edited curve back into the case, so the sidebar, the report
+        // and the next regeneration all agree with the wall on screen.
+        apply_curve(&mut self.params, self.editor.curve());
+        self.ui_area_ratio = self.params.area_ratio;
+        self.preset = None; // a hand-tuned bell is no named engine
+        self.wall_kind = Some(self.params.contour_kind);
         self.wall_fallback = None;
         // Mid-run edits rasterize onto the solver's CURRENT (graded) grid —
         // that is the cheap-to-overwrite-mask property the sandbox rests on.
@@ -215,7 +229,7 @@ impl CfdApp {
         }
         self.params.area_ratio = self.ui_area_ratio;
         let wall = nozzle_contour(&self.params);
-        self.editor.set_points(wall.points.clone());
+        self.editor.reset(&self.params);
         self.committed_wall = wall.points;
         self.wall_kind = Some(wall.kind);
         self.wall_fallback = wall.fallback;
@@ -256,7 +270,7 @@ impl CfdApp {
         self.sync_domain_fields();
         let wall = nozzle_contour(&self.params);
         self.editor.set_domain(self.params.lz_rt, self.params.lr_rt);
-        self.editor.set_points(wall.points.clone());
+        self.editor.reset(&self.params);
         self.committed_wall = wall.points;
         self.wall_kind = Some(wall.kind);
         self.wall_fallback = wall.fallback;
@@ -313,7 +327,11 @@ impl CfdApp {
         self.mem_confirm = false;
         self.params = cand;
         self.cost_cache = None;
+        // The mesh sets the chord tolerance, so a resolution change re-sizes
+        // the polyline the solver gets.
         self.editor.set_domain(self.params.lz_rt, self.params.lr_rt);
+        self.editor.reset(&self.params);
+        self.committed_wall = self.editor.polyline().to_vec();
         let setup = make_setup(&self.params, &self.committed_wall);
         let _ = self.tx.send(UiCommand::Rebuild(Box::new(setup)));
         self.relock_pending = true;
@@ -706,6 +724,7 @@ impl CfdApp {
             .weak()
             .small(),
         );
+        self.handle_readout(ui);
         // Honesty flag: the wall on screen is not the wall that was asked for.
         // eprintln! into a windowed app's stdout is not a disclosure.
         if let Some(why) = &self.wall_fallback {
@@ -778,6 +797,51 @@ impl CfdApp {
             .small(),
         );
         self.domain_section(ui);
+    }
+
+    /// The live value of the handle under the pointer, and the clamp reason
+    /// when a drag has run into a constraint.
+    ///
+    /// This is where the numbers a drag is setting become visible. Without it
+    /// the parametric editor is a shape that moves; with it, it is an
+    /// instrument — dragging theta_n reads "theta_n 34.2°" while you drag.
+    fn handle_readout(&mut self, ui: &mut egui::Ui) {
+        if !self.editor_on {
+            return;
+        }
+        let handles = self.editor.handles();
+        let text = match self.active_handle.and_then(|i| handles.get(i)) {
+            Some(h) => format!("{} {:.3} {}", h.label, h.value, h.unit),
+            None => {
+                let n = handles.len();
+                let drag = handles.iter().filter(|h| h.pickable).count();
+                if n == drag {
+                    format!("wall editor · {n} handles · drag to shape")
+                } else {
+                    // The derived ones are drawn but not pickable, and saying
+                    // so is the difference between "one handle is broken" and
+                    // "one marker is an annotation".
+                    format!("wall editor · {n} handles, {drag} draggable · Q is derived")
+                }
+            }
+        };
+        ui.label(RichText::new(text).small().color(ACCENT))
+            .on_hover_text(
+                "A parametric wall is edited through its degrees of freedom, not \
+                 through the tessellated polyline the solver eats. The hollow \
+                 diamond is the Bézier control point Q: it is DERIVED from the two \
+                 wall angles and the two endpoints, has no remaining freedom, and \
+                 is deliberately not draggable — moving it would break the tangency \
+                 at N that makes θ_n a wall angle rather than a decoration.",
+            );
+        if let Some(why) = &self.handle_clamp {
+            ui.label(
+                RichText::new("handle clamped — the wall cannot go further this way")
+                    .small()
+                    .color(AMBER),
+            )
+            .on_hover_text(why.clone());
+        }
     }
 
     fn operating_point(&mut self, ui: &mut egui::Ui) {
@@ -1271,6 +1335,8 @@ impl eframe::App for CfdApp {
                 if output.space_panned {
                     self.space_panned = true;
                 }
+                self.active_handle = output.active_handle;
+                self.handle_clamp = output.clamp;
                 if output.commit_geometry {
                     self.commit_editor_geometry();
                 }
