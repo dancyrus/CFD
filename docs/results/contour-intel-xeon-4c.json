@@ -1,6 +1,6 @@
 {
-  "commit": "a898617d72c34b7b0071b3e07145eaf5471009dc",
-  "timestamp": "2026-08-16T23:28:22Z",
+  "commit": "4169a568785c19f8d2773f8be51f2f4c2bbebe70",
+  "timestamp": "2026-08-16T23:31:40Z",
   "machine": "intel-xeon-4c",
   "tests": [
     {"id":"cone-equivalence","name":"generate_contour(Conical) vs legacy cone at eps 2, 8 and every preset","expected":"<= 1e-9","actual":0.000000000000007105427357601002,"units":"max |dr| (r_t)","pass":true},
