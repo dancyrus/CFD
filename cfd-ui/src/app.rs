@@ -542,6 +542,14 @@ impl CfdApp {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
+        // A field being typed into owns the keyboard. Every shortcut below is
+        // also a character you type into a number: 1-8 pick the display field,
+        // "." single-steps, E is the e in 1e-5. Without this gate, typing 3
+        // into the resolution field switched the display to Pressure, and the
+        // "." in 1.5 paused the solver and stepped it once.
+        if keyboard_is_captured(ctx) {
+            return;
+        }
         let (pressed, space_released) = ctx.input(|i| {
             let mut v: Vec<Key> = Vec::new();
             for k in [Key::Period, Key::R, Key::F, Key::T, Key::E, Key::L] {
@@ -1497,6 +1505,20 @@ impl eframe::App for CfdApp {
     }
 }
 
+/// True while a widget owns the keyboard, i.e. while the player is typing into
+/// a field. The single gate for every global shortcut.
+///
+/// `wants_keyboard_input` is `memory.focused().is_some()`, and in egui 0.31
+/// only a widget that registers `interested_in_focus` can hold that: `DragValue`
+/// — which does so exactly while it is in text-entry mode, being a draggable
+/// button otherwise — and `TextEdit`. A `Button` never takes focus, so clicking
+/// Play or a preset does not leave the shortcuts dead behind it. Focus is set
+/// during the widget pass and read at the start of the next one, which is when
+/// `handle_keys` runs: the frame that carries the keystroke.
+fn keyboard_is_captured(ctx: &egui::Context) -> bool {
+    ctx.wants_keyboard_input()
+}
+
 /// Fold a stored discriminant array over the defaults, one field at a time.
 ///
 /// Per-field rather than all-or-nothing: an index this build does not know
@@ -1937,6 +1959,118 @@ mod tests {
             got[FieldKind::Pressure as usize],
             Preset::Turbo,
             "one bad entry must not discard the others"
+        );
+    }
+
+    /// A headless app on the Preview extents. The mock is what makes this
+    /// cheap — the keyboard path never touches the solver, and a real one
+    /// would spend the whole test building a grid nobody steps.
+    fn headless_app() -> (CfdApp, std::sync::mpsc::Receiver<UiCommand>) {
+        let (lz_rt, lr_rt, cells_per_rt, dz_over_dr) = DomainPreset::Preview.values();
+        let params = CaseParams {
+            lz_rt,
+            lr_rt,
+            cells_per_rt,
+            dz_over_dr,
+            ..CaseParams::default()
+        };
+        let wall = case::nozzle_contour(&params);
+        let setup = case::make_setup(&params, &wall.points);
+        let solver = cfd_core::MockSolver::new(setup).expect("mock rejected the preview case");
+        let info = cfd_contract::StepInfo {
+            step: 0,
+            time: 0.0,
+            dt: 0.0,
+            residual: f64::NAN,
+            converged: false,
+            floor_activations: 0,
+        };
+        let initial = crate::worker::make_frame(&solver, info);
+        let (_in, out) = triple_buffer::triple_buffer(&initial);
+        let (tx, rx) = std::sync::mpsc::channel();
+        // The receiver goes back to the caller: `cmd` swallows a send error, so
+        // dropping it would hide a shortcut that did fire.
+        (CfdApp::new(out, tx, initial, params, wall, true, None), rx)
+    }
+
+    /// One egui pass containing a `DragValue`, with `key` pressed. Returns the
+    /// widget's id so a later pass can hand focus back or take it away.
+    fn pass_with_a_number_field(
+        ctx: &egui::Context,
+        value: &mut f64,
+        key: Key,
+        take_focus: bool,
+    ) -> egui::Id {
+        let mut id = egui::Id::NULL;
+        let raw = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        // The pass output is the tessellated frame — nothing to paint here,
+        // only the input and focus bookkeeping it leaves in the context.
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                id = ui.add(egui::DragValue::new(value)).id;
+                if take_focus {
+                    ui.memory_mut(|m| m.request_focus(id));
+                }
+            });
+        });
+        id
+    }
+
+    /// The bug: every shortcut is also a character you type into a number.
+    /// Typing 3 into a field switched the display to Pressure, and the "." in
+    /// 1.5 paused the solver and single-stepped it.
+    ///
+    /// This pins both halves — the gate in `handle_keys`, and the egui
+    /// behaviour it rests on, which is the half a version bump can move: a
+    /// focused `DragValue` is a `DragValue` in text-entry mode, so
+    /// `wants_keyboard_input` is true exactly while the player is typing.
+    #[test]
+    fn typing_in_a_field_does_not_fire_the_shortcuts() {
+        let (mut app, _rx) = headless_app();
+        let ctx = egui::Context::default();
+        let mut v = 32.0_f64;
+
+        // Nothing focused: the shortcuts are live. Half the fix — a gate that
+        // swallowed every key would satisfy the other half on its own.
+        app.field = FieldKind::Mach;
+        let id = pass_with_a_number_field(&ctx, &mut v, Key::Num3, false);
+        assert!(!keyboard_is_captured(&ctx), "no field is being typed into");
+        app.handle_keys(&ctx);
+        assert_eq!(app.field, FieldKind::Pressure, "3 must pick Pressure");
+
+        // The same keystroke into a focused field: the display must not move.
+        app.field = FieldKind::Mach;
+        app.paused = false;
+        pass_with_a_number_field(&ctx, &mut v, Key::Num3, true);
+        assert!(
+            keyboard_is_captured(&ctx),
+            "a DragValue in text-entry mode must own the keyboard"
+        );
+        app.handle_keys(&ctx);
+        assert_eq!(app.field, FieldKind::Mach, "typing 3 changed the display");
+
+        // ... and neither must the decimal point of "1.5" step the solver.
+        pass_with_a_number_field(&ctx, &mut v, Key::Period, true);
+        app.handle_keys(&ctx);
+        assert!(!app.paused, "typing . paused the solver");
+
+        // Focus released (Escape, Enter, a click elsewhere): shortcuts return.
+        ctx.memory_mut(|m| m.surrender_focus(id));
+        pass_with_a_number_field(&ctx, &mut v, Key::Num5, false);
+        app.handle_keys(&ctx);
+        assert_eq!(
+            app.field,
+            FieldKind::Density,
+            "shortcuts must come back when the field is done"
         );
     }
 
