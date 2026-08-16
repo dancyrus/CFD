@@ -124,7 +124,9 @@ a silently rescaling colorbar.
 Positions are normalised 0→1 and are **not evenly spaced**. Each set is the
 *minimal* number of anchors that reproduces the reference map to
 **max ΔE00 ≤ 2.0** (about one just-noticeable difference) under
-`colormap.rs`'s piecewise-linear-in-sRGB `build()`. Copy them exactly.
+`colormap.rs`'s piecewise-linear-in-sRGB `build()` — including `build()`'s
+rounding of every entry to `u8`, which the tool models, so the figure quoted
+here is the one the shipped LUT actually measures. Copy them exactly.
 Regenerate rather than hand-edit — `docs/tools/verify_colormap.py` emits these
 tables:
 
@@ -136,37 +138,39 @@ python docs/tools/verify_colormap.py --diverging 59,76,192 180,4,38
 ```
 
 ### `viridis` — Density
-7 anchors · max ΔE00 1.50 · L\* 14.9→90.9 · step CV 1.2%
+7 anchors · max ΔE00 1.69 · L\* 14.9→90.9 · step CV 1.2%
 
 | pos | rgb |
 |---|---|
 | 0.0000 | 68, 1, 84 |
-| 0.1725 | 68, 59, 132 |
-| 0.4157 | 40, 124, 142 |
-| 0.5647 | 31, 160, 136 |
-| 0.7059 | 70, 192, 111 |
-| 0.8784 | 173, 220, 48 |
+| 0.1765 | 67, 61, 132 |
+| 0.4196 | 40, 125, 142 |
+| 0.5882 | 33, 165, 133 |
+| 0.7098 | 72, 193, 110 |
+| 0.8863 | 178, 221, 45 |
 | 1.0000 | 253, 231, 37 |
 
 ### `inferno` — Pressure, Speed
-11 anchors · max ΔE00 1.96 · L\* 0.1→97.9 · step CV 1.1%
+12 anchors · max ΔE00 1.96 · L\* 0.1→97.9 · step CV 1.1%
 
 | pos | rgb |
 |---|---|
 | 0.0000 | 0, 0, 4 |
-| 0.0627 | 11, 7, 36 |
-| 0.1647 | 50, 10, 94 |
-| 0.2824 | 100, 21, 110 |
-| 0.4314 | 160, 42, 99 |
-| 0.5961 | 219, 80, 59 |
-| 0.7294 | 247, 132, 16 |
-| 0.8235 | 252, 176, 20 |
-| 0.9059 | 245, 217, 73 |
+| 0.0667 | 12, 8, 38 |
+| 0.1176 | 30, 12, 69 |
+| 0.1686 | 52, 10, 95 |
+| 0.2980 | 106, 23, 110 |
+| 0.4275 | 159, 42, 99 |
+| 0.5922 | 218, 78, 60 |
+| 0.7255 | 247, 130, 18 |
+| 0.8157 | 252, 172, 17 |
+| 0.9020 | 246, 215, 70 |
 | 0.9569 | 241, 241, 121 |
 | 1.0000 | 252, 255, 164 |
 
 ### `black-body` — Temperature
-7 anchors · max ΔE00 1.94 · L\* 0.0→100.0 · linear in L\*
+7 anchors · max ΔE00 1.94 (**float fit, not re-measured** — see below) ·
+L\* 0.0→100.0 · linear in L\*
 
 | pos | rgb |
 |---|---|
@@ -183,74 +187,84 @@ defect — the map is designed for *linear L\**, not constant ΔE00, and the
 spikes sit at the near-black end where 8-bit quantisation dominates. Accepted
 tradeoff for the heat semantics.
 
+**Outstanding:** every other table on this page was re-fitted after
+`verify_colormap.py` was corrected to round each LUT entry to `u8` the way
+`build()` does. `black-body` was not, because its reference map is not
+reproducible from the tool — it is neither a matplotlib nor a `cmcrameri` name,
+and no anchor CSV for it is checked in. Its 1.94 is therefore the old float-fit
+figure and the shipped LUT is likely a little above it, by the same ~0.1–0.2
+the other maps moved. The table itself is unchanged and in use. Closing this
+means checking in the source table it was fitted from, then re-running the tool.
+
 ### `batlow` — Mach
-7 anchors · max ΔE00 1.80 · L\* 12.2→87.2 · step CV 8.9%
+9 anchors · max ΔE00 1.23 · L\* 12.2→87.2 · step CV 8.9%
 
 | pos | rgb |
 |---|---|
 | 0.0000 | 1, 25, 89 |
-| 0.1137 | 16, 64, 96 |
-| 0.2745 | 40, 100, 95 |
+| 0.1255 | 17, 67, 96 |
+| 0.2706 | 39, 99, 95 |
+| 0.4392 | 103, 123, 62 |
 | 0.5569 | 157, 137, 43 |
 | 0.6627 | 209, 147, 66 |
-| 0.7608 | 244, 159, 114 |
+| 0.7529 | 242, 157, 109 |
+| 0.8196 | 252, 169, 149 |
 | 1.0000 | 250, 204, 250 |
 
 ### `vik` — VelocityZ, VelocityR
-9 anchors · max ΔE00 1.27 · L\* 11.2→91.6 (apex at 0.49)→16.3 · step CV 17.6%
+9 anchors · max ΔE00 1.72 · L\* 11.2→91.6 (apex at 0.49)→16.3 · step CV 17.6%
 
 | pos | rgb |
 |---|---|
 | 0.0000 | 0, 18, 97 |
-| 0.1686 | 6, 86, 140 |
-| 0.2549 | 51, 127, 168 |
+| 0.1765 | 8, 89, 143 |
+| 0.2588 | 54, 129, 169 |
 | 0.4314 | 192, 216, 228 |
-| 0.4902 | 232, 231, 229 |
-| 0.5490 | 236, 209, 195 |
+| 0.4863 | 231, 231, 231 |
+| 0.5647 | 233, 202, 184 |
 | 0.8118 | 179, 83, 31 |
-| 0.8824 | 143, 43, 6 |
+| 0.8784 | 145, 45, 6 |
 | 1.0000 | 89, 0, 8 |
 
-The anchor at **0.4902** is not decoration. It is the light apex; drop it and
+The anchor at **0.4863** is not decoration. It is the light apex; drop it and
 the lightness derivative flips sign discontinuously and the eye reads a hard
 edge at exactly `u = 0` — a shear layer that is not there. See §4.
 
 ### Alternate diverging: `smooth-cool-warm`
 Keep available as a settings option for players who expect ParaView's classic
-blue-white-red. 10 anchors · max ΔE00 1.11 · step CV 19.2%.
+blue-white-red. 10 anchors · max ΔE00 1.47 · step CV 19.2%.
 
 | pos | rgb |
 |---|---|
 | 0.0000 | 59, 76, 192 |
-| 0.1412 | 103, 136, 238 |
-| 0.2706 | 148, 182, 255 |
-| 0.3922 | 190, 211, 246 |
-| 0.5020 | 221, 220, 220 |
-| 0.6314 | 245, 195, 170 |
-| 0.7686 | 242, 146, 116 |
-| 0.8980 | 215, 84, 69 |
-| 0.9529 | 198, 52, 52 |
+| 0.1451 | 105, 138, 239 |
+| 0.2627 | 146, 180, 254 |
+| 0.3804 | 186, 209, 248 |
+| 0.4980 | 220, 221, 221 |
+| 0.6275 | 245, 196, 172 |
+| 0.7490 | 244, 154, 123 |
+| 0.8941 | 216, 86, 70 |
+| 0.9490 | 199, 54, 52 |
 | 1.0000 | 180, 4, 38 |
 
 ### Rainbow option: `turbo`
 Not the default for any field (§7); shipped so the "Turbo (classic)" picker
-entry is real turbo rather than a resample of it. 13 anchors · max ΔE00 1.79 ·
+entry is real turbo rather than a resample of it. 12 anchors · max ΔE00 1.99 ·
 1 L\* reversal · deuteranopia min step 0.081.
 
 | pos | rgb |
 |---|---|
 | 0.0000 | 48, 18, 59 |
-| 0.0902 | 68, 84, 195 |
-| 0.1451 | 71, 120, 240 |
-| 0.1922 | 65, 150, 255 |
-| 0.2549 | 39, 190, 233 |
-| 0.3412 | 29, 231, 178 |
-| 0.4667 | 136, 255, 78 |
-| 0.5412 | 190, 244, 52 |
-| 0.6275 | 238, 207, 58 |
-| 0.6941 | 254, 169, 51 |
-| 0.7647 | 249, 117, 29 |
-| 0.8745 | 210, 49, 5 |
+| 0.0863 | 68, 81, 191 |
+| 0.1882 | 66, 148, 255 |
+| 0.2471 | 42, 185, 238 |
+| 0.3373 | 28, 230, 180 |
+| 0.4706 | 139, 255, 75 |
+| 0.5451 | 193, 243, 52 |
+| 0.6353 | 241, 203, 58 |
+| 0.6980 | 254, 167, 50 |
+| 0.7686 | 248, 114, 28 |
+| 0.8706 | 212, 51, 5 |
 | 1.0000 | 122, 4, 3 |
 
 The CVD and step-CV numbers here fail the §10 gate on purpose — that is what
@@ -265,7 +279,10 @@ they do — anyone tempted to "tidy" the anchor positions into even spacing is
 about to reintroduce exactly this.
 
 Measured against the true reference maps, over 256 entries, max ΔE00 in
-CAM02-UCS. These are the numbers that justified changing `colormap.rs`.
+CAM02-UCS. These are the numbers that justified changing `colormap.rs`. They
+predate the `u8`-rounding correction to the tool and so understate the error
+slightly — re-measured, turbo is 21.78 and coolwarm 6.61. The verdicts do not
+move.
 
 | superseded LUT | max ΔE00 vs reference | verdict |
 |---|---|---|
@@ -397,7 +414,7 @@ The position is not "rainbow is banned."
 So: **not the default for any field.** A settings toggle labelled
 "Classic (rainbow)" is a legitimate affordance for players trained on Fluent and
 EnSight, both of which still ship rainbow defaults. If we ship it, ship real
-turbo from the 13-anchor table, not the 9-point resample that is 21.6 ΔE00 away
+turbo from the 12-anchor table in §3, not the 9-point resample that is 21.6 ΔE00 away
 from it.
 
 Note for credibility with the target audience: ParaView moved off rainbow

@@ -128,7 +128,11 @@ def _reconstruct(idx, ref):
     n = len(ref)
     xs = np.arange(n) / (n - 1)
     c = np.round(ref[idx] * 255.0) / 255.0   # anchors quantised to u8, as shipped
-    return np.clip(np.stack([np.interp(xs, xs[idx], c[:, k]) for k in range(3)], 1), 0, 1)
+    lerp = np.stack([np.interp(xs, xs[idx], c[:, k]) for k in range(3)], 1)
+    # build() writes a u8 LUT, so every ENTRY is rounded, not just the anchors.
+    # Interpolating in float here reports an error smaller than what actually
+    # ships -- it read 1.96 for inferno where the shipped LUT measures 2.12.
+    return np.clip(np.round(lerp * 255.0) / 255.0, 0, 1)
 
 def fit_anchors(ref, tol=2.0, cap=24):
     idx = [0, len(ref) - 1]
