@@ -1,10 +1,8 @@
 {
-  "commit": "1e34ec2aef510af153eefaec8141148089b28727",
-  "timestamp": "2026-08-16T20:26:11Z",
+  "commit": "a88a5e2f6eb22aa1d8d697f4a3df878cdd542914",
+  "timestamp": "2026-08-17T00:11:30Z",
   "machine": "intel-xeon-4c",
   "tests": [
-    {"id":"T0-disk","name":"rasterizer disk area, R in {3..20} cells","expected":"<= 5e-3","actual":0.000000005412779598310543,"units":"worst relative area error","pass":true},
-    {"id":"T0-throat","name":"rasterized nozzle throat area, 6 slider settings","expected":"<= 5e-3","actual":0.0015822280899842056,"units":"worst relative area error","pass":true},
     {"id":"T5-toro2","name":"positivity: Toro test 2 double rarefaction","expected":0,"actual":0,"units":"floor activations","pass":true},
     {"id":"T3-unlimited","name":"order of accuracy, smooth advection, unlimited slope","expected":">= 1.90","actual":1.988265418395167,"units":"convergence order","pass":true},
     {"id":"T3-limited","name":"order of accuracy, smooth advection, minmod","expected":">= 1.50","actual":1.7759660019045689,"units":"convergence order","pass":true},
@@ -20,7 +18,9 @@
     {"id":"T4","name":"Sod shock tube, N = 200 uniform strip","expected":"<= 6.0e-3","actual":0.0042654666994339395,"units":"L1(rho)","pass":true},
     {"id":"WB","name":"well-balanced: quiescent axisymmetric box, 100 steps","expected":"<= 1e-7","actual":0,"units":"max abs drift","pass":true},
     {"id":"WB-graded","name":"well-balanced on a graded radial grid (growth 1.2)","expected":"<= 1e-7","actual":0,"units":"max abs drift","pass":true},
-    {"id":"T4-graded","name":"Sod on a graded strip (growth 1.01, ratio ~11x)","expected":"<= 8.0e-3","actual":0.005262820623815447,"units":"L1(rho)","pass":true}
+    {"id":"T4-graded","name":"Sod on a graded strip (growth 1.01, ratio ~11x)","expected":"<= 8.0e-3","actual":0.005262820623815447,"units":"L1(rho)","pass":true},
+    {"id":"T0-disk","name":"rasterizer disk area, R in {3..20} cells","expected":"<= 5e-3","actual":0.000000005412779598310543,"units":"worst relative area error","pass":true},
+    {"id":"T0-throat","name":"rasterized nozzle throat area, 6 slider settings","expected":"<= 5e-3","actual":0.0015822280899842056,"units":"worst relative area error","pass":true}
   ],
   "benchmarks": [],
   "notes": [

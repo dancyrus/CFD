@@ -29,6 +29,23 @@ time. A file is one coherent snapshot of one commit on one machine: records
 from a new commit start the file fresh; re-running a test at the same commit
 replaces its row.
 
+**Two consequences of "one commit", and both bite.** The commit is read at
+RECORD time, and the staging file keeps only lines matching it.
+
+1. **Run every command listed for a suite, at one commit.** A suite whose rows
+   come from more than one command — `ladder` takes T0 from `cfd-geom` and
+   T1–T8 from `cfd-core` — loses the rows you did not re-run. Running only
+   `cfd-core`'s half silently drops `T0-disk` and `T0-throat` from the file.
+2. **Do not commit while a suite is running.** A long benchmark records some
+   rows before your commit and some after; the ones from the old commit are
+   filtered out the moment a later row lands. `rs25_before_after` writes its
+   sea-level notes ~12 minutes before its 20 km ones, and a commit in between
+   loses the first three.
+
+Both failure modes look identical to a clean re-record — a valid file with
+fewer rows — so check the row count against the committed version before
+committing a re-record, not after.
+
 ## Schema
 
 Keep this stable so files can be diffed across time. Extend it here if you
