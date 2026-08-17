@@ -16,6 +16,7 @@
 
 pub mod forces;
 pub mod kernel;
+pub mod monitor;
 pub mod physics;
 
 mod mock;

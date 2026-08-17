@@ -340,10 +340,24 @@ Exception: at the high-ambient end an over-expanded nozzle can push a shock insi
 
 - `set_environment(p_a)` mutates only the outflow BC and the sponge target.
 - The solver thread streams frames at 60 Hz regardless. The user *watches* the plume adjust, and that transient is the most compelling thing the app has.
-- A **residual meter** (normalized L2 of ∂ρ/∂t) with a green "settled" dot below 1e-3, and **thrust, c\* and C_f greyed out whenever unsettled.** This is what makes the transient honest instead of a bug.
+- A **settled verdict** (`StepInfo::converged`, defined below) with a green dot, and **thrust, c\* and C_f greyed out whenever unsettled.** This is what makes the transient honest instead of a bug. The **residual meter** (normalized L2 of ∂ρ/∂t) stays alongside it as a pure diagnostic.
 - A **turbo control** (1× / 4× / 16×) running N solver steps per rendered frame, gated by a frame-time budget. Five lines, and it buys most of what local timestepping would, without the 30 minutes and without destroying the transient's physical meaning.
 
 Interpolating between pre-converged states is the worst option: more code, a lie, and it kills the only thing that looks alive.
+
+### The convergence criterion (work order C1)
+
+**The residual is not the finish line.** The original criterion — normalized density residual `< RESIDUAL_CONVERGED = 1e-3` — never fires on the demo case: measured over 12,000 steps, the residual bottoms out at 8.2e-2 around step 7,750, then *rises* to 1.06e-1 and oscillates, because a mildly overexpanded sea-level plume breathes and has no steady state. Since `converged` gates the report (`Confidence::NotConverged`), the user could never see a valid report on the default case — a correctness bug, not just a slow criterion. The residual survives in `StepInfo::residual` as a reported diagnostic, and nothing else.
+
+**A peak-to-peak spread is not the finish line either.** A trailing-window peak-to-peak test has to wait out the breathing *amplitude*; the trailing **mean** is stationary as soon as the transient decays. Measured on the unmodified baseline, the peak-to-peak test settles the demo case at step 5,526 and the trailing-mean test at step 2,751 — 2.0× on wall clock for zero solver work. Per-machine re-measurements live in `docs/results/convergence-<machine>.json` (`cargo test -p cfd-core --test convergence -- --include-ignored`).
+
+**The criterion** (`cfd-core/src/monitor.rs`, `PlateauMonitor`, wired into `EulerSolver::step`):
+
+- **Signal**: the report's exit-plane **thrust** — the headline number the verdict un-greys, and the most plume-sensitive of the report quantities, so when its mean has stopped moving the rest of the report has too. Two alternatives were measured on the demo case and rejected (survey in `docs/results/convergence-<machine>.json`): the domain-integrated axial momentum `∫rho·u_z dV` tracks the *full* acoustic equilibration of the far field (the ≈15,800-step figure above, not the report), and the lip mass flow shows isolated one-window lucky dips well before its mean actually settles. With no wall in the domain the report is empty and the monitor never fires — nothing to report, nothing to settle.
+- **Sampling**: at fixed **physical-time** intervals, never step counts — dt varies over a run, and under local time stepping a step count stops meaning anything. `SAMPLES_PER_WINDOW = 16` samples per window; the report is only built when a sample is due (~1 step in 50 at the default window).
+- **Window**: auto-sized from the domain transit time, `window = WINDOW_TRANSITS · L_z / (|u|+a)_ref` with `WINDOW_TRANSITS = 0.5`. The reference speed is the isentropic maximum of `u + a` from the chamber, `(|u|+a)_ref = sqrt(gamma·(gamma+1)/(gamma−1))` (non-dimensional, `a_0² = gamma`) — the fastest attainable signal gives the shortest defensible window. A verdict needs two full windows, so the earliest possible fire is one whole domain transit.
+- **Fire** when the window mean has moved less than `tol/2` (relative, `CONVERGED_TOL = 2e-2`, i.e. under 1% per half-transit) from the previous window's mean; two consecutive verdicts therefore bracket a full `tol` of drift. The tolerance is sized from measurement, not taste: on the settled demo case the thrust window-mean drift oscillates in a ~1e-3–8e-3 band *forever* (the breathing is undamped), so a threshold below ~1e-2 either never fires or fires on a lucky low beat; and the quantity being un-greyed carries ±1/N_throat mass-flow quantization (±5% at 20 cells/r_t) and the T8 staircase thrust bias (~13% there), so 1% per window is 5–13× tighter than the number it protects.
+- **Latching**: the verdict holds until something re-arms the monitor — `set_ambient`, `set_geometry` (at its drain point), or a fresh initial field. A latched verdict always refers to an unbroken stretch of the same problem.
 
 ---
 

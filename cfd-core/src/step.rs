@@ -17,10 +17,8 @@ use cfd_contract::{
     SolidField, SolveSetup, Solver, State, StepInfo, Confidence, NG,
 };
 
-use crate::{kernel, physics};
-
-/// Residual threshold for the green "settled" dot. docs/physics-reference.md §9.
-const RESIDUAL_CONVERGED: f64 = 1e-3;
+use crate::monitor::PlateauMonitor;
+use crate::{kernel, monitor, physics};
 
 pub struct EulerSolver {
     setup: SolveSetup,
@@ -33,6 +31,13 @@ pub struct EulerSolver {
     info: StepInfo,
     ledger: physics::FlipLedger,
     residual_ref: f64,
+    /// Convergence verdict: plateau on the trailing mean of the report's
+    /// exit-plane thrust, sampled on physical time, window sized from the
+    /// domain transit time. docs/physics-reference.md §9. The density
+    /// residual stays a reported diagnostic and is NOT the finish line — an
+    /// overexpanded plume breathes and its residual never drops below any
+    /// fixed threshold.
+    monitor: PlateauMonitor,
     pending_geometry: Option<Arc<SolidField>>,
 }
 
@@ -60,6 +65,8 @@ impl EulerSolver {
                              converged: false, floor_activations: 0 },
             ledger: physics::FlipLedger::default(),
             residual_ref: f64::NAN,
+            monitor: PlateauMonitor::for_domain(g.lz(), setup.gas.gamma as f64,
+                                                monitor::CONVERGED_TOL),
             pending_geometry: None,
             setup,
         };
@@ -96,7 +103,13 @@ impl EulerSolver {
         self.info.time = 0.0;
         self.info.step = 0;
         self.residual_ref = f64::NAN;
+        self.monitor.reset(0.0);
+        self.info.converged = false;
     }
+
+    /// The convergence monitor, read-only — window, sample cadence, last
+    /// window mean and drift, for the UI and the diagnostics.
+    pub fn monitor(&self) -> &PlateauMonitor { &self.monitor }
 
     /// Interior primitives in the solver's OWN units — non-dimensional,
     /// canonical `[rho, u_z, u_r, p]`, `grid.len()` long, ghosts stripped.
@@ -129,7 +142,9 @@ impl Solver for EulerSolver {
                                            &mut self.ledger);
             self.solid = pad_solid(&new_solid, &g);
             self.setup.solid = new_solid;
-            self.residual_ref = f64::NAN; // reset the convergence monitor
+            self.residual_ref = f64::NAN; // restart the residual diagnostic
+            self.monitor.reset(self.info.time); // re-arm the convergence monitor
+            self.info.converged = false;
             self.info.step = 0;
         }
 
@@ -189,11 +204,23 @@ impl Solver for EulerSolver {
         self.info.time += dt as f64;
         self.info.dt = dt;
         self.info.floor_activations = floors;
-        // Normalized by the step-10 value; NaN before step 10.
+        // Normalized by the step-10 value; NaN before step 10. A reported
+        // DIAGNOSTIC only — it is not the finish line (§9: a breathing plume
+        // holds it above any fixed threshold forever).
         if self.info.step == 10 { self.residual_ref = raw.max(f64::MIN_POSITIVE); }
         self.info.residual = if self.info.step >= 10 { raw / self.residual_ref }
                              else { f64::NAN };
-        self.info.converged = self.info.step >= 10 && self.info.residual < RESIDUAL_CONVERGED;
+        // Convergence: plateau on the trailing mean of the report's thrust,
+        // sampled at fixed physical-time intervals (§9). Building the report
+        // costs a field pass, so it runs only when the monitor's clock
+        // actually wants a sample — ~1 step in 50 at the default window. With
+        // no wall in the domain the report is empty (NaN thrust) and the
+        // monitor never fires: nothing to report, nothing to settle.
+        if self.monitor.due(self.info.time) {
+            let thrust = self.report().thrust_n;
+            self.monitor.update(self.info.time, thrust);
+        }
+        self.info.converged = self.monitor.converged();
         Ok(self.info)
     }
 
@@ -307,6 +334,8 @@ impl Solver for EulerSolver {
         // plume re-equilibrates. See docs/physics-reference.md §9.
         self.setup.ambient = a;
         self.residual_ref = f64::NAN;
+        self.monitor.reset(self.info.time);
+        self.info.converged = false;
         self.info.step = 0;
     }
 
