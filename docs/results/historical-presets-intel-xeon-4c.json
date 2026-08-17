@@ -1,6 +1,6 @@
 {
-  "commit": "bfdc6ee9a06321499d46b611f613802e42a7e96b",
-  "timestamp": "2026-08-17T01:57:05Z",
+  "commit": "31c47bc0381cad0c054b0e580e4e045f94e961ec",
+  "timestamp": "2026-08-17T02:04:17Z",
   "machine": "intel-xeon-4c",
   "tests": [
     {"id":"throat-derivation-round-trip","name":"shipped r_t vs re-deriving it from published thrust and the preset's own gas","expected":"<= 0.5%","actual":0.12398082653133358,"units":"worst |deviation| % (WAC Corporal 38ALDW-1500)","pass":true},
@@ -15,7 +15,16 @@
     {"id":"redstone-throat-area","name":"Redstone rasterized throat area vs the published 15.5 in throat diameter","expected":"0.121736 +/- 0.5%","actual":0.12179394694425873,"units":"m^2 (refined grid, 80 cells/r_t)","pass":true},
     {"id":"frozen-cstar-rust-vs-python","name":"cstar_ideal (Rust) vs cstar_frozen (tools/propellant_cea.py) over all eight cases","expected":"< 1e-5","actual":0.0000003926163597567367,"units":"max relative difference","pass":true}
   ],
-  "benchmarks": [],
+  "benchmarks": [
+    {"case":"V-2 (A-4) Model 39 (eps 2.83, p0 1.572 MPa, 0 km)","setting":"15° cone, preset domain, 20 cells/r_t","cells":19740,"steps_per_sec":288.4989261469891,"seconds_to_steady":18.2181889354},
+    {"case":"WAC Corporal 38ALDW-1500 (eps 5, p0 2.068 MPa, 0 km)","setting":"15° cone, preset domain, 20 cells/r_t","cells":24924,"steps_per_sec":233.01198532377924,"seconds_to_steady":25.2809789438},
+    {"case":"Redstone NAA 75-110-A-7 (eps 3.61, p0 2.193 MPa, 0 km)","setting":"15° cone, preset domain, 20 cells/r_t","cells":21244,"steps_per_sec":288.66990861756835,"seconds_to_steady":20.019866022400002},
+    {"case":"Thor LR79-NA-7 (MB-1) (eps 8, p0 4.100 MPa, 0 km)","setting":"80% Rao bell, preset domain, 20 cells/r_t","cells":32058,"steps_per_sec":202.04760620643532,"seconds_to_steady":35.482101997},
+    {"case":"Titan I LR87-AJ-3 (1 of 2) (eps 8, p0 4.000 MPa, 0 km)","setting":"80% Rao bell, preset domain, 20 cells/r_t","cells":32058,"steps_per_sec":205.86453972474766,"seconds_to_steady":35.388948939},
+    {"case":"Titan I LR91-AJ-3 (eps 25, p0 4.500 MPa, 12 km)","setting":"75% Rao bell, preset domain, 20 cells/r_t","cells":64025,"steps_per_sec":106.41627220889457,"seconds_to_steady":95.4961385034},
+    {"case":"Atlas LR89-5 booster (1 of 2) (eps 8, p0 3.999 MPa, 0 km)","setting":"80% Rao bell, preset domain, 20 cells/r_t","cells":32058,"steps_per_sec":192.38463565479336,"seconds_to_steady":36.8121403392},
+    {"case":"Atlas LR105-5 sustainer (eps 25, p0 4.799 MPa, 10 km)","setting":"80% Rao bell, preset domain, 20 cells/r_t","cells":65325,"steps_per_sec":104.9844984026048,"seconds_to_steady":96.68506924059999}
+  ],
   "notes": [
     "V-2 (A-4) Model 39: shipped r_t 193.60 mm; re-deriving it here from the published thrust 244.7 kN at sea level with this preset's own gamma gives 193.64 mm (+0.02%). lambda 0.9830, eta_Cf 0.9877, Cf_ideal 1.3608. Implied mass flow at 95% c* efficiency is 119.21 kg/s -- RECORDED, NOT ASSERTED: the AEHS mass-flow column is the unreliable one (its LR89-5 row implies Isp 356 s against its own 248-282 column), which is precisely why the throat radii come from thrust rather than from mass flow.",
     "Redstone NAA 75-110-A-7: shipped r_t 196.85 mm; re-deriving it here from the published thrust 369.1 kN at sea level with this preset's own gamma gives 196.76 mm (-0.04%). lambda 0.9830, eta_Cf 0.9877, Cf_ideal 1.4253. Implied mass flow at 95% c* efficiency is 169.80 kg/s -- RECORDED, NOT ASSERTED: the AEHS mass-flow column is the unreliable one (its LR89-5 row implies Isp 356 s against its own 248-282 column), which is precisely why the throat radii come from thrust rather than from mass flow.",
@@ -27,6 +36,17 @@
     "WAC Corporal 38ALDW-1500: shipped r_t 27.50 mm; re-deriving it here from the published thrust 6.7 kN at sea level with this preset's own gamma gives 27.53 mm (+0.12%). lambda 0.9830, eta_Cf 0.9877, Cf_ideal 1.3952. Implied mass flow at 95% c* efficiency is 3.36 kg/s -- RECORDED, NOT ASSERTED: the AEHS mass-flow column is the unreliable one (its LR89-5 row implies Isp 356 s against its own 248-282 column), which is precisely why the throat radii come from thrust rather than from mass flow.",
     "Every historical preset clears the 0.40 Summerfield separation threshold at its own default altitude; the tightest is Titan I LR87-AJ-3 (1 of 2) at p_e/p_a 0.630. The two altitude-optimised presets are asserted in BOTH directions: Atlas LR105-5 (default 10 km) and Titan I LR91-AJ-3 (default 12 km) must separate at sea level, or their non-zero default would be decoration rather than a fix, and each default must clear its own computed crossing by at least 2 km. Every other preset must NOT separate at 0 km, or it would need a default of its own.",
     "The Rao table covers eps = 4-100 and rao_angles clamps at BOTH ends; the area-ratio slider bottoms out at 2, so all 10 bell presets can be dragged below the table. rao_clamp_warning fires at both ends -- verified against the function the sidebar calls rather than a restatement of its condition, because the natural way to write that check while thinking only about Merlin Vac (eps 165) is to test the high end alone. Below eps 4 the angles are the eps = 4 row (theta_n 21.50, theta_e 14.00 at 80%) stretched to the requested exit radius.",
-    "Redstone throat area recovered from the rasterized wall: 0.121794 m^2 at 4x the production radial resolution (+0.048% vs the published 0.121736 m^2), 0.122107 m^2 on the production grid (+0.305%). The production figure is biased HIGH by column averaging: a column integrates the wall over its own width and r(z) is quadratic at a throat, so the cell-mean area exceeds the minimum by ~(dz^2/12)/R_arc. It falls as dz^2, which the refined figure confirms. The preset's own r_t gives a geometric area of 0.121736 m^2 (+0.000%)."
+    "Redstone throat area recovered from the rasterized wall: 0.121794 m^2 at 4x the production radial resolution (+0.048% vs the published 0.121736 m^2), 0.122107 m^2 on the production grid (+0.305%). The production figure is biased HIGH by column averaging: a column integrates the wall over its own width and r(z) is quadratic at a throat, so the cell-mean area exceeds the minimum by ~(dz^2/12)/R_arc. It falls as dz^2, which the refined figure confirms. The preset's own r_t gives a geometric area of 0.121736 m^2 (+0.000%).",
+    "V-2 (A-4) Model 39: solved mass flow 104.9 kg/s at visual steady against a quasi-1D ideal of 114.8 kg/s for the same throat area and frozen c* (-8.6%), C_f 1.168, area-averaged exit Mach 1.91, confidence NotConverged.",
+    "WAC Corporal 38ALDW-1500: 4855 positivity-floor activations, all during the cold-start front (last at step 132 of 5469 to visual steady, zero after) — the SS13 quarantine class, same as the existing presets.",
+    "WAC Corporal 38ALDW-1500: solved mass flow 3.0 kg/s at visual steady against a quasi-1D ideal of 3.2 kg/s for the same throat area and frozen c* (-8.7%), C_f 1.211, area-averaged exit Mach 2.09, confidence NotConverged.",
+    "Redstone NAA 75-110-A-7: solved mass flow 150.3 kg/s at visual steady against a quasi-1D ideal of 164.7 kg/s for the same throat area and frozen c* (-8.8%), C_f 1.221, area-averaged exit Mach 2.07, confidence NotConverged.",
+    "Thor LR79-NA-7 (MB-1): solved mass flow 235.2 kg/s at visual steady against a quasi-1D ideal of 257.6 kg/s for the same throat area and frozen c* (-8.7%), C_f 1.301, area-averaged exit Mach 2.66, confidence NotConverged.",
+    "Titan I LR87-AJ-3 (1 of 2): solved mass flow 229.1 kg/s at visual steady against a quasi-1D ideal of 251.0 kg/s for the same throat area and frozen c* (-8.7%), C_f 1.297, area-averaged exit Mach 2.65, confidence NotConverged.",
+    "Titan I LR91-AJ-3: 12741 positivity-floor activations, all during the cold-start front (last at step 236 of 9466 to visual steady, zero after) — the SS13 quarantine class, same as the existing presets.",
+    "Titan I LR91-AJ-3: solved mass flow 103.2 kg/s at visual steady against a quasi-1D ideal of 113.1 kg/s for the same throat area and frozen c* (-8.8%), C_f 1.495, area-averaged exit Mach 3.52, confidence NotConverged.",
+    "Atlas LR89-5 booster (1 of 2): solved mass flow 256.8 kg/s at visual steady against a quasi-1D ideal of 281.2 kg/s for the same throat area and frozen c* (-8.7%), C_f 1.297, area-averaged exit Mach 2.65, confidence NotConverged.",
+    "Atlas LR105-5 sustainer: solved mass flow 112.1 kg/s at visual steady against a quasi-1D ideal of 122.9 kg/s for the same throat area and frozen c* (-8.8%), C_f 1.474, area-averaged exit Mach 3.43, confidence NotConverged.",
+    "seconds_to_steady for the historical presets is MEASURED: steps_per_sec over 250 steps after a 50-step warm-up on this machine, then the case run to the SS9 visual-steady step count (6,100 steps at the 46.4 r_t compact demo domain, scaled by domain length and by 1/dt) with the wall clock taken. The residual-based settled flag is not usable as a finish line for these cases for the same reason it is not for the demo case -- an overexpanded sea-level plume keeps breathing above the 1e-3 threshold indefinitely."
   ]
 }

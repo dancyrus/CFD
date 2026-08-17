@@ -1,6 +1,6 @@
 {
-  "commit": "bfdc6ee9a06321499d46b611f613802e42a7e96b",
-  "timestamp": "2026-08-17T01:57:05Z",
+  "commit": "31c47bc0381cad0c054b0e580e4e045f94e961ec",
+  "timestamp": "2026-08-17T01:58:09Z",
   "machine": "intel-xeon-4c",
   "tests": [
     {"id":"cone-equivalence","name":"NozzleCurve(Conical).radius_at vs legacy cone vertices at eps 2, 8 and every preset","expected":"<= 1e-9","actual":0.000000000000007105427357601002,"units":"max |dr| (r_t)","pass":true},

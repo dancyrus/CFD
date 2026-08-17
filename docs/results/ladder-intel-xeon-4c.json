@@ -1,6 +1,6 @@
 {
-  "commit": "a8e81c3c5fd28b5952f3261a64162419e7bc9d24",
-  "timestamp": "2026-08-17T01:19:50Z",
+  "commit": "31c47bc0381cad0c054b0e580e4e045f94e961ec",
+  "timestamp": "2026-08-17T02:07:06Z",
   "machine": "intel-xeon-4c",
   "tests": [
     {"id":"T5-toro2","name":"positivity: Toro test 2 double rarefaction","expected":0,"actual":0,"units":"floor activations","pass":true},
@@ -13,12 +13,14 @@
     {"id":"T7-beta","name":"cone vs Taylor-Maccoll: shock angle","expected":"26.737 +/- 1.5","actual":27.960752909823302,"units":"deg","pass":true},
     {"id":"T7-p","name":"cone vs Taylor-Maccoll: surface pressure ratio","expected":"1.3739 +/- 8%","actual":1.394806315610697,"units":"p/p_inf","pass":true},
     {"id":"T7-mach","name":"cone vs Taylor-Maccoll: surface Mach","expected":"2.1468 +/- 5%","actual":2.1599653160179053,"units":"Mach","pass":true},
-    {"id":"T1-graded","name":"free-stream preservation on a graded grid (growth 1.15/1.2)","expected":"<= 1e-5","actual":0.0000006556510925292969,"units":"max abs state error","pass":true},
     {"id":"T1","name":"free-stream preservation (planar uniform, 200 steps)","expected":"<= 1e-5","actual":0.0000054836273193359375,"units":"max abs state error","pass":true},
+    {"id":"T1-graded","name":"free-stream preservation on a graded grid (growth 1.15/1.2)","expected":"<= 1e-5","actual":0.0000006556510925292969,"units":"max abs state error","pass":true},
     {"id":"T4","name":"Sod shock tube, N = 200 uniform strip","expected":"<= 6.0e-3","actual":0.0042654666994339395,"units":"L1(rho)","pass":true},
     {"id":"WB","name":"well-balanced: quiescent axisymmetric box, 100 steps","expected":"<= 1e-7","actual":0,"units":"max abs drift","pass":true},
     {"id":"WB-graded","name":"well-balanced on a graded radial grid (growth 1.2)","expected":"<= 1e-7","actual":0,"units":"max abs drift","pass":true},
-    {"id":"T4-graded","name":"Sod on a graded strip (growth 1.01, ratio ~11x)","expected":"<= 8.0e-3","actual":0.005262820623815447,"units":"L1(rho)","pass":true}
+    {"id":"T4-graded","name":"Sod on a graded strip (growth 1.01, ratio ~11x)","expected":"<= 8.0e-3","actual":0.005262820623815447,"units":"L1(rho)","pass":true},
+    {"id":"T0-disk","name":"rasterizer disk area, R in {3..20} cells","expected":"<= 5e-3","actual":0.000000005412779598310543,"units":"worst relative area error","pass":true},
+    {"id":"T0-throat","name":"rasterized nozzle throat area, 6 slider settings","expected":"<= 5e-3","actual":0.0015822280899842056,"units":"worst relative area error","pass":true}
   ],
   "benchmarks": [],
   "notes": [
