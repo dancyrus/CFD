@@ -1,6 +1,6 @@
 {
-  "commit": "4b808dcbd6659e85fa9dff965b61270565c4a878",
-  "timestamp": "2026-08-17T01:58:57Z",
+  "commit": "712626b38065bbdc6dd932caebbf277e253ad275",
+  "timestamp": "2026-08-17T02:10:48Z",
   "machine": "intel-xeon-4c",
   "tests": [
     {"id":"G0-steady","name":"d'Alembert negative control: the flow is steady, so the paradox applies (residual < 1e-3, physics-reference §9)","expected":"< 1e-3 at every level","actual":0.00020777337581414518,"units":"normalized residual","pass":true},
