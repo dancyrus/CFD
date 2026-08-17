@@ -202,12 +202,16 @@ fn spec(
     }
 }
 
-/// The demo case plus every shipped engine preset, as `(name, spec)`.
+/// The demo case plus the six original engine presets, as `(name, spec)` —
+/// between them every contour SHAPE the app can build: a cone, a Rao-table
+/// bell, and a measured-angle bell.
 ///
 /// The preset rows MIRROR `cfd_ui::case::PRESETS` — `cfd-geom` cannot depend on
-/// `cfd-ui`, so the mirror is guarded from the other side by
-/// `cfd-ui`'s `preset_specs_match_the_geom_golden_table`, which fails if a
-/// preset's geometry moves away from these numbers.
+/// `cfd-ui`, so the mirror is guarded from the other side by `cfd-ui`'s
+/// `preset_specs_match_the_geom_golden_table`, which fails if one of these six
+/// moves away from these numbers, AND fails if any newer preset (the eight
+/// historical engines, and whatever comes after) introduces a shape this table
+/// does not cover.
 pub fn golden_specs() -> Vec<(&'static str, NozzleSpec)> {
     vec![
         (
