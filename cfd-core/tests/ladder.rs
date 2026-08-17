@@ -1186,7 +1186,10 @@ fn g0_case(h: f64) -> (Grid, SolidField, f64, f64, f64) {
 /// Runs G0 at cell size `h` for `transits` upstream acoustic crossings of the
 /// domain, and returns (mean C_d over the last `avg` crossings, peak-to-peak
 /// spread of C_d over that window, max Mach, final normalized residual,
-/// floors, converged).
+/// floors, residual-steady). The last flag is `residual < 1e-3` directly —
+/// NOT `StepInfo::converged`, which since work order C1 is the report-thrust
+/// plateau monitor: this rung's premise is d'Alembert's steady-flow
+/// assumption, and the residual diagnostic is the §9 measure of that.
 ///
 /// The force is TIME-AVERAGED and its spread is reported, for two reasons.
 /// Subsonic convergence here is slow — the duct is an acoustic resonator with
@@ -1235,7 +1238,7 @@ fn g0_measure(h: f64, transits: f64, avg: f64) -> (f64, f64, f64, f64, u64, bool
         .filter(|&(iz, ir)| !solid.is_solid(grid.idx(iz, ir)))
         .map(|(iz, ir)| mach_at(&w, &grid, iz, ir, gamma))
         .fold(0.0f64, f64::max);
-    (mean, spread, m_max, info.residual, info.floor_activations, info.converged)
+    (mean, spread, m_max, info.residual, info.floor_activations, info.residual < 1e-3)
 }
 
 /// G0 — negative control. M_inf = 0.3 over a smooth body: by d'Alembert's
@@ -1248,10 +1251,11 @@ fn g0_measure(h: f64, transits: f64, avg: f64) -> (f64, f64, f64, f64, u64, bool
 /// passes.
 ///
 /// d'Alembert's premise is STEADY flow, so the rung checks it rather than
-/// assuming it, using this project's own definition of steady — normalized
-/// residual below 1e-3, the §9 threshold behind `StepInfo::converged`. A drag
-/// read off an oscillating wake is not a measurement of anything, and an
-/// inviscid solver has no mechanism to produce one.
+/// assuming it, on the normalized residual dropping below 1e-3 — the §9
+/// residual diagnostic, checked directly (`StepInfo::converged` is the
+/// report-thrust plateau monitor since work order C1, a different question).
+/// A drag read off an oscillating wake is not a measurement of anything, and
+/// an inviscid solver has no mechanism to produce one.
 #[test]
 #[ignore = "ladder: run with --include-ignored"]
 fn g0_dalembert_negative_control() {
