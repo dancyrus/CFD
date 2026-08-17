@@ -234,18 +234,22 @@ breathing above the 1e-3 threshold indefinitely.)
 
 | engine | ε | grid | cells | steps/s | steps to steady | **wall time** | × Merlin 1D |
 |---|---|---|---|---|---|---|---|
-| V-2 (A-4) | 2.83 | 105 × 188 | 19,740 | 281.7 | 4,668 | **17.9 s** | 0.26 |
-| Redstone A-7 | 3.61 | 113 × 188 | 21,244 | 271.7 | 4,983 | **20.4 s** | 0.30 |
-| WAC Corporal | 5.0 | 124 × 201 | 24,924 | 234.6 | 5,469 | **24.8 s** | 0.38 |
-| Titan I LR87 | 8.0 | 144 × 234 | 33,696 | 196.7 | 6,325 | **35.8 s** | 0.60 |
-| Thor LR79 | 8.0 | 144 × 234 | 33,696 | 200.7 | 6,325 | **35.9 s** | 0.60 |
-| Atlas LR89 | 8.0 | 144 × 234 | 33,696 | 193.5 | 6,325 | **36.1 s** | 0.60 |
-| Titan I LR91 | 25.0 | 218 × 325 | 70,850 | 101.7 | 9,466 | **94.7 s** | 1.88 |
-| Atlas LR105 | 25.0 | 218 × 325 | 70,850 | 104.1 | 9,466 | **96.4 s** | 1.88 |
+| V-2 (A-4) | 2.83 | 105 × 188 | 19,740 | 288.1 | 4,668 | **18.2 s** | 0.26 |
+| Redstone A-7 | 3.61 | 113 × 188 | 21,244 | 275.1 | 4,983 | **20.9 s** | 0.30 |
+| WAC Corporal | 5.0 | 124 × 201 | 24,924 | 242.5 | 5,469 | **25.3 s** | 0.38 |
+| Titan I LR87 | 8.0 | 144 × 234 | 33,696 | 198.0 | 6,325 | **36.2 s** | 0.60 |
+| Thor LR79 | 8.0 | 144 × 234 | 33,696 | 194.4 | 6,325 | **36.3 s** | 0.60 |
+| Atlas LR89 | 8.0 | 144 × 234 | 33,696 | 194.4 | 6,325 | **36.9 s** | 0.60 |
+| Titan I LR91 | 25.0 | 218 × 325 | 70,850 | 101.4 | 9,466 | **95.7 s** | 1.88 |
+| Atlas LR105 | 25.0 | 218 × 325 | 70,850 | 101.8 | 9,466 | **98.0 s** | 1.88 |
 
-As expected, the cheap end of the library: 18–96 s against the demo case's Large
+As expected, the cheap end of the library: 18–98 s against the demo case's Large
 domain at 804 s and Merlin Vac's ~12× Merlin 1D. Short nozzles buy small domains
 as well as short ones, because `preset_domain` sizes off ε.
+
+Run-to-run spread on this machine is about 2% (an earlier pass of the same
+benchmark read 17.9–96.4 s), so treat the last digit as noise. The cell counts
+and step counts are exact — they are geometry, not timing.
 
 ### Positivity floors
 
