@@ -70,19 +70,37 @@ fn inlet_ghost(wi: Prim, chamber: &Chamber, g: Real) -> Cons {
     prim_to_cons([rb, ub, 0.0, pb], g)
 }
 
-/// Downstream outflow ghost. Supersonic (|u| >= a): copy the interior cell —
-/// all four characteristics exit, exact and non-reflecting. Subsonic: impose
-/// p_a, extrapolate entropy and R⁺.
+/// Downstream outflow ghost, the same three-way split `farfield_ghost` uses on
+/// the radial normal. Outgoing supersonic (u >= a): copy the interior cell —
+/// all four characteristics exit, exact and non-reflecting. Outgoing subsonic
+/// (0 <= u < a): impose p_a, extrapolate entropy and R⁺. Reversed (u < 0): the
+/// ambient reservoir at rest — incoming gas carries AMBIENT entropy and
+/// AMBIENT tangential velocity, never the interior's, which is downstream of
+/// the face and says nothing about what enters through it.
+///
+/// The reversal branch and the SIGNED supersonic test are both load-bearing
+/// (A2). Without them, u < 0 fell into the subsonic construction, which
+/// extrapolates interior entropy and v along characteristics that are entering
+/// the domain — measured: interior u = -0.30 produced a ghost with u = +1.45,
+/// a spurious outward jet at M 2.5. And `|u| >= a` read supersonic INFLOW as
+/// supersonic outflow, copying the interior bit-exactly: zero conditions on
+/// four incoming characteristics, ill-posed — a sustained M 4.49 inflow grew
+/// domain mass 41.7% over 3000 steps with nothing constraining it.
 #[inline]
-fn outflow_ghost(ui: Cons, wi: Prim, p_a: Real, g: Real) -> Cons {
+fn outflow_ghost(ui: Cons, wi: Prim, ambient: &Ambient, g: Real) -> Cons {
+    let un = wi[1];
+    if un < 0.0 {
+        let rho_a = ambient.p / ambient.t;
+        return prim_to_cons([rho_a, 0.0, 0.0, ambient.p], g);
+    }
     let ai = (g * wi[3] / wi[0]).sqrt();
-    if wi[1].abs() >= ai {
+    if un >= ai {
         return ui;
     }
-    let rb = wi[0] * (p_a / wi[3]).powf(1.0 / g);
-    let ab = (g * p_a / rb).sqrt();
-    let ub = wi[1] + 2.0 * (ai - ab) / (g - 1.0);
-    prim_to_cons([rb, ub, wi[2], p_a], g)
+    let rb = wi[0] * (ambient.p / wi[3]).powf(1.0 / g);
+    let ab = (g * ambient.p / rb).sqrt();
+    let ub = un + 2.0 * (ai - ab) / (g - 1.0);
+    prim_to_cons([rb, ub, wi[2], ambient.p], g)
 }
 
 /// Radial far-field ghost: the outflow construction with the radial normal;
@@ -131,7 +149,7 @@ pub fn fill_ghosts(u: &mut [Cons], g: &Grid, solid: &[bool], gas: &GasModel,
         let ghost = if solid[i1] {
             u[i1]
         } else {
-            outflow_ghost(u[i1], cons_to_prim(u[i1], gm), ambient.p, gm)
+            outflow_ghost(u[i1], cons_to_prim(u[i1], gm), ambient, gm)
         };
         u[g.gidx(nz, ir)] = ghost;
         u[g.gidx(nz + 1, ir)] = ghost;
@@ -713,6 +731,36 @@ mod tests {
         assert!((wg[0] as f64 - rb).abs() <= 1e-5 * rb, "rho_b = {}", wg[0]);
         assert!((wg[1] as f64 - ub).abs() <= 1e-5 * ub.abs().max(1.0), "u_b = {}", wg[1]);
         assert!((wg[2] - wi[2]).abs() <= 1e-6, "v_b extrapolates v_i");
+    }
+
+    #[test]
+    fn ghosts_outflow_reversed_flow_uses_ambient_reservoir() {
+        // The A2 fix: any reversed flow at the outflow plane — subsonic OR
+        // supersonic — gets the ambient reservoir, exactly like the radial
+        // far field. Before it, u = -0.30 here produced a ghost jetting
+        // OUTWARD at M 2.5, and u = -2.0 (|u| > a) copied the interior
+        // bit-exactly, imposing nothing on four incoming characteristics.
+        let g = Grid::uniform(8, 4, 0.1, 0.05);
+        let gm = 1.4f32;
+        let amb = ambient();
+        let expect = ambient_cons(&amb, gm);
+        // Subsonic reversal (a ~ 1.06 for this state).
+        let mut u = filled_grid(&g, |_, _| [0.8, -0.30, 0.4, 0.65], gm);
+        fill_ghosts(&mut u, &g, &no_solid(&g), &gas(), &chamber(), &amb, &numerics());
+        assert_eq!(u[g.gidx(g.nz as isize, 1)], expect);
+        assert_eq!(u[g.gidx(g.nz as isize + 1, 1)], expect);
+        // Supersonic reversal: |u| >= a must NOT read as supersonic outflow.
+        let mut u = filled_grid(&g, |_, _| [1.0, -2.0, 0.1, 0.06], gm); // a ~ 0.29
+        fill_ghosts(&mut u, &g, &no_solid(&g), &gas(), &chamber(), &amb, &numerics());
+        assert_eq!(u[g.gidx(g.nz as isize, 1)], expect);
+        // Outgoing flow at exactly u = 0 still takes the subsonic outflow
+        // branch (imposes p_a), not the reservoir.
+        let wi: Prim = [1.0, 0.0, 0.2, 0.9];
+        let mut u = filled_grid(&g, |_, _| wi, gm);
+        fill_ghosts(&mut u, &g, &no_solid(&g), &gas(), &chamber(), &amb, &numerics());
+        let wg = cons_to_prim(u[g.gidx(g.nz as isize, 1)], gm);
+        assert!((wg[3] - amb.p).abs() <= 1e-6, "p_b = {}", wg[3]);
+        assert!((wg[2] - wi[2]).abs() <= 1e-6, "v_b extrapolates v_i at u = 0");
     }
 
     #[test]

@@ -713,6 +713,73 @@ fn body_at(bodies: &Bodies, g: &Grid, iz: usize, ir: usize) -> usize {
     bodies.label(g.idx(iz, ir)).expect("expected a solid cell here")
 }
 
+// --- outflow-plane probe -----------------------------------------------------
+
+/// Instrumentation of the z-max outflow plane, sampled over a whole run.
+///
+/// `physics::outflow_ghost` is the only boundary the A2 reversed-flow fix
+/// touches, so "can that fix move this rung?" reduces to "does reversed flow
+/// ever reach the z-max plane?". If it never does, the rung's failure is not
+/// the boundary and the staircase diagnosis stands; a null result here is as
+/// useful as a positive one, so this records unconditionally.
+///
+/// Tracked over the boundary-adjacent fluid cells (column `nz - 1`):
+///   - the minimum `u_z` over the whole run;
+///   - the largest fraction of those cells with `u_z < 0` at one instant;
+///   - the largest fraction with `u_z <= -a`, the branch the pre-fix code read
+///     as supersonic OUTflow and answered with a bit-exact copy of the
+///     interior — four incoming characteristics left unconstrained.
+#[derive(Clone, Copy)]
+struct OutflowProbe {
+    min_uz: f64,
+    max_frac_reversed: f64,
+    max_frac_supersonic_in: f64,
+    samples: u64,
+}
+
+impl OutflowProbe {
+    fn new() -> Self {
+        OutflowProbe { min_uz: f64::INFINITY, max_frac_reversed: 0.0,
+                       max_frac_supersonic_in: 0.0, samples: 0 }
+    }
+
+    fn sample(&mut self, w: &[Prim], g: &Grid, solid: &SolidField, gamma: f64) {
+        let iz = g.nz - 1;
+        let (mut n, mut rev, mut sup) = (0u32, 0u32, 0u32);
+        for ir in 0..g.nr {
+            if solid.is_solid(g.idx(iz, ir)) {
+                continue;
+            }
+            let q = w[g.idx(iz, ir)];
+            let uz = q[1] as f64;
+            let a = (gamma * q[3] as f64 / q[0] as f64).sqrt();
+            n += 1;
+            if uz < 0.0 { rev += 1; }
+            if uz <= -a { sup += 1; }
+            self.min_uz = self.min_uz.min(uz);
+        }
+        if n > 0 {
+            self.max_frac_reversed = self.max_frac_reversed.max(rev as f64 / n as f64);
+            self.max_frac_supersonic_in =
+                self.max_frac_supersonic_in.max(sup as f64 / n as f64);
+        }
+        self.samples += 1;
+    }
+
+    fn line(&self, tag: &str) -> String {
+        format!("{tag}: min u_z at the outflow plane {:+.4e}, max fraction of \
+                 outflow cells with u_z < 0 {:.4}, max fraction with u_z <= -a \
+                 {:.4}, over {} samples",
+                self.min_uz, self.max_frac_reversed, self.max_frac_supersonic_in,
+                self.samples)
+    }
+}
+
+/// Sample the probe every this many steps. The plane is one column, so the
+/// cost is a fraction of a step's; the cadence only has to be fine enough not
+/// to step over a transient reversal.
+const PROBE_EVERY: u64 = 20;
+
 // --- G1: multi-body regular reflection --------------------------------------
 
 /// Exact two-shock solution for a symmetric 10 deg double wedge at M_inf = 2,
@@ -1107,8 +1174,27 @@ fn g3_forward_facing_step() {
 
     // Run on to the published time, t = 4 in Woodward & Colella's units where
     // a_inf = 1; ours are chamber-referenced, so t_ours = 4/sqrt(gamma).
-    let info = run_to_time(&mut s, 4.0 / gamma.sqrt(), 40_000);
+    // Outflow-plane instrumentation (A2), over the long run rather than the
+    // balance window: the window is deliberately stopped before any
+    // disturbance reaches the exit, so only the run to t = 4 can show
+    // reversed flow there. Recorded whichever way it comes out.
+    let mut probe = OutflowProbe::new();
+    let t_end = 4.0 / gamma.sqrt();
+    let mut info = s.step().unwrap();
+    let mut n = 1u64;
+    probe.sample(&s.primitives(), &grid, &solid, gamma);
+    while info.time < t_end && n < 40_000 {
+        info = s.step().unwrap();
+        n += 1;
+        if n.is_multiple_of(PROBE_EVERY) {
+            probe.sample(&s.primitives(), &grid, &solid, gamma);
+        }
+    }
+    assert!(info.time >= t_end, "ran out of steps at t = {}", info.time);
     let w = s.primitives();
+    probe.sample(&w, &grid, &solid, gamma);
+    println!("{}", probe.line("G3"));
+    cfd_results::record_note("ladder", "g3-outflow-probe", &probe.line("G3"));
     let top = grid.nr - 2; // wall-adjacent fluid row
 
     // The leading front, row by row, over the 6 rows below the top wall.
@@ -1196,7 +1282,7 @@ fn g0_case(h: f64) -> (Grid, SolidField, f64, f64, f64) {
 /// spread is itself a measurement: d'Alembert's premise is STEADY flow, so a
 /// spread that does not shrink is the solver reporting an unsteady wake behind
 /// a streamlined body, which an inviscid solver cannot physically have.
-fn g0_measure(h: f64, transits: f64, avg: f64) -> (f64, f64, f64, f64, u64, bool) {
+fn g0_measure(h: f64, transits: f64, avg: f64) -> (f64, f64, f64, f64, u64, bool, OutflowProbe) {
     let gamma = 1.4f64;
     let m_inf = 0.3f64;
     let (grid, solid, z_c, semi_r, lz) = g0_case(h);
@@ -1216,11 +1302,16 @@ fn g0_measure(h: f64, transits: f64, avg: f64) -> (f64, f64, f64, f64, u64, bool
             / (0.5 * gamma * m_inf * m_inf * semi_r)
     };
     let mut samples: Vec<f64> = Vec::new();
+    let mut probe = OutflowProbe::new();
     let mut info = s.step().unwrap();
     let mut n = 1u64;
+    probe.sample(&s.primitives(), &grid, &solid, gamma);
     while info.time < t_end {
         info = s.step().unwrap();
         n += 1;
+        if n.is_multiple_of(PROBE_EVERY) {
+            probe.sample(&s.primitives(), &grid, &solid, gamma);
+        }
         if info.time >= t_avg && n.is_multiple_of(100) {
             samples.push(c_d(&s));
         }
@@ -1235,7 +1326,8 @@ fn g0_measure(h: f64, transits: f64, avg: f64) -> (f64, f64, f64, f64, u64, bool
         .filter(|&(iz, ir)| !solid.is_solid(grid.idx(iz, ir)))
         .map(|(iz, ir)| mach_at(&w, &grid, iz, ir, gamma))
         .fold(0.0f64, f64::max);
-    (mean, spread, m_max, info.residual, info.floor_activations, info.converged)
+    probe.sample(&w, &grid, &solid, gamma);
+    (mean, spread, m_max, info.residual, info.floor_activations, info.converged, probe)
 }
 
 /// G0 — negative control. M_inf = 0.3 over a smooth body: by d'Alembert's
@@ -1256,9 +1348,17 @@ fn g0_measure(h: f64, transits: f64, avg: f64) -> (f64, f64, f64, f64, u64, bool
 #[ignore = "ladder: run with --include-ignored"]
 fn g0_dalembert_negative_control() {
     const HS: [f64; 3] = [0.1, 0.05, 0.025];
-    let (c1, s1, m1, r1, f1, k1) = g0_measure(HS[0], 40.0, 10.0);
-    let (c2, s2, m2, r2, f2, k2) = g0_measure(HS[1], 40.0, 10.0);
-    let (c3, s3, m3, r3, f3, k3) = g0_measure(HS[2], 40.0, 10.0);
+    let (c1, s1, m1, r1, f1, k1, pr1) = g0_measure(HS[0], 40.0, 10.0);
+    let (c2, s2, m2, r2, f2, k2, pr2) = g0_measure(HS[1], 40.0, 10.0);
+    let (c3, s3, m3, r3, f3, k3, pr3) = g0_measure(HS[2], 40.0, 10.0);
+    // Outflow-plane instrumentation (A2): does reversed flow reach the only
+    // boundary the reversed-inflow fix changes? Recorded before the asserts,
+    // and recorded whichever way it comes out.
+    for (h, pr) in HS.iter().zip([pr1, pr2, pr3]) {
+        let tag = format!("G0 h = {h}");
+        println!("{}", pr.line(&tag));
+        cfd_results::record_note("ladder", &format!("g0-outflow-probe-h{h}"), &pr.line(&tag));
+    }
     let coarse = (c1.abs() / c2.abs()).log2();
     let fine = (c2.abs() / c3.abs()).log2();
     let steady = k1 && k2 && k3;

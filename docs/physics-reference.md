@@ -173,12 +173,16 @@ p_b = p0·(a_b²/a0²)^(γ/(γ−1))
 ρ_b = γ·p_b / a_b²
 ```
 
-**Downstream outflow.** Supersonic (`|u| ≥ a`): copy the interior cell. All four characteristics exit, so this is exact and non-reflecting. Subsonic: impose `p_a`, extrapolate entropy and R⁺.
+**Downstream outflow.** The same three-way split as the radial far field, on the axial normal. Outgoing supersonic (`u ≥ a`): copy the interior cell. All four characteristics exit, so this is exact and non-reflecting. Outgoing subsonic (`0 ≤ u < a`): impose `p_a`, extrapolate entropy and R⁺.
 
 ```
 ρ_b = ρ_i·(p_a/p_i)^(1/γ);  a_b = sqrt(γp_a/ρ_b)
 u_b = (u_i + 2a_i/(γ−1)) − 2a_b/(γ−1);  v_b = v_i;  p_b = p_a
 ```
+
+Reversed (`u < 0`): the ambient reservoir at rest, `(ρ_a, 0, 0, p_a)`. Incoming gas carries **ambient** entropy and **ambient** tangential velocity, never the interior's — the interior is downstream of the face and says nothing about what enters through it.
+
+⚠ **The reversal branch and the signed supersonic test are both load-bearing** (work order A2). The first draft had no reversal branch and tested `|u| ≥ a`. Without the branch, `u < 0` fell into the subsonic construction, which extrapolates interior entropy and `v` along characteristics that are *entering* the domain — measured on non-nozzle geometry: interior `u = −0.30` produced a ghost with `u = +1.45`, a spurious outward jet at M 2.5. And `|u| ≥ a` read supersonic *inflow* as supersonic outflow, copying the interior bit-exactly — zero conditions imposed on four incoming characteristics, which is ill-posed; a sustained M 4.49 inflow grew domain mass 41.7% over 3000 steps with nothing constraining it. Clean nozzle exhaust never reverses at the exit plane, which is why T0–T8 cannot see any of this.
 
 **No sponge on the downstream boundary.** The core is supersonic there and a sponge would corrupt it.
 
