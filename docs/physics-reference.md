@@ -415,6 +415,27 @@ C_d = c*_ideal / c*,   c*_ideal = sqrt(γRT₀) / (γ·(2/(γ+1))^((γ+1)/(2(γ�
 
 Exit-plane control volume, not the wall-pressure integral. Both are defensible and they give different numbers with different mesh sensitivity; the exit-plane form stays valid when the domain extends past the lip into the plume, which it does.
 
+**Body forces on immersed geometry** (`cfd-core::forces`, added by the general-geometry ladder work order). Every quantity above is defined on a *nozzle*: it needs a lip, a throat and an exit plane. An arbitrary drawn body has none of them, so the force on a body is a separate definition:
+
+```
+F_z = Σ_{axial fluid/solid faces}  wall_flux_z(W_fluid, sgn)[1] · A_f
+F_r = Σ_{radial fluid/solid faces} wall_flux_r(W_fluid, sgn)[2] · A_f
+
+sgn = +1 when the FLUID is on the low side of the face, −1 on the high side
+A_f = 2π·r_center·dr (axial) and 2π·r_face·dz (radial) under axisymmetry;
+      dr and dz per unit depth in planar mode
+```
+
+The integrand is the §3 wall flux itself, **not** a fresh `p·n` quadrature. `wall_flux_{z,r}` return `sgn·p*`, which is already the force per unit area on the body in `+z` / `+r`: the adjacent fluid cell loses exactly that much momentum through the face, and the body's reaction is the same number with the same sign. Writing it any other way — cell-centre pressure, a re-reconstructed face pressure, a signed-normal quadrature over the staircase — makes the force and the momentum the fluid actually loses two different quantities, and then no momentum balance over a domain containing a body closes. Ladder rung G3 closes exactly that balance, which is what keeps this definition honest.
+
+Consequences worth stating, because they look like errors and are not:
+
+- On a staircase wall the *projected frontal area* is quantized to `dr` (axial) and `dz` (radial). A body of frontal height `t` carries a frontal-area error up to `dr/t`, so a thin body's drag converges at first order with a large constant. That is a property of the immersed staircase (§3), not of this integral, and it is what rung G2 measures.
+- Uniform pressure on a closed axisymmetric ring gives a nonzero inward `F_r` — the outer face is the larger one. It is the same `p·dA` imbalance the §1 source term cancels, not a bug.
+- There is no shear term. There is no boundary layer (§13), so pressure is the whole force by construction.
+
+Per-body selection uses `forces::label_bodies`, 4-connected on interior indices — the same neighbourhood the fluxes use, so two blocks touching only at a corner are two bodies, matching the fact that no flux couples across a corner.
+
 **Quasi-1D reference** (verified end to end for r_t = 50 mm, ε = 25, γ = 1.20, Mw = 22, p₀ = 5 MPa, T₀ = 3200 K, p_a = 101325 Pa — every claimed digit reproduced): M_e = 3.9127686, ṁ = 23.1584772 kg/s via both the Vandenkerckhove Γ and ρ_e V_e A_e (agreement 6e-16), c\* = 1695.703 m/s, F = 52455.11 N, C_f = 1.335758 (closed form and momentum integral agree to 4e-16), Isp_SL = 230.971 s, Isp_vac = 318.573 s. Use this as a unit test for the reference path.
 
 **What a correct 2D axisymmetric solver should show against quasi-1D**, so a developer can tell physics from a bug:
@@ -445,6 +466,21 @@ Headless, exit 0/1, one number per line. T0–T5 run in under two minutes total.
 | **T6** | Oblique shock off a 15° wedge, M = 2, γ = 1.4 | ✓ β = **45.34362°**, p₂/p₁ = 2.1946531, ρ₂/ρ₁ = 1.7289223, M₂ = 1.4457164, dβ/dθ = 1.3490216 | β within ±1.5°, fitted by least squares over x ∈ [x₀+60dz, x₀+150dz]. **Exclude the first 60 cells** — the leading edge is where a staircase wall is worst and including it fails a correct solver |
 | **T7** | Cone vs Taylor–Maccoll, M = 2.35, θ_c = 10°, γ = 1.4 | ✓ β = **26.736718°**, M_surface = 2.146831, p_c/p_∞ = **1.373936** | β ±1.5°, surface p ±8%, surface M ±5%. Plus: max \|v\| in the two rows next to the axis upstream of the cone ≤ 1e-3 of freestream |
 | **T8** | Nozzle vs isentropic | recomputed from `case.gas.gamma` | ṁ/ṁ_ideal ∈ [0.94, 1.00]; exit Mach area-averaged ±4%; C_f 0.975–0.995 of ideal |
+
+### General-geometry rungs G0–G3
+
+T6 and T7 are the ladder's only non-nozzle rungs, and both bodies are **single, thick, steady and attached to the domain edge** — they satisfy every assumption a general sandbox breaks. These four exist so that "optimizations must never be tuned for nozzles" is testable rather than promised: each breaks one of those assumptions, and G0 breaks the one with no geometry in it at all. Rationale, derivations and measured results: `docs/work-orders/general-geometry-rungs.md`. All four reuse the T6 rig and differ only in the solid mask.
+
+| | Test | Reference | Pass |
+|---|---|---|---|
+| **G0** | d'Alembert negative control: M 0.3 over a smooth 2:1 ellipse in a symmetric duct, h = 0.05 / 0.025 / 0.0125 | C_d = **0 exactly** — steady shock-free inviscid drag past a fore-aft symmetric body in a symmetric duct. Every count reported is the scheme's own dissipation | C_d falls monotonically under refinement and the fine-pair order ≥ 1.0; floors = 0; max M < 0.95 (shock-free is checked, not assumed) |
+| **G1** | Multi-body regular reflection: symmetric 10° double wedge, M 2, γ 1.4, planar. **Two disconnected solid components** | ✓ β₁ = **39.313932°**, p₂/p₁ = 1.706579, M₂ = 1.640522; reflected 49.384042° to the local flow, p₃/p₂ = 1.642579; **p₃/p₁ = 2.803191**, M₃ = 1.284889; reflection point z = 1.521155 | component count = 2; p₃/p₁ within **13.1%**; reflection point within **0.063** |
+| **G2** | Thin body: symmetric 5° diamond, zero incidence, M 2, immersed (touches no boundary). 8.7 cells thick at h = 0.01 | ✓ t/c = 0.087489, β_LE = 34.301575°, fore p/p∞ = 1.315407, aft = 0.747760, **C_d = 0.017737** (Ackeret 0.017677) | C_d within **2h/t** — the staircase frontal-area quantization bound, 22.9% at h = 0.01 |
+| **G3** | Never steady: Woodward & Colella M 3 forward-facing step, 3 × 1 duct, step 0.2 at z = 0.6 | structural — the published solution is a picture, not a number | floors = **0**; mass, z-momentum and energy balance against the analytic inflow ≤ **2e-6** (T2's band) over the pre-disturbance window; the Mach stem forms on the leading bow shock (front normal at the top wall, ≤ 2 cells of spread over 6 rows, with a subsonic pocket behind it). **Not** a convergence assertion |
+
+**Where G1's and G2's tolerances come from.** G1's is this document's own ±1.5° shock-angle claim (T6, T7 and §13's badge) propagated through the exact two-shock solution: ±1.5° on β₁ moves p₃/p₁ by 13.10% / 15.19% and the reflection point by 0.0674 / 0.0632, and the rung takes the tighter side of each so it is never laxer than the claim it inherits. G2's is the immersed staircase's own floor: a body of frontal height t on cells of size h has its *projected frontal area* quantized to one cell, so no flow solution can do better than 2h/t in C_d. Both were checked against a three-level grid-convergence study before being written down.
+
+**G3's balance window is exact, not approximate.** Before any disturbance reaches the outflow, both boundary fluxes are exactly the free-stream flux, so mass/momentum/energy balance against the analytic inflow carries no discretization error at all — only f32 roundoff against f64 reductions. That is why it can be held to T2's 2e-6 rather than to a looser, time-integration-limited band. The window is verified in the test (the exit column must still be free stream), never assumed. The momentum leg additionally needs the wall impulse, which is why §11's surface pressure integral has to be the wall flux itself and not a re-derived `p·n`.
 
 **T7 has a trap.** The NASA NPARC validation archive lists p₃/p₁ = 1.4234 for this case. That value is wrong for a 10° cone — ✓ it corresponds to a **10.791°** cone (⚠ the earlier estimate of 10.90° was itself off; 10.90° gives 1.43040). The archive's own pair is internally inconsistent: its β = 27.1843° implies p = 1.4306, not 1.4234. Its *Mach* numbers match to five digits. Put this in the test comment so nobody "fixes" the value back to the archive's.
 
