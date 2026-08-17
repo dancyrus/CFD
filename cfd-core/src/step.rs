@@ -14,7 +14,7 @@ use std::sync::Arc;
 use cfd_contract::kernels::{cons_to_prim, prim_to_cons, sound_speed};
 use cfd_contract::{
     Ambient, CfdError, Cons, FieldKind, Numerics, Prim, Real, Report, Result, Snapshot,
-    SolidField, SolveSetup, Solver, State, StepInfo, Confidence, NG,
+    SolidField, SolveSetup, Solver, State, StepInfo, Confidence, WallMode, NG,
 };
 
 use crate::{kernel, physics};
@@ -131,6 +131,24 @@ impl Solver for EulerSolver {
             self.setup.solid = new_solid;
             self.residual_ref = f64::NAN; // reset the convergence monitor
             self.info.step = 0;
+        }
+
+        // ColumnReflect's fill assumes star-convex-in-r geometry (at most one
+        // solid run per column). On anything else it overwrites live fluid
+        // above the second run — measured on a 9-disk array, 2346 of 21420
+        // fluid cells destroyed, report off 2.6x, silently. Refuse the mode
+        // instead (work order A2). Checked per step only in this mode; it is
+        // a diagnostic mode and the scan is one pass over the mask.
+        if num.wall_mode == WallMode::ColumnReflect
+            && !physics::column_reflect_supported(&g, &self.setup.solid)
+        {
+            return Err(CfdError::Geometry(
+                "WallMode::ColumnReflect requires star-convex-in-r geometry \
+                 (at most one solid run per column); a column has more than \
+                 one — the mirror fill would overwrite live fluid. Use \
+                 WallMode::Mirror for this geometry."
+                    .into(),
+            ));
         }
 
         physics::fill_ghosts(&mut self.state.u_old, &g, &self.solid, &gas,
