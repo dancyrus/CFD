@@ -98,6 +98,21 @@ impl EulerSolver {
         self.residual_ref = f64::NAN;
     }
 
+    /// Interior primitives in the solver's OWN units — non-dimensional,
+    /// canonical `[rho, u_z, u_r, p]`, `grid.len()` long, ghosts stripped.
+    /// `Snapshot` is the SI display copy and is a lossy place to do physics
+    /// from; this is the input `forces::surface_pressure_force` wants, and the
+    /// only way an out-of-crate caller can get at the field without the
+    /// reference-scale round trip.
+    pub fn primitives(&self) -> Vec<Prim> {
+        let g = &self.setup.grid;
+        let gamma = self.setup.gas.gamma;
+        (0..g.nr)
+            .flat_map(|ir| (0..g.nz).map(move |iz| (iz, ir)))
+            .map(|(iz, ir)| cons_to_prim(self.state.u_old[g.gidx(iz as isize, ir as isize)], gamma))
+            .collect()
+    }
+
     pub fn setup(&self) -> &SolveSetup { &self.setup }
 }
 
@@ -192,13 +207,7 @@ impl Solver for EulerSolver {
     }
 
     fn snapshot(&self) -> Snapshot {
-        let g = self.setup.grid.clone();
-        let gamma = self.setup.gas.gamma;
-        let prims: Vec<Prim> = (0..g.nr)
-            .flat_map(|ir| (0..g.nz).map(move |iz| (iz, ir)))
-            .map(|(iz, ir)| cons_to_prim(self.state.u_old[g.gidx(iz as isize, ir as isize)], gamma))
-            .collect();
-        snapshot_from_prims(&self.setup, &prims, self.info)
+        snapshot_from_prims(&self.setup, &self.primitives(), self.info)
     }
 
     fn report(&self) -> Report {
