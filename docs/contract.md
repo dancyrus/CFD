@@ -195,8 +195,17 @@ pub struct StepInfo {
     pub step: u64,
     pub time: f64,              // non-dimensional
     pub dt: Real,
-    /// L2 of the density update, normalized by its step-10 value. NaN before step 10.
+    /// L2 of the density update, normalized by its step-10 value. NaN before
+    /// step 10. A reported DIAGNOSTIC only — it is NOT the convergence
+    /// criterion (physics-reference §9: a breathing plume holds it above any
+    /// fixed threshold forever).
     pub residual: f64,
+    /// The finish line: `cfd-core`'s plateau monitor — the trailing window
+    /// MEAN of the report's exit-plane thrust moved < tol/2 from the previous
+    /// window's mean, sampled at fixed physical-time intervals, window
+    /// auto-sized from the domain transit time. Latched until ambient/
+    /// geometry/initial-field changes re-arm it. Definition and constants:
+    /// physics-reference §9.
     pub converged: bool,
     /// Cumulative. Nonzero means every downstream number is un-auditable.
     pub floor_activations: u64,
@@ -368,9 +377,20 @@ step():
   kernel::enforce_positivity(&mut u_new, gas, &mut floors)
 
   physics::apply_sponge(&mut u_new, grid, dt, ambient, gas, num.sponge_cells)
-  residual = kernel::density_residual_f64(u_old, u_new, solid)
+  residual = kernel::density_residual_f64(u_old, u_new, solid)   // diagnostic only
   state.swap()
+
+  // convergence (physics-reference §9): plateau on the trailing mean of the
+  // report's exit-plane thrust, sampled on PHYSICAL time — the report is
+  // only built when the monitor's clock is due, ~1 step in 50.
+  if monitor.due(time) { monitor.update(time, report().thrust_n) }
+  converged = monitor.converged()
 ```
+
+The monitor lives in `cfd-core/src/monitor.rs` (`PlateauMonitor`; constants
+`CONVERGED_TOL = 2e-2`, `SAMPLES_PER_WINDOW = 16`, `WINDOW_TRANSITS = 0.5`).
+`set_ambient`, `set_geometry` (at its drain point) and `set_initial` re-arm it
+with `monitor.reset(time)`; the verdict latches until one of those happens.
 
 ---
 

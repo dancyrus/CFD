@@ -8,6 +8,7 @@
 //! indexed with `Grid::gidx`. Ghost cells never cross a crate boundary.
 
 pub mod kernel;
+pub mod monitor;
 pub mod physics;
 
 mod mock;

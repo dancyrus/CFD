@@ -1122,7 +1122,7 @@ impl CfdApp {
         let settled = rep.converged;
         if !settled {
             ui.label(
-                RichText::new("settling — integrated quantities greyed until the residual drops")
+                RichText::new("settling — integrated quantities greyed until the flow settles")
                     .weak()
                     .small(),
             );
@@ -1308,9 +1308,11 @@ impl CfdApp {
                     "warming up (residual defined from step 10)".to_string(),
                 )
             } else if res < 1e-3 {
-                (GREEN, format!("settled · L2(∂ρ/∂t) = {res:.1e}"))
+                // Diagnostic only: the settled verdict is the plateau monitor
+                // (physics-reference §9), not this threshold.
+                (GREEN, format!("low · L2(∂ρ/∂t) = {res:.1e}"))
             } else {
-                (AMBER, format!("converging · L2(∂ρ/∂t) = {res:.1e}"))
+                (AMBER, format!("active · L2(∂ρ/∂t) = {res:.1e}"))
             };
             let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
             ui.painter().circle_filled(r.center(), 4.0, dot);

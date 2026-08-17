@@ -21,6 +21,12 @@ One file per suite per machine: `<suite>-<machine>.json`.
   bell vs published geometry, RS-25 cone-vs-bell report), written by
   `cargo test -p cfd-ui contour` plus the slow before/after comparison
   `cargo test -p cfd-ui rs25_before_after -- --include-ignored`.
+- `convergence-<machine>.json` — the convergence-criterion swap (work order
+  C1): before/after steps-to-settled on the demo case for the trailing-mean
+  plateau against the peak-to-peak design it replaced, plus the residual
+  criterion's measured minimum (which must stay above 1e-3 — the documented
+  reason it could not be the finish line). Written by
+  `cargo test -p cfd-core --test convergence -- --include-ignored`.
 - `historical-presets-<machine>.json` — the historical engine presets
   (1943–1961) and their CEA-backed propellant classes: cone geometry, domain
   fit, separation at each preset's default altitude, the Redstone throat area
