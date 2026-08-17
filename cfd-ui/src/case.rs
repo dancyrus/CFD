@@ -42,6 +42,16 @@ pub const CELLS_PER_RT_RANGE: (f64, f64) = (8.0, 160.0);
 pub const DZ_OVER_DR_RANGE: (f64, f64) = (1.0, 8.0);
 pub const LZ_RANGE: (f64, f64) = (20.0, 600.0);
 pub const LR_RANGE: (f64, f64) = (5.0, 100.0);
+/// Bottom stop of the area-ratio slider. Named because it is load-bearing for
+/// the Rao disclosure: it sits BELOW the digitised table's ε = 4 start, so any
+/// bell preset can be dragged into the clamped region and the app has to say
+/// so — the mirror of the ε > 100 case Merlin Vac already exercises. The top
+/// stop is not a constant; it stretches to hold whatever preset is selected.
+pub const AREA_RATIO_SLIDER_MIN: f64 = 2.0;
+/// The digitised Rao table's area-ratio range (`cfd_geom::rao_angles` clamps to
+/// it at BOTH ends rather than extrapolating). Outside it the bell angles are
+/// an end row stretched to the requested exit radius, which the UI discloses.
+pub const RAO_TABLE_EPS: std::ops::RangeInclusive<f64> = 4.0..=100.0;
 
 /// Altitude ceiling, docs/physics-reference.md §5: 58 km is where the
 /// thinnest ambient still clears the pressure floor for the highest-pressure
@@ -168,6 +178,12 @@ pub struct CaseParams {
     /// Downstream throat-arc radius in r_t. The §10 family value is 0.382;
     /// measured geometry brings its own (Raptor 2: 0.300).
     pub throat_arc_down: f64,
+    /// Divergent half-angle of a `Conical` contour, degrees. Per-case because
+    /// the app used to hard-code 15° and the contour audit found no source for
+    /// that number; handbook practice runs 12–18°. `CONE_HALF_ANGLE_DEG` is
+    /// still the default, and three of the historical presets genuinely are
+    /// 15° — but three data points are not a constant.
+    pub cone_half_angle_deg: f64,
     pub altitude_m: f64,
     /// Labelled vacuum mode: back pressure fixed at `VACUUM_P_FRAC * p0`,
     /// ignoring `altitude_m`. The region above the 58 km slider cap.
@@ -199,6 +215,7 @@ impl Default for CaseParams {
             contour_kind: ContourKind::Conical,
             bell_percent: 0.8,
             throat_arc_down: THROAT_ARC_DOWN,
+            cone_half_angle_deg: CONE_HALF_ANGLE_DEG,
             altitude_m: 0.0,
             vacuum: false,
             lz_rt: LZ_DEFAULT,
@@ -340,17 +357,17 @@ pub fn ambient_nd(p: &CaseParams) -> Ambient {
 
 /// A propellant class whose chamber thermochemistry comes from
 /// `tools/propellant_cea.py` — constant-enthalpy constant-pressure equilibrium
-/// from the liquid reactants' heats of formation, run through NASA CEA
-/// (rocketcea) and cross-checked against cantera/gri30, which agree to 0.13% on
-/// T₀ and 0.03% on c*. The full table is `docs/results/propellant-cea.md`.
+/// from the liquid reactants' heats of formation, on the GRI-Mech 3.0 species
+/// set with the HIGH-TEMPERATURE thermo fits (`gri30_highT`). The standard
+/// `gri30` polynomials cap at 3000 K and every LOX/RP-1 case here runs above
+/// 3450 K, so the standard set would be extrapolating on all five. The full
+/// table is `docs/results/propellant-cea.md`.
 ///
 /// γ here is the FROZEN ratio — cp/cv of the equilibrium chamber mixture, its
-/// composition held fixed — and NOT CEA's shifting-equilibrium exponent,
-/// because the solver is a fixed-gamma ideal gas with no species transport
-/// (docs/physics-reference.md §2). The gap is large enough to matter: LOX/RP-1
-/// at 4.1 MPa is γ_frozen 1.221 against γ_eq 1.148, and handing the solver the
-/// equilibrium value would ask a frozen-composition code to reproduce a
-/// recombining expansion it cannot perform.
+/// composition held fixed — because the solver is a fixed-gamma ideal gas with
+/// no species transport (docs/physics-reference.md §2). Handing it a
+/// shifting-equilibrium exponent would ask a frozen-composition code to
+/// reproduce a recombining expansion it cannot perform.
 ///
 /// **These are class REFERENCE values — the mean over the class's cases.** A
 /// preset carries its own per-case numbers instead (`EnginePreset::gamma` and
@@ -372,14 +389,31 @@ pub enum PropellantClass {
 }
 
 /// Chamber thermochemistry of one propellant class or one engine case.
+///
+/// Two characteristic velocities, because they answer different questions and
+/// the historical throat radii depend on getting that distinction right:
+///
+/// * `cstar_shifting_m_s` is what `tools/propellant_cea.py` computes by
+///   expanding the equilibrium mixture to the sonic point, letting the
+///   composition shift. It is what CEA reports, and it is what the published
+///   throat areas were sized against — so it, not the closed form, is what the
+///   `A_t = F / (Cf·λ·η·p₀)` derivation is calibrated on.
+/// * `cstar_frozen_m_s` is the closed form for a calorically perfect gas at
+///   these (T₀, MW, γ). It runs ~1.3% low, because holding chamber γ all the
+///   way to the throat ignores the recombination that reheats the gas as it
+///   accelerates. It is nonetheless the honest figure for THIS solver, which
+///   is exactly that fixed-γ ideal gas.
+///
+/// `cstar_ideal` recomputes the frozen form in Rust and
+/// `rust_and_python_frozen_cstar_agree` holds the two implementations
+/// together, so the table cannot drift from the tool that produced it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GasProperties {
     pub gamma: f64,
     pub t0_k: f64,
     pub mw_g_mol: f64,
-    /// Ideal c* for a calorically perfect gas at these (T₀, MW, γ) — the value
-    /// the fixed-gamma solver reproduces, not CEA's equilibrium c*.
-    pub cstar_ideal_m_s: f64,
+    pub cstar_shifting_m_s: f64,
+    pub cstar_frozen_m_s: f64,
 }
 
 impl PropellantClass {
@@ -402,22 +436,25 @@ impl PropellantClass {
     pub const fn reference(self) -> GasProperties {
         match self {
             PropellantClass::LoxRp1 => GasProperties {
-                gamma: 1.221_039,
-                t0_k: 3484.488,
-                mw_g_mol: 21.853_31,
-                cstar_ideal_m_s: 1764.375,
+                gamma: 1.221_014,
+                t0_k: 3488.581,
+                mw_g_mol: 21.865_61,
+                cstar_shifting_m_s: 1804.863,
+                cstar_frozen_m_s: 1764.927,
             },
             PropellantClass::LoxEthanol75 => GasProperties {
-                gamma: 1.191_122,
-                t0_k: 2982.336,
-                mw_g_mol: 22.687_11,
-                cstar_ideal_m_s: 1616.282,
+                gamma: 1.191_029,
+                t0_k: 2985.608,
+                mw_g_mol: 22.694_11,
+                cstar_shifting_m_s: 1644.738,
+                cstar_frozen_m_s: 1616.966,
             },
             PropellantClass::RfnaAnilineFurfuryl => GasProperties {
-                gamma: 1.211_682,
-                t0_k: 2986.707,
-                mw_g_mol: 25.615_83,
-                cstar_ideal_m_s: 1512.928,
+                gamma: 1.211_618,
+                t0_k: 2988.298,
+                mw_g_mol: 25.620_19,
+                cstar_shifting_m_s: 1539.056,
+                cstar_frozen_m_s: 1513.231,
             },
         }
     }
@@ -429,16 +466,16 @@ impl PropellantClass {
     pub const fn cases_span(self) -> (GasProperties, GasProperties) {
         match self {
             PropellantClass::LoxRp1 => (
-                GasProperties { gamma: 1.219_718, t0_k: 3466.106, mw_g_mol: 21.749_46, cstar_ideal_m_s: 1763.024 },
-                GasProperties { gamma: 1.221_870, t0_k: 3514.429, mw_g_mol: 22.013_91, cstar_ideal_m_s: 1766.147 },
+                GasProperties { gamma: 1.219_702, t0_k: 3470.218, mw_g_mol: 21.761_67, cstar_shifting_m_s: 1803.813, cstar_frozen_m_s: 1763.565 },
+                GasProperties { gamma: 1.221_839, t0_k: 3518.501, mw_g_mol: 22.026_37, cstar_shifting_m_s: 1806.722, cstar_frozen_m_s: 1766.679 },
             ),
             PropellantClass::LoxEthanol75 => (
-                GasProperties { gamma: 1.187_561, t0_k: 2886.347, mw_g_mol: 22.025_27, cstar_ideal_m_s: 1612.105 },
-                GasProperties { gamma: 1.194_682, t0_k: 3078.326, mw_g_mol: 23.348_94, cstar_ideal_m_s: 1620.459 },
+                GasProperties { gamma: 1.187_463, t0_k: 2889.649, mw_g_mol: 22.031_74, cstar_shifting_m_s: 1634.501, cstar_frozen_m_s: 1612.833 },
+                GasProperties { gamma: 1.194_595, t0_k: 3081.567, mw_g_mol: 23.356_47, cstar_shifting_m_s: 1654.974, cstar_frozen_m_s: 1621.099 },
             ),
             PropellantClass::RfnaAnilineFurfuryl => (
-                GasProperties { gamma: 1.211_682, t0_k: 2986.707, mw_g_mol: 25.615_83, cstar_ideal_m_s: 1512.928 },
-                GasProperties { gamma: 1.211_682, t0_k: 2986.707, mw_g_mol: 25.615_83, cstar_ideal_m_s: 1512.928 },
+                GasProperties { gamma: 1.211_618, t0_k: 2988.298, mw_g_mol: 25.620_19, cstar_shifting_m_s: 1539.056, cstar_frozen_m_s: 1513.231 },
+                GasProperties { gamma: 1.211_618, t0_k: 2988.298, mw_g_mol: 25.620_19, cstar_shifting_m_s: 1539.056, cstar_frozen_m_s: 1513.231 },
             ),
         }
     }
@@ -486,6 +523,24 @@ pub struct EnginePreset {
     /// "published" (RS-25 only), "measured geometry" (Raptor 2, whose wall
     /// angles bypass the table entirely), or "design-class estimate".
     pub bell_source: &'static str,
+    /// Where `r_throat_m` comes from. Only the Redstone's is a published
+    /// dimension; the rest are derived from thrust and thrust coefficient
+    /// against that one calibration point. Empty for the six presets that
+    /// predate this labelling.
+    pub throat_source: &'static str,
+    /// Where `p0_pa` and `area_ratio` come from. Empty for the six presets
+    /// that predate this labelling.
+    pub operating_source: &'static str,
+    /// Divergent half-angle for a `Conical` preset, degrees. Ignored by the
+    /// bell kinds, which take their wall angles from the Rao table or from
+    /// published geometry.
+    pub cone_half_angle_deg: f64,
+    /// c* by shifting-equilibrium expansion to the sonic point, m/s, from
+    /// `tools/propellant_cea.py`. Data, not a derived quantity: only the
+    /// equilibrium solve can produce it, and it is the figure the throat
+    /// derivation was calibrated against. Zero for the six presets that
+    /// predate the tool.
+    pub cstar_shifting_m_s: f64,
     /// Shown as "(slow)" in the selector: run time ≈12× Merlin 1D.
     pub slow: bool,
     /// The altitude the preset OPENS at, km. Almost every engine is 0 — it is
@@ -503,6 +558,16 @@ pub struct EnginePreset {
     /// Preset-specific honesty note, surfaced as a tooltip.
     pub note: &'static str,
 }
+
+/// Shared tooltip for the five bells in the historical set. Thor is 1957 and
+/// Atlas D 1959, against Rao's 1958 and 1960 papers — these engines predate or
+/// are contemporary with the charts the generator interpolates, so the wall it
+/// draws is of the right family but is not the engine's own contour. The same
+/// class of caveat the Raptor 2 preset already carries, for the opposite
+/// reason: that one is too late and too different, these are too early.
+const EARLY_BELL_NOTE: &str = "Early contoured nozzle. Predates or is \
+     contemporary with Rao's published charts, so the generated contour is an \
+     approximation of the real one.";
 
 /// The six modern presets come first and keep their indices — `PRESETS[0]` is
 /// the Merlin 1D cost reference and several tests index by position. The eight
@@ -523,6 +588,10 @@ pub const PRESETS: [EnginePreset; 14] = [
         throat_arc_down: THROAT_ARC_DOWN,
         bell_percent: 0.78,
         bell_source: "design-class estimate",
+        throat_source: "",
+        operating_source: "",
+        cone_half_angle_deg: CONE_HALF_ANGLE_DEG,
+        cstar_shifting_m_s: 0.0,
         slow: false,
         default_altitude_km: 0.0,
         note: "",
@@ -546,6 +615,10 @@ pub const PRESETS: [EnginePreset; 14] = [
         throat_arc_down: THROAT_ARC_DOWN,
         bell_percent: 0.75,
         bell_source: "design-class estimate",
+        throat_source: "",
+        operating_source: "",
+        cone_half_angle_deg: CONE_HALF_ANGLE_DEG,
+        cstar_shifting_m_s: 0.0,
         slow: false,
         default_altitude_km: 0.0,
         note: "Sits 3% inside the separation threshold at sea level by design \
@@ -579,6 +652,10 @@ pub const PRESETS: [EnginePreset; 14] = [
         throat_arc_down: 0.300,
         bell_percent: 0.76,
         bell_source: "measured geometry (FAA AR 2019-001b Table 1)",
+        throat_source: "",
+        operating_source: "",
+        cone_half_angle_deg: CONE_HALF_ANGLE_DEG,
+        cstar_shifting_m_s: 0.0,
         slow: false,
         default_altitude_km: 0.0,
         note: "Wall angles are the published θ_n 32.0° / θ_e 6.0° on a \
@@ -600,6 +677,10 @@ pub const PRESETS: [EnginePreset; 14] = [
         throat_arc_down: THROAT_ARC_DOWN,
         bell_percent: 0.78,
         bell_source: "design-class estimate",
+        throat_source: "",
+        operating_source: "",
+        cone_half_angle_deg: CONE_HALF_ANGLE_DEG,
+        cstar_shifting_m_s: 0.0,
         slow: false,
         default_altitude_km: 0.0,
         note: "",
@@ -619,6 +700,10 @@ pub const PRESETS: [EnginePreset; 14] = [
         throat_arc_down: THROAT_ARC_DOWN,
         bell_percent: 0.80,
         bell_source: "published",
+        throat_source: "",
+        operating_source: "",
+        cone_half_angle_deg: CONE_HALF_ANGLE_DEG,
+        cstar_shifting_m_s: 0.0,
         slow: false,
         default_altitude_km: 0.0,
         note: "Shows a separation warning at sea level: a known conservatism \
@@ -643,6 +728,10 @@ pub const PRESETS: [EnginePreset; 14] = [
         throat_arc_down: THROAT_ARC_DOWN,
         bell_percent: 0.75,
         bell_source: "design-class estimate",
+        throat_source: "",
+        operating_source: "",
+        cone_half_angle_deg: CONE_HALF_ANGLE_DEG,
+        cstar_shifting_m_s: 0.0,
         slow: true,
         default_altitude_km: 0.0,
         note: "The costliest preset by far even at the reduced 14 cells per \
@@ -652,209 +741,239 @@ pub const PRESETS: [EnginePreset; 14] = [
                the ε = 100 row — see the amber flag.",
     },
     // -----------------------------------------------------------------------
-    // Historical engines, 1943–1961. Every one is a 15° CONE, not a bell, and
-    // that is the period being represented rather than a modelling shortcut:
-    // the parabolic bell is a Rao 1958 result, and none of these engines flew
-    // one. γ, T₀ and MW are the per-case CEA numbers from
-    // `tools/propellant_cea.py` (docs/results/propellant-cea.md), not the
-    // class means — see `PropellantClass`.
+    // Historical engines, 1943–1961. γ, T₀, MW and the shifting-equilibrium c*
+    // are the per-case numbers from `tools/propellant_cea.py`
+    // (docs/results/propellant-cea.md), not the class means — see
+    // `PropellantClass`.
     //
-    // Throat radii are DERIVED except the Redstone's, which is the one
-    // published geometric figure in the set (throat dia 15.5 in). Where a
-    // derived r_t disagrees with the engine's commonly-cited thrust or mass
-    // flow by more than 10%, the disagreement is recorded in the preset's own
-    // note and in docs/results/historical-presets-v1.md — it is NOT tuned
-    // away, because r_t is what the task fixed and matching a half-remembered
-    // thrust figure by moving geometry would launder a guess into a datum.
+    // THE BELL/CONE TRANSITION FALLS INSIDE THIS DATE RANGE, which is the one
+    // thing an earlier revision of this table got wrong on five of eight
+    // engines. The V-2, WAC Corporal and Redstone are cones; Thor, both Atlas
+    // engines and both Titan I engines are bells. Rocketdyne carried bell
+    // nozzles from Navaho into Atlas, Jupiter and Thor, and Rao was at
+    // Rocketdyne, so the change happens mid-1950s — inside the set, not after
+    // it.
+    //
+    // Throat radii are DERIVED from published thrust and thrust coefficient,
+    // A_t = F / (Cf_ideal · λ · η · p₀), except the Redstone's, which is the
+    // one published throat dimension in the set (15.5 in diameter) and the
+    // single point η = 0.9877 is calibrated on. That derivation reproduces it
+    // to −0.03%. The obvious alternative — A_t = ṁ·c*/p₀ — is NOT used: it
+    // back-solves the Redstone to a c* efficiency of 100.2%, which no engine
+    // achieves, and the same AEHS table's LR89-5 row implies an Isp of 356 s
+    // against its own Isp column of 248–282. The mass-flow column is the weak
+    // one, so it is not what the geometry rests on.
     // -----------------------------------------------------------------------
     EnginePreset {
         name: "V-2 (A-4) Model 39",
         propellant: PropellantClass::LoxEthanol75.label(),
         propellant_class: Some(PropellantClass::LoxEthanol75),
         area_ratio: 2.83,
-        p0_pa: 1.57e6,
-        r_throat_m: 0.206,
-        gamma: 1.194_682,
-        t0_k: 2886.347,
-        mw_g_mol: 22.025_27,
+        p0_pa: 1.572e6,
+        r_throat_m: 0.193_6,
+        gamma: 1.194_595,
+        t0_k: 2889.649,
+        mw_g_mol: 22.031_74,
+        cstar_shifting_m_s: 1634.501,
         cells_per_rt: CELLS_PER_RT,
         contour_kind: ContourKind::Conical,
+        cone_half_angle_deg: 15.0,
         throat_arc_down: THROAT_ARC_DOWN,
         bell_percent: 0.8,
-        bell_source: "published (Sutton 1949 via AEHS); r_t derived",
+        bell_source: "15° cone — confirmed (Wewerka set the half-angle; AEHS names it conical)",
+        throat_source: "derived from thrust and Cf; validated against Redstone",
+        operating_source: "published",
         slow: false,
         default_altitude_km: 0.0,
-        note: "Area ratio 2.83 per Sutton. Museum-hardware dimensions \
-               elsewhere imply ~3.34. Unresolved.\n\
-               The derived 206 mm throat also runs ~10% above the commonly \
-               cited 125 kg/s propellant flow. Recorded, not tuned out — see \
-               docs/results/historical-presets-v1.md.",
+        note: "Area ratio 2.83 per Sutton. Museum-hardware dimensions elsewhere \
+               imply ~3.34. Unresolved.",
+    },
+    EnginePreset {
+        name: "WAC Corporal 38ALDW-1500",
+        propellant: PropellantClass::RfnaAnilineFurfuryl.label(),
+        propellant_class: Some(PropellantClass::RfnaAnilineFurfuryl),
+        area_ratio: 5.00,
+        p0_pa: 2.068e6,
+        r_throat_m: 0.027_5,
+        gamma: 1.211_618,
+        t0_k: 2988.298,
+        mw_g_mol: 25.620_19,
+        cstar_shifting_m_s: 1539.056,
+        cells_per_rt: CELLS_PER_RT,
+        contour_kind: ContourKind::Conical,
+        cone_half_angle_deg: 15.0,
+        throat_arc_down: THROAT_ARC_DOWN,
+        bell_percent: 0.8,
+        bell_source: "cone — confirmed by date (1945 Aerojet JATO unit)",
+        throat_source: "derived from thrust and Cf; validated against Redstone",
+        operating_source: "RECONSTRUCTED — chamber pressure and area ratio unpublished",
+        slow: false,
+        default_altitude_km: 0.0,
+        note: "Chamber pressure and area ratio are both reconstructed, not \
+               published. Thrust, burn time, propellants and the \
+               air-pressurised feed are confirmed; everything downstream of p₀ \
+               and ε is only as good as that reconstruction.",
     },
     EnginePreset {
         name: "Redstone NAA 75-110-A-7",
         propellant: PropellantClass::LoxEthanol75.label(),
         propellant_class: Some(PropellantClass::LoxEthanol75),
         area_ratio: 3.61,
-        p0_pa: 2.19e6,
-        // The only published throat dimension in the historical set: 15.5 in
-        // diameter. Everything else here is derived, and this is the engine
-        // the CEA acceptance gate is anchored on.
-        r_throat_m: 0.196_9,
-        gamma: 1.187_561,
-        t0_k: 3078.326,
-        mw_g_mol: 23.348_94,
+        p0_pa: 2.193e6,
+        // The one published throat dimension in the set, and the point the
+        // whole derivation is calibrated on: 15.5 in diameter.
+        r_throat_m: 0.196_85,
+        gamma: 1.187_463,
+        t0_k: 3081.567,
+        mw_g_mol: 23.356_47,
+        cstar_shifting_m_s: 1654.974,
         cells_per_rt: CELLS_PER_RT,
         contour_kind: ContourKind::Conical,
+        cone_half_angle_deg: 15.0,
         throat_arc_down: THROAT_ARC_DOWN,
         bell_percent: 0.8,
-        bell_source: "published (throat dia 15.5 in)",
+        bell_source: "15° cone — confirmed (\"a straight-sided 15° divergent \
+                      nozzle section was retained\")",
+        throat_source: "published (15.5 in throat diameter)",
+        operating_source: "published",
         slow: false,
         default_altitude_km: 0.0,
-        note: "The one engine here with a published throat diameter, and so \
-               the anchor for the propellant thermochemistry: computed ideal \
-               c* 1620 m/s against the 1658 m/s implied by the published \
-               throat area, mass flow and chamber pressure. That implies a c* \
-               efficiency above 100%, which no engine achieves — the published \
-               trio is mutually optimistic, most likely because 318 psia is \
-               injector-end rather than nozzle stagnation pressure.",
+        note: "The only engine here with a published throat diameter, and so \
+               the calibration point for every derived throat radius in the \
+               set: the thrust-and-Cf derivation reproduces it to −0.03%.",
     },
     EnginePreset {
         name: "Thor LR79-NA-7 (MB-1)",
         propellant: PropellantClass::LoxRp1.label(),
         propellant_class: Some(PropellantClass::LoxRp1),
-        area_ratio: 8.0,
-        p0_pa: 4.10e6,
-        r_throat_m: 0.195,
-        gamma: 1.220_590,
-        t0_k: 3491.034,
-        mw_g_mol: 21.933_69,
+        area_ratio: 8.00,
+        p0_pa: 4.100e6,
+        r_throat_m: 0.187_8,
+        gamma: 1.220_567,
+        t0_k: 3495.093,
+        mw_g_mol: 21.946_03,
+        cstar_shifting_m_s: 1804.434,
         cells_per_rt: CELLS_PER_RT,
-        contour_kind: ContourKind::Conical,
+        contour_kind: ContourKind::ParabolicBell,
+        cone_half_angle_deg: CONE_HALF_ANGLE_DEG,
         throat_arc_down: THROAT_ARC_DOWN,
-        bell_percent: 0.8,
-        bell_source: "p₀/ε published; r_t derived",
+        bell_percent: 0.80,
+        bell_source: "design-class estimate; no published wall angles",
+        throat_source: "derived from thrust and Cf; validated against Redstone",
+        operating_source: "published",
         slow: false,
         default_altitude_km: 0.0,
-        note: "",
-    },
-    EnginePreset {
-        name: "Atlas LR89-5 booster",
-        propellant: PropellantClass::LoxRp1.label(),
-        propellant_class: Some(PropellantClass::LoxRp1),
-        area_ratio: 8.0,
-        p0_pa: 4.00e6,
-        r_throat_m: 0.170,
-        gamma: 1.221_564,
-        t0_k: 3471.873,
-        mw_g_mol: 21.794_65,
-        cells_per_rt: CELLS_PER_RT,
-        contour_kind: ContourKind::Conical,
-        throat_arc_down: THROAT_ARC_DOWN,
-        bell_percent: 0.8,
-        bell_source: "p₀/ε published; r_t derived",
-        slow: false,
-        default_altitude_km: 0.0,
-        note: "The 170 mm derived throat produces roughly 30% less sea-level \
-               thrust than the commonly cited 165,000 lbf — the largest \
-               disagreement in the historical set. Recorded rather than tuned \
-               away; the r_t needed to close it is ~203 mm. See \
-               docs/results/historical-presets-v1.md.",
-    },
-    EnginePreset {
-        name: "Atlas LR105-5 sustainer",
-        propellant: PropellantClass::LoxRp1.label(),
-        propellant_class: Some(PropellantClass::LoxRp1),
-        area_ratio: 25.0,
-        p0_pa: 4.80e6,
-        r_throat_m: 0.101,
-        gamma: 1.219_718,
-        t0_k: 3514.429,
-        mw_g_mol: 22.013_91,
-        cells_per_rt: CELLS_PER_RT,
-        contour_kind: ContourKind::Conical,
-        throat_arc_down: THROAT_ARC_DOWN,
-        bell_percent: 0.8,
-        bell_source: "p₀/ε published; r_t derived",
-        slow: false,
-        // Altitude-optimised: p_e/p_a is 0.168 at sea level, well under the
-        // 0.40 separation threshold, so the preset opens at 25 km instead.
-        default_altitude_km: 25.0,
-        note: "Altitude-optimised, and genuinely separated at sea level \
-               (p_e/p_a ≈ 0.17 against the 0.40 threshold) — the preset opens \
-               at 25 km, where the readouts mean something. Drag the altitude \
-               slider down to see the separation warning it is avoiding.",
+        note: EARLY_BELL_NOTE,
     },
     EnginePreset {
         name: "Titan I LR87-AJ-3 (1 of 2)",
         propellant: PropellantClass::LoxRp1.label(),
         propellant_class: Some(PropellantClass::LoxRp1),
-        area_ratio: 8.0,
-        p0_pa: 4.00e6,
-        r_throat_m: 0.190,
-        gamma: 1.221_870,
-        t0_k: 3466.106,
-        mw_g_mol: 21.749_46,
+        area_ratio: 8.00,
+        p0_pa: 4.000e6,
+        r_throat_m: 0.187_7,
+        gamma: 1.221_839,
+        t0_k: 3470.218,
+        mw_g_mol: 21.761_67,
+        cstar_shifting_m_s: 1803.813,
         cells_per_rt: CELLS_PER_RT,
-        contour_kind: ContourKind::Conical,
+        contour_kind: ContourKind::ParabolicBell,
+        cone_half_angle_deg: CONE_HALF_ANGLE_DEG,
         throat_arc_down: THROAT_ARC_DOWN,
-        bell_percent: 0.8,
-        bell_source: "p₀/ε published; r_t derived",
+        bell_percent: 0.80,
+        bell_source: "design-class estimate; no published wall angles; contour family unverified",
+        throat_source: "derived from thrust and Cf; validated against Redstone",
+        operating_source: "published",
         slow: false,
         default_altitude_km: 0.0,
         note: "One of the two chambers of the LR87-AJ-3 first stage, not the \
-               pair: the preset solves a single nozzle.",
+               pair: the preset solves a single nozzle.\n\
+               Contour family is UNVERIFIED — Aerojet, not Rocketdyne, so the \
+               Navaho bell lineage does not carry over. Shipped as a bell; \
+               resolvable from museum hardware.",
     },
     EnginePreset {
         name: "Titan I LR91-AJ-3",
         propellant: PropellantClass::LoxRp1.label(),
         propellant_class: Some(PropellantClass::LoxRp1),
         area_ratio: 25.0,
-        p0_pa: 4.50e6,
-        r_throat_m: 0.121,
-        gamma: 1.221_451,
-        t0_k: 3478.998,
-        mw_g_mol: 21.774_82,
+        p0_pa: 4.500e6,
+        r_throat_m: 0.118_9,
+        gamma: 1.221_424,
+        t0_k: 3483.149,
+        mw_g_mol: 21.787_13,
+        cstar_shifting_m_s: 1805.410,
         cells_per_rt: CELLS_PER_RT,
-        contour_kind: ContourKind::Conical,
+        contour_kind: ContourKind::ParabolicBell,
+        cone_half_angle_deg: CONE_HALF_ANGLE_DEG,
         throat_arc_down: THROAT_ARC_DOWN,
-        bell_percent: 0.8,
-        bell_source: "p₀/ε published; r_t derived",
+        bell_percent: 0.75,
+        bell_source: "design-class estimate; no published wall angles; contour family unverified",
+        throat_source: "derived from thrust and Cf; validated against Redstone",
+        operating_source: "published",
         slow: false,
-        // The second-stage design altitude, 60 km, sits above the 58 km
-        // atmosphere/slider cap; `default_altitude_m` clamps it. Only the
-        // slider handle cares — `atmosphere` clamps at the same 58 km, so the
-        // ambient this produces is the one the model has anyway.
-        default_altitude_km: 60.0,
+        // Separates at sea level (p_e/p_a 0.157); the computed threshold is
+        // 7.2 km and 12 km carries margin over it.
+        default_altitude_km: 12.0,
         note: "Altitude-optimised second stage, separated at sea level \
-               (p_e/p_a ≈ 0.16 against the 0.40 threshold) — the preset opens \
-               at the top of the altitude slider. Its 60 km design altitude is \
-               above the model's 58 km cap and clamps there; past that end of \
-               the slider sits the labelled vacuum stop.",
+               (p_e/p_a ≈ 0.16 against the 0.40 threshold) — opens at 12 km, \
+               above the 7.2 km the criterion actually needs.\n\
+               Contour family is UNVERIFIED (Aerojet). The ablative skirt \
+               carries ε from 13:1 to 25:1.",
     },
     EnginePreset {
-        name: "WAC Corporal 38ALDW-1500",
-        propellant: PropellantClass::RfnaAnilineFurfuryl.label(),
-        propellant_class: Some(PropellantClass::RfnaAnilineFurfuryl),
-        area_ratio: 5.0,
-        p0_pa: 2.10e6,
-        r_throat_m: 0.035,
-        gamma: 1.211_682,
-        t0_k: 2986.707,
-        mw_g_mol: 25.615_83,
+        name: "Atlas LR89-5 booster (1 of 2)",
+        propellant: PropellantClass::LoxRp1.label(),
+        propellant_class: Some(PropellantClass::LoxRp1),
+        area_ratio: 8.00,
+        p0_pa: 3.999e6,
+        r_throat_m: 0.198_7,
+        gamma: 1.221_536,
+        t0_k: 3475.943,
+        mw_g_mol: 21.806_83,
+        cstar_shifting_m_s: 1803.934,
         cells_per_rt: CELLS_PER_RT,
-        contour_kind: ContourKind::Conical,
+        contour_kind: ContourKind::ParabolicBell,
+        cone_half_angle_deg: CONE_HALF_ANGLE_DEG,
         throat_arc_down: THROAT_ARC_DOWN,
-        bell_percent: 0.8,
-        bell_source: "RECONSTRUCTED — p₀ and ε unpublished",
+        bell_percent: 0.80,
+        bell_source: "design-class estimate; no published wall angles",
+        throat_source: "derived from thrust and Cf; validated against Redstone",
+        operating_source: "published",
         slow: false,
         default_altitude_km: 0.0,
-        note: "Chamber pressure and area ratio are reconstructed from thrust \
-               and burn time. No published figures found.\n\
-               The reconstruction does not close: 2.10 MPa on a 35 mm throat \
-               gives ~10.7 kN, against the 1,500 lbf (6.7 kN) the engine's own \
-               designation quotes. Either p₀ or r_t is too large by roughly a \
-               third. Recorded, not tuned — this is the least trustworthy \
-               preset in the library and the tooltip says so.",
+        note: "One of the two booster chambers, not the pair. This is the \
+               1959–60 Atlas D/E/F with the MA-3 engine set, NOT the 1990 \
+               commercial \"Atlas I\" with MA-5 — the area ratio is 8 either \
+               way, but the chamber pressure differs.",
+    },
+    EnginePreset {
+        name: "Atlas LR105-5 sustainer",
+        propellant: PropellantClass::LoxRp1.label(),
+        propellant_class: Some(PropellantClass::LoxRp1),
+        area_ratio: 25.0,
+        p0_pa: 4.799e6,
+        r_throat_m: 0.120_0,
+        gamma: 1.219_702,
+        t0_k: 3518.501,
+        mw_g_mol: 22.026_37,
+        cstar_shifting_m_s: 1806.722,
+        cells_per_rt: CELLS_PER_RT,
+        contour_kind: ContourKind::ParabolicBell,
+        cone_half_angle_deg: CONE_HALF_ANGLE_DEG,
+        throat_arc_down: THROAT_ARC_DOWN,
+        bell_percent: 0.80,
+        bell_source: "design-class estimate; no published wall angles",
+        throat_source: "derived from thrust and Cf; validated against Redstone",
+        operating_source: "published",
+        slow: false,
+        // Separates at sea level (p_e/p_a 0.168); computed threshold 6.7 km,
+        // shipped at 10 km for margin.
+        default_altitude_km: 10.0,
+        note: "Altitude-optimised sustainer, separated at sea level \
+               (p_e/p_a ≈ 0.17 against the 0.40 threshold) — opens at 10 km, \
+               above the 6.7 km the criterion actually needs. Drag the \
+               altitude slider down to see the separation warning it avoids.",
     },
 ];
 
@@ -869,13 +988,18 @@ impl EnginePreset {
         (self.default_altitude_km * 1000.0).clamp(0.0, ALT_MAX_M)
     }
 
-    /// This preset's own chamber thermochemistry, as one value.
+    /// This preset's own chamber thermochemistry, as one value. The frozen c*
+    /// is recomputed from (T₀, MW, γ) rather than stored, so it can never
+    /// disagree with the three numbers it is derived from; the
+    /// shifting-equilibrium c* is carried as data because only the equilibrium
+    /// solve in `tools/propellant_cea.py` can produce it.
     pub fn gas(&self) -> GasProperties {
         GasProperties {
             gamma: self.gamma,
             t0_k: self.t0_k,
             mw_g_mol: self.mw_g_mol,
-            cstar_ideal_m_s: cstar_ideal(self.t0_k, self.mw_g_mol, self.gamma),
+            cstar_shifting_m_s: self.cstar_shifting_m_s,
+            cstar_frozen_m_s: cstar_ideal(self.t0_k, self.mw_g_mol, self.gamma),
         }
     }
 
@@ -894,6 +1018,7 @@ impl EnginePreset {
             contour_kind: self.contour_kind,
             bell_percent: self.bell_percent,
             throat_arc_down: self.throat_arc_down,
+            cone_half_angle_deg: self.cone_half_angle_deg,
             altitude_m,
             vacuum,
             lz_rt,
@@ -1011,7 +1136,7 @@ pub struct GeneratedWall {
 pub fn nozzle_spec(p: &CaseParams) -> NozzleSpec {
     let contour = match p.contour_kind {
         ContourKind::Conical => cfd_geom::ContourKind::Conical {
-            half_angle_deg: CONE_HALF_ANGLE_DEG,
+            half_angle_deg: p.cone_half_angle_deg,
         },
         ContourKind::ParabolicBell => cfd_geom::ContourKind::ParabolicBell {
             bell_percent: p.bell_percent,
@@ -1056,7 +1181,7 @@ pub fn nozzle_contour(p: &CaseParams) -> GeneratedWall {
             }
         }
         Err(e) => GeneratedWall {
-            points: fallback_cone(p.area_ratio),
+            points: fallback_cone(p.area_ratio, p.cone_half_angle_deg),
             kind: ContourKind::Conical,
             fallback: Some(e.to_string()),
         },
@@ -1072,8 +1197,8 @@ pub fn nozzle_contour(p: &CaseParams) -> GeneratedWall {
 /// in `cfd_geom::generate_contour`; it survives as (a) the infallible
 /// fallback for a rejected `NozzleSpec`, and (b) the independent reference
 /// the cone-equivalence test compares the new path against.
-fn fallback_cone(area_ratio: f64) -> Vec<[f64; 2]> {
-    let alpha = 15f64.to_radians();
+fn fallback_cone(area_ratio: f64, half_angle_deg: f64) -> Vec<[f64; 2]> {
+    let alpha = half_angle_deg.to_radians();
     let beta = 30f64.to_radians();
     let (r1, r2, r_c) = (1.5, 0.382, 2.0);
     let r_e = area_ratio.max(1.1).sqrt();
@@ -1108,7 +1233,7 @@ fn fallback_cone(area_ratio: f64) -> Vec<[f64; 2]> {
 /// reference that does not go through `cfd_geom`.
 #[cfg(test)]
 pub fn conical_contour(area_ratio: f64) -> Vec<[f64; 2]> {
-    fallback_cone(area_ratio)
+    fallback_cone(area_ratio, CONE_HALF_ANGLE_DEG)
 }
 
 /// Wall radius at axial station z by linear interpolation, `None` outside the
@@ -1897,8 +2022,14 @@ mod contour_swap {
     /// opposite, so neither group is merely unchecked.
     #[test]
     fn presets_actually_get_bells() {
+        // Six modern presets plus the five historical bells — Thor, both
+        // Atlas engines and both Titan I engines. The bell/cone transition
+        // falls inside 1943–1961, so "historical" and "cone" are NOT the same
+        // set; an earlier revision of the table assumed they were and had five
+        // engines wrong.
         let bells: Vec<_> = PRESETS.iter().filter(|p| p.contour_kind.is_bell()).collect();
-        assert_eq!(bells.len(), 6, "the six modern presets are the bell presets");
+        assert_eq!(bells.len(), 11, "6 modern + 5 historical bells: {:?}",
+                   bells.iter().map(|p| p.name).collect::<Vec<_>>());
         for pre in bells {
             let c = pre.case(0.0, false);
             let wall = nozzle_contour(&c);
@@ -1939,39 +2070,53 @@ mod historical_presets {
 
     const SUITE: &str = "historical-presets";
 
-    /// The eight engines this work order added, in table order. Named rather
-    /// than sliced by index so the list survives a reordering of `PRESETS`,
-    /// and asserted complete below so it cannot silently drift out of sync.
-    const HISTORICAL: [&str; 8] = [
-        "V-2 (A-4) Model 39",
-        "Redstone NAA 75-110-A-7",
-        "Thor LR79-NA-7 (MB-1)",
-        "Atlas LR89-5 booster",
-        "Atlas LR105-5 sustainer",
-        "Titan I LR87-AJ-3 (1 of 2)",
-        "Titan I LR91-AJ-3",
-        "WAC Corporal 38ALDW-1500",
+    /// The eight engines this work order added, in table order, with the
+    /// contour each one is supposed to have. Named rather than sliced by index
+    /// so the list survives a reordering of `PRESETS`, and paired with the
+    /// contour so the cone/bell split is asserted rather than assumed — an
+    /// earlier revision of this table had all eight as cones and was wrong on
+    /// five of them.
+    const HISTORICAL: [(&str, bool); 8] = [
+        ("V-2 (A-4) Model 39", false),
+        ("WAC Corporal 38ALDW-1500", false),
+        ("Redstone NAA 75-110-A-7", false),
+        ("Thor LR79-NA-7 (MB-1)", true),
+        ("Titan I LR87-AJ-3 (1 of 2)", true),
+        ("Titan I LR91-AJ-3", true),
+        ("Atlas LR89-5 booster (1 of 2)", true),
+        ("Atlas LR105-5 sustainer", true),
     ];
 
     fn historical() -> Vec<&'static EnginePreset> {
         let v: Vec<_> = HISTORICAL
             .iter()
-            .map(|n| {
-                PRESETS
+            .map(|(n, is_bell)| {
+                let p = PRESETS
                     .iter()
                     .find(|p| p.name == *n)
-                    .unwrap_or_else(|| panic!("preset {n} is missing from PRESETS"))
+                    .unwrap_or_else(|| panic!("preset {n} is missing from PRESETS"));
+                assert_eq!(
+                    p.contour_kind.is_bell(),
+                    *is_bell,
+                    "{n}: contour family is not what the source research says"
+                );
+                p
             })
             .collect();
-        // Every conical preset is a historical one and vice versa: this is
-        // what stops a ninth cone being added without joining the list (and
-        // so escaping every test below).
+        // Every conical preset is a historical one: the six modern presets are
+        // all bells, so a cone appearing outside this list means something was
+        // added without joining it (and so escaping every test below).
         let cones: Vec<_> = PRESETS
             .iter()
             .filter(|p| !p.contour_kind.is_bell())
             .map(|p| p.name)
             .collect();
-        assert_eq!(cones, HISTORICAL, "the conical presets are the historical set");
+        let want: Vec<_> = HISTORICAL
+            .iter()
+            .filter(|(_, b)| !*b)
+            .map(|(n, _)| *n)
+            .collect();
+        assert_eq!(cones, want, "the conical presets are the historical cones");
         v
     }
 
@@ -1987,32 +2132,45 @@ mod historical_presets {
     }
 
     /// 1. Every historical preset generates a valid wall through
-    ///    `cfd_geom::generate_contour` with `ContourKind::Conical`: the spec is
-    ///    accepted (no silent fallback), the returned `WallProfile` passes its
-    ///    own `validate` — finite, r > 0, z STRICTLY increasing, which for a
+    ///    `cfd_geom::generate_contour`: the spec is accepted (no silent
+    ///    fallback to the cone), the returned `WallProfile` passes its own
+    ///    `validate` — finite, r > 0, z STRICTLY increasing, which for a
     ///    single-valued polyline is exactly non-self-intersection — and the
     ///    geometry is the one asked for: minimum radius r_t at the marked
-    ///    throat, exit radius r_t·√ε, 15° divergent wall.
+    ///    throat, exit radius r_t·√ε, and an exit wall angle that matches the
+    ///    contour family (the cone's own half-angle, or well under it for a
+    ///    bell).
     #[test]
-    fn historical_presets_generate_valid_cones() {
+    fn historical_presets_generate_valid_walls() {
         let mut worst_exit_err = 0.0f64;
-        let mut worst_angle_err = 0.0f64;
+        let mut worst_cone_angle_err = 0.0f64;
         for pre in historical() {
             let c = pre.case(pre.default_altitude_m(), false);
             let spec = nozzle_spec(&c);
-            assert_eq!(
-                spec.contour,
-                cfd_geom::ContourKind::Conical { half_angle_deg: CONE_HALF_ANGLE_DEG },
-                "{}: not a 15 deg cone spec",
-                pre.name
-            );
+            match pre.contour_kind {
+                ContourKind::Conical => assert_eq!(
+                    spec.contour,
+                    cfd_geom::ContourKind::Conical { half_angle_deg: pre.cone_half_angle_deg },
+                    "{}: cone spec does not carry the preset's own half-angle",
+                    pre.name
+                ),
+                ContourKind::ParabolicBell => assert_eq!(
+                    spec.contour,
+                    cfd_geom::ContourKind::ParabolicBell { bell_percent: pre.bell_percent },
+                    "{}: bell spec does not carry the preset's own bell percent",
+                    pre.name
+                ),
+                ContourKind::MeasuredBell { .. } => {
+                    panic!("{}: no historical preset uses measured angles", pre.name)
+                }
+            }
             let profile = cfd_geom::generate_contour(&spec, CONTOUR_SAMPLES)
                 .unwrap_or_else(|e| panic!("{}: generate_contour rejected the spec: {e}", pre.name));
             profile
                 .validate()
                 .unwrap_or_else(|e| panic!("{}: invalid profile: {e}", pre.name));
 
-            // validate() proves strict z monotonicity; state the two geometric
+            // validate() proves strict z monotonicity; state the geometric
             // consequences the app depends on explicitly so a future change to
             // validate() cannot quietly drop them.
             for w in profile.points.windows(2) {
@@ -2043,16 +2201,26 @@ mod historical_presets {
             let want_exit = pre.r_throat_m * pre.area_ratio.sqrt();
             worst_exit_err = worst_exit_err.max((r_exit / want_exit - 1.0).abs());
 
-            // The divergent wall is a 15 deg cone: measure the LAST segment,
-            // which is always inside the straight run (the downstream throat
-            // arc is over within 0.382 r_t of the throat).
             let n = profile.points.len();
             let (a, b) = (profile.points[n - 2], profile.points[n - 1]);
-            let angle = ((b[1] - a[1]) / (b[0] - a[0])).atan().to_degrees();
-            worst_angle_err = worst_angle_err.max((angle - CONE_HALF_ANGLE_DEG).abs());
+            let exit_deg = ((b[1] - a[1]) / (b[0] - a[0])).atan().to_degrees();
+            if pre.contour_kind.is_bell() {
+                // A bell's whole point is turning the flow back toward axial.
+                assert!(
+                    exit_deg > 0.0 && exit_deg < pre.cone_half_angle_deg,
+                    "{}: exit angle {exit_deg:.2}° is not a bell",
+                    pre.name
+                );
+            } else {
+                // The divergent wall IS the cone: measure the last segment,
+                // always inside the straight run (the downstream throat arc is
+                // over within 0.382 r_t of the throat).
+                worst_cone_angle_err =
+                    worst_cone_angle_err.max((exit_deg - pre.cone_half_angle_deg).abs());
+            }
         }
         record(
-            "cone-exit-radius",
+            "wall-exit-radius",
             "historical presets: generated exit radius vs r_t*sqrt(eps)",
             "<= 1e-9",
             worst_exit_err,
@@ -2061,14 +2229,17 @@ mod historical_presets {
         );
         record(
             "cone-half-angle",
-            "historical presets: divergent wall angle vs the 15 deg cone",
+            "historical cones: divergent wall angle vs the preset's own cone_half_angle_deg",
             "<= 0.01",
-            worst_angle_err,
+            worst_cone_angle_err,
             "max |deviation| (deg)",
-            worst_angle_err <= 0.01,
+            worst_cone_angle_err <= 0.01,
         );
         assert!(worst_exit_err <= 1e-9, "worst exit-radius error {worst_exit_err:.3e}");
-        assert!(worst_angle_err <= 0.01, "worst wall angle error {worst_angle_err:.4} deg");
+        assert!(
+            worst_cone_angle_err <= 0.01,
+            "worst cone angle error {worst_cone_angle_err:.4} deg"
+        );
     }
 
     /// 2. Every historical preset fits the domain `preset_domain` sizes for it,
@@ -2090,7 +2261,7 @@ mod historical_presets {
             let end = *wall.points.last().unwrap();
             let (fz, fr) = (end[0] / c.lz_rt, end[1] / c.lr_rt);
             println!(
-                "{:28} exit at z {:6.2} / {:6.1} r_t ({:4.1}%), r {:5.2} / {:5.1} r_t ({:4.1}%)",
+                "{:30} exit at z {:6.2} / {:6.1} r_t ({:4.1}%), r {:5.2} / {:5.1} r_t ({:4.1}%)",
                 pre.name, end[0], c.lz_rt, 100.0 * fz, end[1], c.lr_rt, 100.0 * fr
             );
             worst_z = worst_z.max(fz);
@@ -2116,7 +2287,7 @@ mod historical_presets {
         assert!(worst_r <= MAX_R_FRACTION, "worst radial fill {worst_r:.3}");
     }
 
-    /// 3. THE TEST THAT PROVES `default_altitude_km` DOES ITS JOB. Quasi-1D
+    /// 3. THE TEST THAT PROVES `default_altitude_km` EARNS ITS PLACE. Quasi-1D
     ///    p_e/p_a at each preset's own default altitude must clear the 0.40
     ///    Summerfield threshold — nobody opens a preset into a separation
     ///    warning they did not cause.
@@ -2124,7 +2295,9 @@ mod historical_presets {
     ///    And the other half, without which the field could be zero everywhere
     ///    and still pass: the two altitude-optimised presets must genuinely
     ///    separate at sea level. If they did not, the non-zero default would be
-    ///    decoration.
+    ///    decoration. The computed crossings are 6.7 km (LR105) and 7.2 km
+    ///    (LR91); the shipped 10 and 12 km carry margin over them, and that
+    ///    margin is asserted too.
     #[test]
     fn historical_presets_do_not_separate_at_their_default_altitude() {
         let mut worst = f64::INFINITY;
@@ -2136,7 +2309,7 @@ mod historical_presets {
             let at_default = ratio(c.altitude_m);
             let at_sea_level = ratio(0.0);
             println!(
-                "{:28} M_e {:5.3} | default {:4.0} km: p_e/p_a {:8.3} | sea level: {:6.3} \
+                "{:30} M_e {:5.3} | default {:4.0} km: p_e/p_a {:8.3} | sea level: {:6.3} \
                  (threshold {:.3})",
                 pre.name,
                 m_e,
@@ -2162,6 +2335,38 @@ mod historical_presets {
                      level (p_e/p_a {at_sea_level:.3}) — the default is decoration",
                     pre.name
                 );
+                // The default must sit ABOVE the crossing with room to spare,
+                // not just on the right side of it: bisect the crossing and
+                // require the shipped default to clear it.
+                let (mut lo, mut hi) = (0.0f64, ALT_MAX_M);
+                for _ in 0..60 {
+                    let mid = 0.5 * (lo + hi);
+                    if ratio(mid) < 0.40 {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                let crossing_km = 0.5 * (lo + hi) / 1000.0;
+                println!(
+                    "{:30} separation crossing at {crossing_km:.1} km, ships at {:.0} km",
+                    pre.name, pre.default_altitude_km
+                );
+                assert!(
+                    pre.default_altitude_km >= crossing_km + 2.0,
+                    "{}: default {:.0} km leaves under 2 km of margin over the {crossing_km:.1} km \
+                     crossing",
+                    pre.name,
+                    pre.default_altitude_km
+                );
+                record(
+                    &format!("separation-crossing-{}", pre.name),
+                    &format!("{}: altitude at which p_e/p_a reaches 0.40", pre.name),
+                    &format!("<= {:.0} km (the shipped default)", pre.default_altitude_km),
+                    crossing_km,
+                    "km",
+                    pre.default_altitude_km >= crossing_km,
+                );
             } else {
                 // A zero default has to be earned the same way.
                 assert!(
@@ -2184,33 +2389,32 @@ mod historical_presets {
             "Every historical preset clears the 0.40 Summerfield separation threshold at its \
              own default altitude; the tightest is {worst_name} at p_e/p_a {worst:.3}. The two \
              altitude-optimised presets are asserted in BOTH directions: Atlas LR105-5 \
-             (default 25 km) and Titan I LR91-AJ-3 (default 60 km, clamped to the model's \
-             58 km ceiling) must separate at sea level, or their non-zero default would be \
-             decoration rather than a fix. Every other preset must NOT separate at 0 km, or \
-             it would need a default of its own."));
+             (default 10 km) and Titan I LR91-AJ-3 (default 12 km) must separate at sea level, \
+             or their non-zero default would be decoration rather than a fix, and each default \
+             must clear its own computed crossing by at least 2 km. Every other preset must NOT \
+             separate at 0 km, or it would need a default of its own."));
         assert!(worst > 0.40);
     }
 
     /// 4. The Redstone throat area, recovered from the RASTERIZED wall rather
-    ///    than from the polyline: rasterize, then integrate the open (non-solid)
-    ///    area of each axial column from the exact solid fractions and take the
-    ///    minimum over columns. That exercises the whole geometry chain the
-    ///    solver sees — spec, contour, polygon clipper — against the one
-    ///    published dimension in the historical set.
+    ///    than from the polyline: rasterize, then integrate the open
+    ///    (non-solid) area of each axial column from the exact solid fractions
+    ///    and take the minimum over columns. That exercises the whole geometry
+    ///    chain the solver sees — spec, contour, polygon clipper — against the
+    ///    one published dimension in the historical set.
     ///
     /// Measured on a REFINED grid, and the reason is a second-order effect
     /// worth stating rather than hiding: a column integrates the wall over its
     /// own width, and near a throat r(z) is quadratic, so the cell-averaged
-    /// area is biased HIGH by ~(dz²/12)/R_arc — about 0.45% at the production
-    /// 20 cells/r_t with the §10 family's 0.382 r_t downstream arc, which
-    /// would sit right on the 0.5% tolerance for a discretization reason that
-    /// has nothing to do with whether the geometry is right. The production
-    /// grid is measured too and recorded, so the bias is visible instead of
-    /// designed around.
+    /// area is biased HIGH by ~(dz²/12)/R_arc — a few tenths of a percent at
+    /// the production 20 cells/r_t with the §10 family's 0.382 r_t downstream
+    /// arc, for a discretization reason that has nothing to do with whether the
+    /// geometry is right. The production grid is measured and asserted too, so
+    /// the bias is visible instead of designed around.
     #[test]
     fn redstone_rasterized_throat_area_matches_published() {
-        /// Published: 15.5 in throat diameter.
-        const A_T_PUBLISHED_M2: f64 = 0.121_766;
+        /// Published: 15.5 in throat diameter -> pi * (0.19685 m)^2.
+        const A_T_PUBLISHED_M2: f64 = 0.121_736;
         const TOL: f64 = 0.005;
 
         let pre = PRESETS
@@ -2276,9 +2480,8 @@ mod historical_presets {
              m^2), {a_production:.6} m^2 on the production grid ({:+.3}%). The production \
              figure is biased HIGH by column averaging: a column integrates the wall over its \
              own width and r(z) is quadratic at a throat, so the cell-mean area exceeds the \
-             minimum by ~(dz^2/12)/R_arc — with dz = 0.145 r_t and the 0.382 r_t downstream \
-             arc that is ~0.45%. It falls as dz^2, which the refined figure confirms. The \
-             preset's own r_t gives a geometric area of {a_geometric:.6} m^2 ({:+.3}%).",
+             minimum by ~(dz^2/12)/R_arc. It falls as dz^2, which the refined figure confirms. \
+             The preset's own r_t gives a geometric area of {a_geometric:.6} m^2 ({:+.3}%).",
             100.0 * err, 100.0 * err_production,
             100.0 * (a_geometric / A_T_PUBLISHED_M2 - 1.0)));
         assert!(
@@ -2287,11 +2490,6 @@ mod historical_presets {
              {A_T_PUBLISHED_M2:.6} m^2",
             100.0 * err
         );
-        // The production grid clears the same tolerance on its own — the
-        // refinement above is there to separate the geometry from the
-        // discretization, not because the shipped grid needs the help. Assert
-        // it, so if the column-averaging bias ever grows past 0.5% that is a
-        // failure rather than a footnote.
         assert!(
             err_production.abs() <= TOL,
             "Redstone throat area on the PRODUCTION grid ({} cells/r_t) is {:+.3}% off the \
@@ -2301,7 +2499,100 @@ mod historical_presets {
         );
     }
 
-    /// 5. REGRESSION: the six presets that existed before this work order are
+    /// 5. The Rao table is digitised over ε = 4–100 and `rao_angles` CLAMPS at
+    ///    both ends rather than extrapolating. The area-ratio slider bottoms
+    ///    out at ε = 2, so a user can drag any of the five historical bells
+    ///    into the clamped region below the table — and that has to be
+    ///    disclosed exactly as the ε > 100 case is, not silently.
+    ///
+    ///    This asserts the SYMMETRY of the clamp and of the condition the UI
+    ///    flags it on. It is a characterisation test: the app's condition is
+    ///    `!(4.0..=100.0).contains(&ε)`, which already covers both ends, and
+    ///    this pins that it keeps doing so — the failure mode being guarded is
+    ///    a future edit that special-cases only the high end, which is the
+    ///    natural way to write it if you are only thinking about Merlin Vac.
+    #[test]
+    fn rao_table_clamps_and_flags_symmetrically_at_both_ends() {
+        /// The digitised range, as the UI's disclosure condition uses it.
+        const TABLE: std::ops::RangeInclusive<f64> = 4.0..=100.0;
+        let flagged = |eps: f64| !TABLE.contains(&eps);
+
+        for bp in [0.75, 0.80] {
+            // Below the table: every ε clamps to the ε = 4 row, and is flagged.
+            let at_low_end = cfd_geom::rao_angles(4.0, bp);
+            for eps in [2.0, 2.5, 3.0, 3.9, 3.999] {
+                assert_eq!(
+                    cfd_geom::rao_angles(eps, bp),
+                    at_low_end,
+                    "eps {eps} does not clamp to the eps = 4 row"
+                );
+                assert!(flagged(eps), "eps {eps} is clamped but not flagged");
+            }
+            // Above it: the mirror image, which is the case that already had
+            // the disclosure.
+            let at_high_end = cfd_geom::rao_angles(100.0, bp);
+            for eps in [100.001, 120.0, 165.0, 400.0] {
+                assert_eq!(
+                    cfd_geom::rao_angles(eps, bp),
+                    at_high_end,
+                    "eps {eps} does not clamp to the eps = 100 row"
+                );
+                assert!(flagged(eps), "eps {eps} is clamped but not flagged");
+            }
+            // Inside the table nothing is clamped and nothing is flagged.
+            for eps in [4.0, 8.0, 25.0, 100.0] {
+                assert!(!flagged(eps), "eps {eps} is inside the table but flagged");
+            }
+            // The endpoints are genuinely distinct, so "clamps to the end row"
+            // is a real constraint rather than a tautology about a flat table.
+            assert!(
+                (at_low_end.0 - at_high_end.0).abs() > 1.0,
+                "the table's two ends have the same theta_n; the clamp assertions above \
+                 would pass on any input"
+            );
+        }
+
+        // Every shipped bell can actually be dragged into the low-clamped
+        // region: the slider's floor is below 4, so this is reachable, not
+        // hypothetical. (Merlin Vac is the engine that made the HIGH end
+        // reachable; the historical bells are what make the low end matter.)
+        let draggable: Vec<&str> = PRESETS
+            .iter()
+            .filter(|p| p.contour_kind == ContourKind::ParabolicBell)
+            .map(|p| p.name)
+            .collect();
+        assert!(
+            !draggable.is_empty() && AREA_RATIO_SLIDER_MIN < *TABLE.start(),
+            "no bell preset can reach the low clamp; this test is guarding nothing"
+        );
+        // …and the wall still generates there rather than falling back, which
+        // is what makes a silent clamp possible in the first place.
+        for name in &draggable {
+            let pre = PRESETS.iter().find(|p| p.name == *name).unwrap();
+            let mut c = pre.case(0.0, false);
+            c.area_ratio = 3.0;
+            let w = nozzle_contour(&c);
+            assert_eq!(
+                w.fallback, None,
+                "{name} at eps 3 falls back to the cone — the clamp disclosure would never \
+                 be reached, and the status line would say cone instead"
+            );
+            assert_eq!(w.kind, ContourKind::ParabolicBell);
+        }
+        cfd_results::record_note(SUITE, "rao-low-end-clamp", &format!(
+            "The Rao table covers eps = 4-100 and rao_angles clamps at BOTH ends; the area-ratio \
+             slider bottoms out at {AREA_RATIO_SLIDER_MIN}, so all {} bell presets can be dragged \
+             below the table. The UI's disclosure condition is !(4.0..=100.0).contains(eps), \
+             which already fires at both ends — verified here rather than assumed, because the \
+             natural way to write that check while thinking only about Merlin Vac (eps 165) is \
+             to test the high end alone. Below eps 4 the angles are the eps = 4 row \
+             (theta_n {:.2}, theta_e {:.2} at 80%) stretched to the requested exit radius.",
+            draggable.len(),
+            cfd_geom::rao_angles(4.0, 0.8).0,
+            cfd_geom::rao_angles(4.0, 0.8).1));
+    }
+
+    /// 6. REGRESSION: the six presets that existed before this work order are
     ///    untouched, field by field. The expected values are a deliberate
     ///    second copy of the table — that is what a pin is for. Changing a
     ///    preset now takes two edits and a moment's thought, which is the
@@ -2348,12 +2639,23 @@ mod historical_presets {
             assert_eq!(p.throat_arc_down, e.10, "{}: throat_arc_down", p.name);
             assert_eq!(p.slow, e.11, "{}: slow", p.name);
             assert_eq!(p.contour_kind, KINDS[i], "{}: contour_kind", p.name);
-            // The two fields this work order added must be inert for these
-            // six: they open at sea level exactly as before, and their gas
-            // properties are per-engine researched values, NOT the CEA table
-            // (see the `propellant_class` doc comment).
+            // The fields this work order added must be INERT for these six:
+            // they open at sea level as before, their gas properties are
+            // per-engine researched values rather than the CEA table (in
+            // particular LoxRp1's computed gamma 1.221 does NOT reach the F-1
+            // or either Merlin), their provenance strings are empty so their
+            // tooltips are byte-identical, and their cone half-angle is the
+            // default — which is unreachable anyway, since all six are bells.
             assert_eq!(p.default_altitude_km, 0.0, "{}: default_altitude_km", p.name);
             assert_eq!(p.propellant_class, None, "{}: propellant_class", p.name);
+            assert_eq!(p.throat_source, "", "{}: throat_source", p.name);
+            assert_eq!(p.operating_source, "", "{}: operating_source", p.name);
+            assert_eq!(p.cstar_shifting_m_s, 0.0, "{}: cstar_shifting_m_s", p.name);
+            assert_eq!(
+                p.cone_half_angle_deg, CONE_HALF_ANGLE_DEG,
+                "{}: cone_half_angle_deg", p.name
+            );
+            assert!(p.contour_kind.is_bell(), "{}: still a bell", p.name);
 
             // And the derived case, which is what the solver actually gets.
             let c = p.case(0.0, false);
@@ -2361,6 +2663,7 @@ mod historical_presets {
             assert_eq!(c.gamma, e.5);
             assert_eq!(c.t0_k, e.6);
             assert_eq!(c.r_specific_si, R_UNIVERSAL_SI / e.7);
+            assert_eq!(c.cone_half_angle_deg, CONE_HALF_ANGLE_DEG);
             assert_eq!((c.lz_rt, c.lr_rt), preset_domain(e.2), "{}: domain", p.name);
         }
         record(
@@ -2379,7 +2682,7 @@ mod historical_presets {
     ///
     /// This is why the presets do not simply use `PropellantClass::reference()`.
     /// A class reference is a mean, and for LOX/ethanol the two cases sit at
-    /// O/F 1.130 and 1.324 — 6.4% apart in T₀. Using the mean would put both
+    /// O/F 1.130 and 1.324 — 6.6% apart in T₀. Using the mean would put both
     /// engines 3% wrong rather than either one right.
     #[test]
     fn preset_gas_matches_its_propellant_class() {
@@ -2395,6 +2698,12 @@ mod historical_presets {
                 ("gamma", pre.gamma, lo.gamma, hi.gamma),
                 ("t0_k", pre.t0_k, lo.t0_k, hi.t0_k),
                 ("mw_g_mol", pre.mw_g_mol, lo.mw_g_mol, hi.mw_g_mol),
+                (
+                    "cstar_shifting",
+                    pre.cstar_shifting_m_s,
+                    lo.cstar_shifting_m_s,
+                    hi.cstar_shifting_m_s,
+                ),
             ] {
                 assert!(
                     v >= a - EPS && v <= b + EPS,
@@ -2416,21 +2725,11 @@ mod historical_presets {
                     class
                 );
             }
-            // `cstar_ideal` here must be the same expression
-            // tools/propellant_cea.py evaluates, so the Rust and Python sides
-            // cannot drift: the tool's per-case c* is inside the class span.
-            let cs = pre.gas().cstar_ideal_m_s;
-            assert!(
-                cs >= lo.cstar_ideal_m_s - 1.0 && cs <= hi.cstar_ideal_m_s + 1.0,
-                "{}: ideal c* {cs:.1} m/s outside the class span [{:.1}, {:.1}] recorded by \
-                 tools/propellant_cea.py — the Rust and Python c* expressions have drifted",
-                pre.name,
-                lo.cstar_ideal_m_s,
-                hi.cstar_ideal_m_s
-            );
             println!(
-                "{:28} {:22} gamma {:.4} T0 {:6.0} K MW {:5.2} -> ideal c* {cs:6.1} m/s",
-                pre.name, class.label(), pre.gamma, pre.t0_k, pre.mw_g_mol
+                "{:30} {:22} gamma {:.4} T0 {:6.0} K MW {:5.2} -> c* {:6.1} shifting / \
+                 {:6.1} frozen m/s",
+                pre.name, class.label(), pre.gamma, pre.t0_k, pre.mw_g_mol,
+                pre.gas().cstar_shifting_m_s, pre.gas().cstar_frozen_m_s
             );
         }
         for class in PropellantClass::ALL {
@@ -2439,6 +2738,155 @@ mod historical_presets {
                 "{class:?} is defined but no preset uses it"
             );
         }
+    }
+
+    /// The Rust `cstar_ideal` closed form must reproduce the `cstar_frozen`
+    /// column `tools/propellant_cea.py` prints, from the same (T₀, MW, γ).
+    ///
+    /// Two implementations of one formula, in two languages, pinned to each
+    /// other. Without this the table could be transcribed from a tool whose
+    /// definition of c* had quietly diverged from the solver's — which is
+    /// exactly the failure the shifting-vs-frozen distinction invites, since
+    /// the two differ by only ~1.3% and both look plausible.
+    #[test]
+    fn rust_and_python_frozen_cstar_agree() {
+        // (name, T0, MW, gamma, python cstar_frozen) from
+        // docs/results/propellant-cea.md, full-precision column.
+        const CASES: [(&str, f64, f64, f64, f64); 8] = [
+            ("V-2", 2889.6492, 22.03174, 1.194595, 1612.833),
+            ("Redstone", 3081.5671, 23.35647, 1.187463, 1621.099),
+            ("Thor", 3495.0930, 21.94603, 1.220567, 1763.565),
+            ("Atlas LR89", 3475.9430, 21.80683, 1.221536, 1763.830),
+            ("Atlas LR105", 3518.5008, 22.02637, 1.219702, 1766.679),
+            ("Titan LR87", 3470.2180, 21.76167, 1.221839, 1764.048),
+            ("Titan LR91", 3483.1491, 21.78713, 1.221424, 1766.514),
+            ("WAC Corporal", 2988.2979, 25.62019, 1.211618, 1513.231),
+        ];
+        let mut worst = 0.0f64;
+        for (name, t0, mw, g, py) in CASES {
+            let rs = cstar_ideal(t0, mw, g);
+            let rel = (rs / py - 1.0).abs();
+            worst = worst.max(rel);
+            assert!(
+                rel < 1e-5,
+                "{name}: Rust cstar_ideal {rs:.4} vs Python cstar_frozen {py:.4} \
+                 ({:+.4}%)",
+                100.0 * (rs / py - 1.0)
+            );
+        }
+        record(
+            "frozen-cstar-rust-vs-python",
+            "cstar_ideal (Rust) vs cstar_frozen (tools/propellant_cea.py) over all eight cases",
+            "< 1e-5",
+            worst,
+            "max relative difference",
+            worst < 1e-5,
+        );
+    }
+
+    /// The constraint the work order set: a derived throat radius that puts
+    /// mass flow more than 10% off the published figure gets REPORTED, not
+    /// adjusted to match. This is the report, as an executable one — the
+    /// numbers are recomputed from the presets every run, so a later edit to
+    /// an r_t cannot quietly change the story the write-up tells.
+    ///
+    /// The published MASS FLOWS are deliberately not asserted against, and
+    /// that is the finding rather than a hedge: the AEHS mass-flow column is
+    /// known-unreliable. Deriving throat area from ṁ and c* back-solves the
+    /// Redstone to a c* efficiency of 100.2%, and the same table's LR89-5 row
+    /// (163,211 lbf against 458 lb/s) implies an Isp of 356 s against its own
+    /// Isp column of 248–282. What IS asserted is the route that does work:
+    /// thrust and thrust coefficient, which reproduces the one published
+    /// throat to −0.03%.
+    #[test]
+    fn derived_throat_radii_reproduce_the_published_thrust() {
+        /// Divergence factor λ = (1+cos α)/2 for the 15° cones; a 75–80% bell
+        /// recovers most of that loss. Both from `tools/propellant_cea.py`.
+        const LAMBDA_BELL: f64 = 0.988;
+        /// Residual C_f efficiency after divergence, calibrated on the single
+        /// published throat in the set.
+        const ETA_CF: f64 = 0.9877;
+
+        // engine, published thrust N, ambient at the rating (None = vacuum)
+        const PUBLISHED: [(&str, f64, Option<f64>); 8] = [
+            ("V-2 (A-4) Model 39", 244_653.0, Some(101_325.0)),
+            ("Redstone NAA 75-110-A-7", 369_096.0, Some(101_325.0)),
+            ("Thor LR79-NA-7 (MB-1)", 667_200.0, Some(101_325.0)),
+            ("Atlas LR89-5 booster (1 of 2)", 726_000.0, Some(101_325.0)),
+            ("Atlas LR105-5 sustainer", 386_400.0, None),
+            ("Titan I LR87-AJ-3 (1 of 2)", 647_900.0, Some(101_325.0)),
+            ("Titan I LR91-AJ-3", 355_900.0, None),
+            ("WAC Corporal 38ALDW-1500", 6_672.0, Some(101_325.0)),
+        ];
+
+        let mut worst = 0.0f64;
+        let mut worst_name = "";
+        println!(
+            "{:30}{:>10}{:>10}{:>9}{:>12}{:>10}",
+            "engine", "r_t mm", "derived", "d%", "F published", "mdot"
+        );
+        for (name, f_pub, rating_pa) in PUBLISHED {
+            let pre = PRESETS.iter().find(|p| p.name == name).unwrap();
+            let c = pre.case(0.0, false);
+            let lambda = if pre.contour_kind.is_bell() {
+                LAMBDA_BELL
+            } else {
+                0.5 * (1.0 + pre.cone_half_angle_deg.to_radians().cos())
+            };
+            let pa_over_p0 = rating_pa.unwrap_or(0.0) / c.p0_pa;
+            let cf_ideal_v = ideal_cf(c.area_ratio, c.gamma, pa_over_p0);
+            // The derivation the table was built with, run backwards from the
+            // preset's own gas properties: A_t = F / (Cf * lambda * eta * p0).
+            let a_t = f_pub / (cf_ideal_v * lambda * ETA_CF * c.p0_pa);
+            let r_derived = (a_t / std::f64::consts::PI).sqrt();
+            let d = r_derived / pre.r_throat_m - 1.0;
+            // Mass flow that the SHIPPED throat implies, at the handbook 95%
+            // c* efficiency the tool uses. Recorded, never asserted.
+            let mdot = c.p0_pa * std::f64::consts::PI * pre.r_throat_m * pre.r_throat_m
+                / (0.95 * pre.cstar_shifting_m_s);
+            println!(
+                "{name:30}{:>10.1}{:>10.1}{:>9.2}{:>12.1}{:>10.2}",
+                pre.r_throat_m * 1e3,
+                r_derived * 1e3,
+                100.0 * d,
+                f_pub / 1e3,
+                mdot
+            );
+            if d.abs() > worst {
+                worst = d.abs();
+                worst_name = name;
+            }
+            cfd_results::record_note(SUITE, &format!("throat-derivation-{name}"), &format!(
+                "{name}: shipped r_t {:.2} mm; re-deriving it here from the published thrust \
+                 {:.1} kN at {} with this preset's own gamma gives {:.2} mm ({:+.2}%). \
+                 lambda {:.4}, eta_Cf {ETA_CF}, Cf_ideal {cf_ideal_v:.4}. Implied mass flow at \
+                 95% c* efficiency is {mdot:.2} kg/s -- RECORDED, NOT ASSERTED: the AEHS \
+                 mass-flow column is the unreliable one (its LR89-5 row implies Isp 356 s \
+                 against its own 248-282 column), which is precisely why the throat radii come \
+                 from thrust rather than from mass flow.",
+                pre.r_throat_m * 1e3, f_pub / 1e3,
+                if rating_pa.is_some() { "sea level" } else { "vacuum" },
+                r_derived * 1e3, 100.0 * d, lambda));
+        }
+        // Round-tripping the derivation must reproduce the shipped table. This
+        // is tight on purpose: it is the same arithmetic, so anything beyond
+        // rounding of the committed literals means the table and the tool have
+        // parted company.
+        record(
+            "throat-derivation-round-trip",
+            "shipped r_t vs re-deriving it from published thrust and the preset's own gas",
+            "<= 0.5%",
+            100.0 * worst,
+            &format!("worst |deviation| % ({worst_name})"),
+            worst <= 0.005,
+        );
+        assert!(
+            worst <= 0.005,
+            "{worst_name}: shipped throat radius is {:.2}% away from what the published thrust \
+             and this preset's gamma derive. Do NOT adjust r_t to close this — the table and \
+             tools/propellant_cea.py have diverged; re-run the tool.",
+            100.0 * worst
+        );
     }
 
     /// Run time for each historical preset, for
@@ -2452,8 +2900,7 @@ mod historical_presets {
     /// visual-steady step count and the wall clock taken. (The residual-based
     /// `converged` flag is not usable as a finish line here for the same
     /// reason it is not for the demo case — an overexpanded sea-level plume
-    /// keeps breathing above the 1e-3 threshold indefinitely — so §9 visual
-    /// steady is the criterion, as everywhere else in this repo.)
+    /// keeps breathing above the 1e-3 threshold indefinitely.)
     ///
     /// Positivity-floor contact is tracked per preset and asserted to be
     /// startup-confined. That is not incidental bookkeeping: cumulative floor
@@ -2492,8 +2939,8 @@ mod historical_presets {
             // activation with "last at step 0" and prove nothing.
             let (mut floors, mut last_floor) = (0u64, 0u64);
             let track = |info: &cfd_contract::StepInfo,
-                             floors: &mut u64,
-                             last: &mut u64| {
+                         floors: &mut u64,
+                         last: &mut u64| {
                 if info.floor_activations > *floors {
                     *floors = info.floor_activations;
                     *last = info.step;
@@ -2521,7 +2968,7 @@ mod historical_presets {
             let secs = 300.0 / sps + t1.elapsed().as_secs_f64();
             let rep = s.report();
             println!(
-                "{:28} {:>4} x {:<4} = {:>6} cells | {:6.1} steps/s | {:6.0} steps to visual \
+                "{:30} {:>4} x {:<4} = {:>6} cells | {:6.1} steps/s | {:6.0} steps to visual \
                  steady in {:6.1} s | {:.2}x Merlin 1D | floors {} (last at step {}) | \
                  mdot {:.1} kg/s, C_f {:.3}, exit M {:.2}",
                 pre.name, g.nz, g.nr, g.len(), sps, target, secs, pre.relative_cost(),
@@ -2536,26 +2983,27 @@ mod historical_presets {
                  not startup-confined, so the report would be permanently quarantined",
                 pre.name
             );
-            if floors > 0 {
-                cfd_results::record_note(SUITE, &format!("floors-{}", pre.name), &format!(
-                    "{}: {floors} positivity-floor activations, all during the cold-start \
-                     front (last at step {last_floor} of {target:.0} to visual steady, zero \
-                     after) — the SS13 quarantine class, same as the existing presets. The \
-                     two altitude-optimised presets start into a very thin ambient (25 km \
-                     and 58 km), which is where the startup blast expands hardest before \
-                     relief.",
-                    pre.name));
-            }
             cfd_results::record_benchmark(SUITE, cfd_results::Benchmark {
                 case: format!(
-                    "{} (eps {}, p0 {:.2} MPa, {:.0} km)",
+                    "{} (eps {}, p0 {:.3} MPa, {:.0} km)",
                     pre.name, pre.area_ratio, pre.p0_pa / 1e6, pre.default_altitude_km
                 ),
-                setting: "15 deg cone, preset domain, 20 cells/r_t".into(),
+                setting: if pre.contour_kind.is_bell() {
+                    format!("{:.0}% Rao bell, preset domain, 20 cells/r_t", pre.bell_percent * 100.0)
+                } else {
+                    format!("{:.0}° cone, preset domain, 20 cells/r_t", pre.cone_half_angle_deg)
+                },
                 cells: g.len() as u64,
                 steps_per_sec: sps,
                 seconds_to_steady: secs,
             });
+            if floors > 0 {
+                cfd_results::record_note(SUITE, &format!("floors-{}", pre.name), &format!(
+                    "{}: {floors} positivity-floor activations, all during the cold-start \
+                     front (last at step {last_floor} of {target:.0} to visual steady, zero \
+                     after) — the SS13 quarantine class, same as the existing presets.",
+                    pre.name));
+            }
             // The solved mass flow against the quasi-1D ideal for the same
             // throat and gas. Recorded, not asserted: this is the solver's
             // known discretization deficit at 20 cells/r_t (docs §8's
@@ -2563,26 +3011,25 @@ mod historical_presets {
             // badge exists to flag), and it is the same sign and size across
             // every historical preset — an engine-independent property of the
             // grid, not a verdict on any preset's throat radius.
-            let mdot_ideal =
-                p.p0_pa * std::f64::consts::PI * p.r_throat_m * p.r_throat_m
-                    / pre.gas().cstar_ideal_m_s;
+            let mdot_ideal = p.p0_pa * std::f64::consts::PI * p.r_throat_m * p.r_throat_m
+                / pre.gas().cstar_frozen_m_s;
             cfd_results::record_note(SUITE, &format!("mdot-{}", pre.name), &format!(
                 "{}: solved mass flow {:.1} kg/s at visual steady against a quasi-1D ideal of \
-                 {mdot_ideal:.1} kg/s for the same throat area and gas ({:+.1}%), C_f {:.3}, \
-                 area-averaged exit Mach {:.2}, confidence {:?}.",
+                 {mdot_ideal:.1} kg/s for the same throat area and frozen c* ({:+.1}%), C_f \
+                 {:.3}, area-averaged exit Mach {:.2}, confidence {:?}.",
                 pre.name, rep.mass_flow_kg_s,
                 100.0 * (rep.mass_flow_kg_s / mdot_ideal - 1.0),
                 rep.thrust_coefficient, rep.exit_mach, rep.confidence));
             projected.push((pre.name, secs, pre.relative_cost()));
         }
         cfd_results::record_note(SUITE, "run-time-method",
-            "seconds_to_steady for the historical presets is PROJECTED, not run to \
-             completion: steps_per_sec is measured over 250 steps after a 50-step warm-up on \
-             this machine, and multiplied by the SS9 visual-steady step count (6,100 steps at \
-             the 46.4 r_t compact demo domain, scaled by domain length and by 1/dt). The \
-             residual-based settled flag is not usable as a finish line for these cases for \
-             the same reason it is not for the demo case -- an overexpanded sea-level plume \
-             keeps breathing above the 1e-3 threshold indefinitely.");
+            "seconds_to_steady for the historical presets is MEASURED: steps_per_sec over 250 \
+             steps after a 50-step warm-up on this machine, then the case run to the SS9 \
+             visual-steady step count (6,100 steps at the 46.4 r_t compact demo domain, scaled \
+             by domain length and by 1/dt) with the wall clock taken. The residual-based \
+             settled flag is not usable as a finish line for these cases for the same reason it \
+             is not for the demo case -- an overexpanded sea-level plume keeps breathing above \
+             the 1e-3 threshold indefinitely.");
 
         // These must be the cheap end of the library. Not a tautology: the
         // cost model reads the graded cell count off each preset's own
@@ -2593,114 +3040,6 @@ mod historical_presets {
             worst < 2.0,
             "a historical preset costs {worst:.2}x Merlin 1D — these are supposed to be the \
              cheapest cases in the library"
-        );
-    }
-
-    /// The constraint the work order set: a derived throat radius that puts
-    /// mass flow more than 10% off the published figure gets REPORTED, not
-    /// adjusted to match. This is the report, as an executable one — the
-    /// numbers are recomputed from the presets every run, so a later edit to
-    /// an r_t cannot quietly change the story the write-up tells.
-    ///
-    /// Nothing here asserts agreement with the published figures, and that is
-    /// deliberate: except for the Redstone throat diameter (tested above),
-    /// these are commonly-cited performance numbers of 1950s hardware, not
-    /// measurements this repo can stand behind. What IS asserted is that the
-    /// set of engines that disagree by more than 10% is exactly the set the
-    /// write-up documents — so a new disagreement fails the build.
-    #[test]
-    fn derived_throat_radii_vs_published_performance() {
-        /// Typical efficiencies used to turn ideal quasi-1D figures into
-        /// delivered ones. Both are mid-range handbook values, not fits.
-        const ETA_CSTAR: f64 = 0.94;
-        const ETA_CF: f64 = 0.95;
-
-        // engine, rating altitude (None = vacuum rating), published thrust N,
-        // published mass flow kg/s (None = not available)
-        const PUBLISHED: [(&str, Option<f64>, f64, Option<f64>); 8] = [
-            ("V-2 (A-4) Model 39", Some(0.0), 249.0e3, Some(125.0)),
-            ("Redstone NAA 75-110-A-7", Some(0.0), 347.0e3, Some(161.03)),
-            ("Thor LR79-NA-7 (MB-1)", Some(0.0), 756.0e3, None),
-            ("Atlas LR89-5 booster", Some(0.0), 734.0e3, None),
-            ("Atlas LR105-5 sustainer", None, 254.0e3, None),
-            ("Titan I LR87-AJ-3 (1 of 2)", Some(0.0), 667.0e3, None),
-            ("Titan I LR91-AJ-3", None, 356.0e3, None),
-            ("WAC Corporal 38ALDW-1500", Some(0.0), 6.672e3, None),
-        ];
-        /// The engines whose derived geometry does NOT reproduce the published
-        /// figures within 10%, and which docs/results/historical-presets-v1.md
-        /// documents as such. All three are recorded in their preset notes too.
-        /// In PUBLISHED order: the V-2 misses on mass flow (+10.5%, barely
-        /// over), the Atlas LR89 and the WAC Corporal on thrust (-29.5% and
-        /// +61%).
-        const KNOWN_OUTLIERS: [&str; 3] = [
-            "V-2 (A-4) Model 39",
-            "Atlas LR89-5 booster",
-            "WAC Corporal 38ALDW-1500",
-        ];
-
-        let mut outliers = Vec::new();
-        println!(
-            "{:28}{:>10}{:>10}{:>9}{:>11}{:>10}{:>8}",
-            "engine", "mdot", "pub mdot", "d%", "F delivered", "pub F", "d%"
-        );
-        for (name, rating_alt, f_pub, mdot_pub) in PUBLISHED {
-            let pre = PRESETS.iter().find(|p| p.name == name).unwrap();
-            let c = pre.case(0.0, false);
-            let a_t = std::f64::consts::PI * pre.r_throat_m * pre.r_throat_m;
-            let cstar = pre.gas().cstar_ideal_m_s;
-            let mdot = c.p0_pa * a_t / (cstar * ETA_CSTAR);
-            // A vacuum rating is p_a = 0; a sea-level rating is the standard
-            // atmosphere. `ideal_cf` takes p_a/p0.
-            let pa_over_p0 = match rating_alt {
-                Some(h) => atmosphere(h).0 / c.p0_pa,
-                None => 0.0,
-            };
-            let thrust = ETA_CF * ideal_cf(c.area_ratio, c.gamma, pa_over_p0) * c.p0_pa * a_t;
-            let d_f = thrust / f_pub - 1.0;
-            let d_m = mdot_pub.map(|m| mdot / m - 1.0);
-            println!(
-                "{name:28}{mdot:>10.2}{:>10}{:>9}{:>11.1}{:>10.1}{:>8.1}",
-                mdot_pub.map_or("-".into(), |m| format!("{m:.2}")),
-                d_m.map_or("-".into(), |d| format!("{:.1}", 100.0 * d)),
-                thrust / 1e3,
-                f_pub / 1e3,
-                100.0 * d_f
-            );
-            let worst = d_f.abs().max(d_m.map_or(0.0, f64::abs));
-            if worst > 0.10 {
-                outliers.push(name);
-            }
-            cfd_results::record_note(SUITE, &format!("derived-vs-published-{name}"), &format!(
-                "{name}: r_t {:.4} m (A_t {a_t:.5} m^2) at p0 {:.2} MPa with ideal c* \
-                 {cstar:.0} m/s gives delivered mass flow {mdot:.1} kg/s (eta_c* {ETA_CSTAR}) \
-                 and {} thrust {:.1} kN (eta_Cf {ETA_CF}), against published {} kg/s and \
-                 {:.1} kN — {}{:+.1}% on thrust. Published performance figures other than the \
-                 Redstone throat diameter are commonly-cited values, not measurements this \
-                 repo verifies; they are a sanity check on the derived geometry, not a \
-                 reference.",
-                pre.r_throat_m, c.p0_pa / 1e6,
-                if rating_alt.is_some() { "sea-level" } else { "vacuum" },
-                thrust / 1e3,
-                mdot_pub.map_or("(n/a)".into(), |m| format!("{m:.1}")),
-                f_pub / 1e3,
-                d_m.map_or(String::new(), |d| format!("{:+.1}% on mass flow, ", 100.0 * d)),
-                100.0 * d_f));
-        }
-        record(
-            "derived-vs-published-outliers",
-            "historical presets whose derived geometry misses the published thrust or mass \
-             flow by more than 10% (documented, not tuned away)",
-            &format!("{:?}", KNOWN_OUTLIERS),
-            outliers.len() as f64,
-            "engines",
-            outliers == KNOWN_OUTLIERS,
-        );
-        assert_eq!(
-            outliers, KNOWN_OUTLIERS,
-            "the set of engines disagreeing with published performance by >10% changed. \
-             Do NOT adjust an r_t to make this pass — update \
-             docs/results/historical-presets-v1.md and this list, or find the real cause."
         );
     }
 }
@@ -3308,4 +3647,5 @@ mod floor_diag {
         println!("total floors {prev}");
     }
 }
+
 
