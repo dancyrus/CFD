@@ -449,17 +449,46 @@ pub fn apply_sponge(u: &mut [Cons], g: &Grid, dt: Real, ambient: &Ambient,
 /// The caller uses HLL for the radial fluxes of cells i-1, i, i+1 where set.
 pub fn carbuncle_mask(w: &[Prim], g: &Grid, mask: &mut [bool]);
 
-/// Quasi-1D isentropic in the nozzle, ambient elsewhere, blended over 4 cells.
+/// The geometric description of a nozzle: r-weighted open radius per column
+/// (g.nz long), the lip, and the throat column (last argmin, so a flat throat
+/// goes sonic at its downstream end).
+pub struct NozzleProfile { pub r_open: Vec<f64>, pub lip: usize, pub i_throat: usize }
+
+/// THE nozzle predicate (work order A2): Some iff a lip exists at column >= 2,
+/// every column from inlet to lip has exactly one fluid run, the open-radius
+/// profile converges then diverges, and the throat is a real, strictly
+/// interior constriction. `quasi1d_init` gates on it; work order A3 must call
+/// this same function, never restate the test.
+pub fn nozzle_profile(g: &Grid, solid: &SolidField) -> Option<NozzleProfile>;
+
+/// True when every column has at most one solid run — the star-convex-in-r
+/// assumption ColumnReflect depends on. `EulerSolver::step` returns
+/// CfdError::Geometry for WallMode::ColumnReflect when this fails, instead of
+/// letting the mirror fill overwrite live fluid (work order A2).
+pub fn column_reflect_supported(g: &Grid, solid: &SolidField) -> bool;
+
+/// Quasi-1D isentropic in the nozzle, ambient elsewhere, blended over 4 cells
+/// — gated on `nozzle_profile`. When the gate fails: uniform isentropic
+/// freestream if the chamber-to-ambient expansion is supersonic AND the
+/// ambient lies on the chamber's isentrope (the external-flow rig), otherwise
+/// ambient at rest. Logs which path ran. Never crashes on any geometry.
 pub fn quasi1d_init(u: &mut [Cons], g: &Grid, solid: &SolidField,
                     gas: &GasModel, chamber: &Chamber, ambient: &Ambient);
 
 /// Area-Mach inversion, NASA b4wind. Guard |ar - 1| < 1e-6 -> return 1.0.
 pub fn mach_from_area_ratio(ar: f64, gamma: f64, supersonic: bool) -> f64;
 
+/// Momentum is booked as well as mass and energy (work order A2): closures
+/// remove all four conserved totals, refills are at rest, and
+/// delta(total over fluid cells) == ledger holds exactly in f64 for each.
 #[derive(Default, Debug, Clone, Copy)]
-pub struct FlipLedger { pub mass: f64, pub energy: f64 }
+pub struct FlipLedger { pub mass: f64, pub energy: f64,
+                        pub momentum_z: f64, pub momentum_r: f64 }
 
-/// Flip bookkeeping plus BFS refill of newly opened cells at rest.
+/// Flip bookkeeping plus BFS refill of newly opened cells at rest. The BFS
+/// runs to completion (the old 8-pass cap left 80% of an erased 80x80 block
+/// unreached); sealed cavities extrapolate the nearest valid fluid cell's
+/// (rho, p) at rest, ambient only when no valid fluid exists anywhere.
 pub fn apply_geometry_change(u: &mut [Cons], g: &Grid, old: &SolidField,
                              new: &SolidField, gas: &GasModel,
                              ambient: &Ambient, ledger: &mut FlipLedger);

@@ -138,20 +138,27 @@ Both original passes omitted this and it will silently corrupt the conservation 
 on GeometryChanged(new_frac):
   for c:
     vol = 2π·r_j·dr·dz
-    fluid -> solid: ledger.mass −= ρ[c]·vol; ledger.energy −= E[c]·vol; valid[c] = false
+    fluid -> solid: ledger.{mass, momentum_z, momentum_r, energy} −= U[c]·vol; valid[c] = false
     solid -> fluid: valid[c] = false; queue.push(c)
-  // BFS fill, at most 8 passes
+  // BFS fill, synchronous passes TO COMPLETION (terminates on its own)
   for c in queue with >=1 valid fluid neighbour:
     ρ[c] = mean(ρ over those neighbours); p[c] = mean(p over them)
     u[c] = 0; v[c] = 0                   // START AT REST
     ledger.mass += ρ[c]·vol; ledger.energy += E[c]·vol
-  remaining invalid cells -> ambient
+  remaining invalid cells (sealed cavities):
+    (ρ, p) of the NEAREST valid fluid cell by grid distance, at rest
+    (multi-source BFS from all valid cells, through solid); ambient only
+    when the edit leaves no valid fluid cell anywhere
   recompute dt; reset the convergence monitor
 ```
 
 `u = v = 0` in newly opened cells is not laziness. A cell opened next to a Mach-3 plume that inherits its neighbour's velocity fires a shock into the new cavity.
 
-The ledger is what separates "conservation drift" from "the user drew a hole." Test T2 asserts `|Δmass_total − ledger.mass| < tol`, not `|Δmass_total| < tol`. Without it every geometry edit is a false test failure.
+⚠ **The first draft capped the BFS at 8 passes and dumped everything unreached at ambient** (work order A2). That covers nudging a wall a few cells and nothing else: measured fractions of an erased solid block left at ambient were 0% at 6×6 and 16×16, **48% at 40×40, 80% at 80×80** — and erasing an obstacle is exactly what a sandbox user does. The loop terminates naturally (every pass fills at least one cell or the queue stops shrinking), so the cap bought nothing. The ambient fallback was also wrong for the cells it did hit: a sealed void inside a hot body filled with cold far-field ambient is a spurious pressure discontinuity; the nearest-valid-fluid extrapolation above replaces it.
+
+The ledger is what separates "conservation drift" from "the user drew a hole." Test T2 asserts `|Δmass_total − ledger.mass| < tol`, not `|Δmass_total| < tol`. Without it every geometry edit is a false test failure. ⚠ It books **momentum as well as mass and energy** (work order A2): closures delete a cell's momentum outright and every refill starts at rest, so without momentum lines a large edit injects or removes momentum with no audit trail, and `Δtotal == ledger` — the only invariant that could catch it — was not even defined for momentum.
+
+**`WallMode::ColumnReflect` is refused on non-star-convex geometry** (work order A2). Its per-column mirror fill finds the first solid cell from the axis and overwrites everything above it. On a column with a second fluid run above the first solid run, that destroys live fluid: measured on a 9-disk array, 2346 of 21420 fluid cells overwritten and the report off by 2.6×, silently; on the nozzle, 0 of 15977, which is why no ladder rung ever saw it. `physics::column_reflect_supported` (at most one solid run per column) gates the mode; `step()` returns `CfdError::Geometry` instead of running it.
 
 ---
 
@@ -173,12 +180,16 @@ p_b = p0·(a_b²/a0²)^(γ/(γ−1))
 ρ_b = γ·p_b / a_b²
 ```
 
-**Downstream outflow.** Supersonic (`|u| ≥ a`): copy the interior cell. All four characteristics exit, so this is exact and non-reflecting. Subsonic: impose `p_a`, extrapolate entropy and R⁺.
+**Downstream outflow.** The same three-way split as the radial far field, on the axial normal. Outgoing supersonic (`u ≥ a`): copy the interior cell. All four characteristics exit, so this is exact and non-reflecting. Outgoing subsonic (`0 ≤ u < a`): impose `p_a`, extrapolate entropy and R⁺.
 
 ```
 ρ_b = ρ_i·(p_a/p_i)^(1/γ);  a_b = sqrt(γp_a/ρ_b)
 u_b = (u_i + 2a_i/(γ−1)) − 2a_b/(γ−1);  v_b = v_i;  p_b = p_a
 ```
+
+Reversed (`u < 0`): the ambient reservoir at rest, `(ρ_a, 0, 0, p_a)`. Incoming gas carries **ambient** entropy and **ambient** tangential velocity, never the interior's — the interior is downstream of the face and says nothing about what enters through it.
+
+⚠ **The reversal branch and the signed supersonic test are both load-bearing** (work order A2). The first draft had no reversal branch and tested `|u| ≥ a`. Without the branch, `u < 0` fell into the subsonic construction, which extrapolates interior entropy and `v` along characteristics that are *entering* the domain — measured on non-nozzle geometry: interior `u = −0.30` produced a ghost with `u = +1.45`, a spurious outward jet at M 2.5. And `|u| ≥ a` read supersonic *inflow* as supersonic outflow, copying the interior bit-exactly — zero conditions imposed on four incoming characteristics, which is ill-posed; a sustained M 4.49 inflow grew domain mass 41.7% over 3000 steps with nothing constraining it. Clean nozzle exhaust never reverses at the exit plane, which is why T0–T8 cannot see any of this.
 
 **No sponge on the downstream boundary.** The core is supersonic there and a sponge would corrupt it.
 
@@ -200,6 +211,10 @@ That gives 1.8% one-way transmission and under 0.1% round-trip return. Add a dia
 ## 5. Initialization, floors, timestep
 
 **Quasi-1D isentropic init** in the nozzle interior, ambient elsewhere, blended over 4 cells at the exit plane. Roughly 3× fewer steps to steady than a cold start, and the app needs the quasi-1D solution anyway for the textbook-comparison overlay, so it is nearly free.
+
+⚠ **The init is gated on `physics::nozzle_profile`, the one nozzle predicate** (work order A2 — work order A3 must call the same function, never restate the test). The geometry is a nozzle iff: a lip exists at column ≥ 2; **every column from inlet to lip has exactly one fluid run**; the open-radius profile **converges then diverges** (non-increasing to the throat, non-decreasing after); and the throat is a nonzero, strictly interior constriction smaller than both ends. The first draft asked only for a lip, an interior argmin and the constriction — satisfied by a blockage anywhere. Measured: a 3×3 array of disconnected disks was seeded as a "nozzle" over 73.1% of its fluid cells at up to M 2.07, and a baffled duct over 98.4% at up to M 3.13 and 0.996 p₀ against an ambient of 0.0203 p₀ — a 50× overpressure blast wave at t = 0 in a case with no nozzle, on by default.
+
+When the gate fails, the generic fallback: **uniform isentropic freestream** when the chamber-to-ambient expansion is supersonic *and* the ambient lies on the chamber's isentrope (t_a within 0.1% of T₀·(p_a/p₀)^((γ−1)/γ) — the external-flow rig, where the chamber is the stream's stagnation state); **ambient at rest** otherwise (a rocket chamber over a low ambient has a supersonic pressure ratio too, but its ambient is not the chamber's stream, and uniform M 3 flow through arbitrary drawn geometry is the same blast-wave mistake the gate exists to prevent). Either path logs one line saying which ran — after a few thousand steps the init is invisible and the log line is the only record.
 
 ⚠ The open-radius formula in the first draft was dimensionally wrong (`dz·Σ_j`) and unweighted. Correct (per-cell `dr_j` inside the sum on a graded grid):
 

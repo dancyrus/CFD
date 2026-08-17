@@ -70,19 +70,37 @@ fn inlet_ghost(wi: Prim, chamber: &Chamber, g: Real) -> Cons {
     prim_to_cons([rb, ub, 0.0, pb], g)
 }
 
-/// Downstream outflow ghost. Supersonic (|u| >= a): copy the interior cell —
-/// all four characteristics exit, exact and non-reflecting. Subsonic: impose
-/// p_a, extrapolate entropy and R⁺.
+/// Downstream outflow ghost, the same three-way split `farfield_ghost` uses on
+/// the radial normal. Outgoing supersonic (u >= a): copy the interior cell —
+/// all four characteristics exit, exact and non-reflecting. Outgoing subsonic
+/// (0 <= u < a): impose p_a, extrapolate entropy and R⁺. Reversed (u < 0): the
+/// ambient reservoir at rest — incoming gas carries AMBIENT entropy and
+/// AMBIENT tangential velocity, never the interior's, which is downstream of
+/// the face and says nothing about what enters through it.
+///
+/// The reversal branch and the SIGNED supersonic test are both load-bearing
+/// (A2). Without them, u < 0 fell into the subsonic construction, which
+/// extrapolates interior entropy and v along characteristics that are entering
+/// the domain — measured: interior u = -0.30 produced a ghost with u = +1.45,
+/// a spurious outward jet at M 2.5. And `|u| >= a` read supersonic INFLOW as
+/// supersonic outflow, copying the interior bit-exactly: zero conditions on
+/// four incoming characteristics, ill-posed — a sustained M 4.49 inflow grew
+/// domain mass 41.7% over 3000 steps with nothing constraining it.
 #[inline]
-fn outflow_ghost(ui: Cons, wi: Prim, p_a: Real, g: Real) -> Cons {
+fn outflow_ghost(ui: Cons, wi: Prim, ambient: &Ambient, g: Real) -> Cons {
+    let un = wi[1];
+    if un < 0.0 {
+        let rho_a = ambient.p / ambient.t;
+        return prim_to_cons([rho_a, 0.0, 0.0, ambient.p], g);
+    }
     let ai = (g * wi[3] / wi[0]).sqrt();
-    if wi[1].abs() >= ai {
+    if un >= ai {
         return ui;
     }
-    let rb = wi[0] * (p_a / wi[3]).powf(1.0 / g);
-    let ab = (g * p_a / rb).sqrt();
-    let ub = wi[1] + 2.0 * (ai - ab) / (g - 1.0);
-    prim_to_cons([rb, ub, wi[2], p_a], g)
+    let rb = wi[0] * (ambient.p / wi[3]).powf(1.0 / g);
+    let ab = (g * ambient.p / rb).sqrt();
+    let ub = un + 2.0 * (ai - ab) / (g - 1.0);
+    prim_to_cons([rb, ub, wi[2], ambient.p], g)
 }
 
 /// Radial far-field ghost: the outflow construction with the radial normal;
@@ -131,7 +149,7 @@ pub fn fill_ghosts(u: &mut [Cons], g: &Grid, solid: &[bool], gas: &GasModel,
         let ghost = if solid[i1] {
             u[i1]
         } else {
-            outflow_ghost(u[i1], cons_to_prim(u[i1], gm), ambient.p, gm)
+            outflow_ghost(u[i1], cons_to_prim(u[i1], gm), ambient, gm)
         };
         u[g.gidx(nz, ir)] = ghost;
         u[g.gidx(nz + 1, ir)] = ghost;
@@ -160,13 +178,41 @@ pub fn fill_ghosts(u: &mut [Cons], g: &Grid, solid: &[bool], gas: &GasModel,
     }
 }
 
+/// True when every column has at most one solid run — the star-convex-in-r
+/// assumption `column_reflect_fill` depends on. `EulerSolver::step` REFUSES
+/// `WallMode::ColumnReflect` when this fails (work order A2): the fill finds
+/// the first solid cell from the axis and overwrites everything above it, so
+/// on a column with a second fluid run it destroys live fluid — measured on a
+/// 9-disk array, 2346 of 21420 live fluid cells overwritten and the report
+/// off by 2.6x, silently. On the nozzle: 0 of 15977 cells, which is why no
+/// ladder rung ever saw it.
+pub fn column_reflect_supported(g: &Grid, solid: &SolidField) -> bool {
+    for iz in 0..g.nz {
+        let mut runs = 0usize;
+        let mut prev_solid = false;
+        for ir in 0..g.nr {
+            let s = solid.is_solid(g.idx(iz, ir));
+            if s && !prev_solid {
+                runs += 1;
+                if runs > 1 {
+                    return false;
+                }
+            }
+            prev_solid = s;
+        }
+    }
+    true
+}
+
 /// WallMode::ColumnReflect (abort-ladder rung 3, also used as a measurement of
 /// the staircase wall's own contribution to the wall layer): per column, every
 /// solid cell is overwritten with the mirror image of the fluid below the bore
 /// (u_r negated), so the sweeps can run the REGULAR flux solver at wall faces
 /// and the bore face becomes a reflecting condition. Only star-convex-in-r
-/// geometry survives; solid cells stay frozen (accumulate skips them) and are
-/// refilled here before every stage.
+/// geometry survives — `column_reflect_supported` is the gate and
+/// `EulerSolver::step` refuses the mode when it fails, so this fill never
+/// sees a column with a second solid run. Solid cells stay frozen (accumulate
+/// skips them) and are refilled here before every stage.
 fn column_reflect_fill(u: &mut [Cons], g: &Grid, solid: &[bool]) {
     let ng = NG as isize;
     let nr = g.nr as isize;
@@ -270,6 +316,17 @@ pub fn carbuncle_mask(w: &[Prim], g: &Grid, mask: &mut [bool]) {
     }
 }
 
+/// Mach of a stream expanded isentropically from the chamber stagnation state
+/// down to static pressure `p`. `None` when the expansion is undefined
+/// (p <= 0, or p at/above stagnation).
+fn isentropic_exit_mach(p: f64, chamber: &Chamber, g: f64) -> Option<f64> {
+    let p0 = chamber.p0 as f64;
+    if !(p > 0.0) || p >= p0 {
+        return None;
+    }
+    Some((2.0 / (g - 1.0) * ((p0 / p).powf((g - 1.0) / g) - 1.0)).sqrt())
+}
+
 /// Isentropic column state [rho, u, p] (f64) at Mach `m` from the chamber
 /// stagnation state. Non-dimensional: R = 1, p = rho*T, a² = gamma*T.
 fn isentropic_state(m: f64, chamber: &Chamber, g: f64) -> [f64; 3] {
@@ -282,27 +339,23 @@ fn isentropic_state(m: f64, chamber: &Chamber, g: f64) -> [f64; 3] {
     [rho, u, p]
 }
 
-/// Quasi-1D isentropic in the nozzle, ambient elsewhere, blended over 4 cells
-/// at the exit plane. Open radius per column: r_w(i) = sqrt(2*sum_j
-/// (1-frac[i][j])*r_j*dr_j) — r-weighted, with the square root. If the area has no
-/// interior minimum (arbitrary drawn blob), fall back to ambient everywhere;
-/// do not crash.
-pub fn quasi1d_init(u: &mut [Cons], g: &Grid, solid: &SolidField,
-                    gas: &GasModel, chamber: &Chamber, ambient: &Ambient) {
-    let gm = gas.gamma;
-    let gm64 = gm as f64;
-    let rho_a = ambient.p / ambient.t;
-    let ua = prim_to_cons([rho_a, 0.0, 0.0, ambient.p], gm);
+/// The geometric description of a nozzle the quasi-1D machinery needs: the
+/// r-weighted open radius of every column, the lip, and the throat column.
+#[derive(Debug, Clone)]
+pub struct NozzleProfile {
+    /// Open radius per column, `g.nz` long: `sqrt(2*sum_j (1-frac)*r_j*dr_j)`
+    /// (docs/physics-reference.md §5). Defined for every column, nozzle or not.
+    pub r_open: Vec<f64>,
+    /// Last column containing any solid cell.
+    pub lip: usize,
+    /// Throat column: the LAST argmin of `r_open` over `0..=lip`, so a flat
+    /// throat goes sonic at its downstream end.
+    pub i_throat: usize,
+}
 
-    // Ambient everywhere first; the nozzle interior overwrites below.
-    for ir in 0..g.nr {
-        for iz in 0..g.nz {
-            u[g.gidx(iz as isize, ir as isize)] = ua;
-        }
-    }
-
-    // Open radius per column (r-weighted, docs/physics-reference.md §5) and
-    // the lip: the last column containing any solid.
+/// r-weighted open radius per column and the lip. Defined for any geometry;
+/// `nozzle_profile` is what decides whether the numbers mean anything.
+fn open_radius_profile(g: &Grid, solid: &SolidField) -> (Vec<f64>, Option<usize>) {
     let mut r_open = vec![0.0f64; g.nz];
     let mut lip: Option<usize> = None;
     for (iz, r_w) in r_open.iter_mut().enumerate() {
@@ -320,12 +373,56 @@ pub fn quasi1d_init(u: &mut [Cons], g: &Grid, solid: &SolidField,
             lip = Some(iz);
         }
     }
+    (r_open, lip)
+}
 
-    // A usable nozzle needs a lip and a strictly interior area minimum with a
-    // real constriction. Anything else falls back to ambient everywhere.
-    let Some(lip) = lip else { return };
+/// Number of maximal runs of consecutive fluid cells in column `iz`.
+fn fluid_runs_in_column(g: &Grid, solid: &SolidField, iz: usize) -> usize {
+    let mut runs = 0usize;
+    let mut prev_solid = true;
+    for ir in 0..g.nr {
+        let s = solid.is_solid(g.idx(iz, ir));
+        if prev_solid && !s {
+            runs += 1;
+        }
+        prev_solid = s;
+    }
+    runs
+}
+
+/// **The** nozzle predicate (work order A2). `quasi1d_init` gates on it, and
+/// work order A3 needs the identical test — call this, never restate it.
+///
+/// `Some(profile)` when all of these hold:
+///
+///   1. A lip exists — some column contains solid — and it is at least the
+///      third column, so there is an upstream chamber to expand from.
+///   2. **Every column from the inlet to the lip has exactly one fluid run.**
+///      A column through a disk array or a mid-duct baffle has two or more; a
+///      fully blocked column has none. This is the assumption a per-column
+///      bore scan makes silently, so it is checked instead of assumed.
+///   3. **The open-radius profile converges then diverges**: non-increasing
+///      up to the throat, non-decreasing from it to the lip.
+///   4. The throat is a real constriction — nonzero, strictly interior, and
+///      strictly smaller than both ends.
+///
+/// The gate this replaces asked only for a lip, an interior argmin and (4), so
+/// a blockage anywhere satisfied it. Measured with the old gate: a 3x3 array
+/// of disconnected disks was seeded as a "nozzle" over 73.1% of its fluid
+/// cells at up to M 2.07, and a baffled duct over 98.4% of its cells at up to
+/// M 3.13 and 0.996 p0 against an ambient of 0.0203 p0 — a 50x overpressure
+/// blast wave launched at t = 0 into a case with no nozzle in it, on by
+/// default.
+pub fn nozzle_profile(g: &Grid, solid: &SolidField) -> Option<NozzleProfile> {
+    let (r_open, lip) = open_radius_profile(g, solid);
+    let lip = lip?;
     if lip < 2 {
-        return;
+        return None;
+    }
+    // (2) exactly one fluid run per column, inlet through lip. Columns past
+    // the lip are plume, not nozzle; the fill never writes inside solid there.
+    if (0..=lip).any(|iz| fluid_runs_in_column(g, solid, iz) != 1) {
+        return None;
     }
     let mut i_throat = 0usize;
     for i in 0..=lip {
@@ -333,13 +430,98 @@ pub fn quasi1d_init(u: &mut [Cons], g: &Grid, solid: &SolidField,
             i_throat = i; // last argmin: sonic at the end of a flat throat
         }
     }
+    // (4) a real constriction, strictly interior.
     let r_t = r_open[i_throat];
     if i_throat == 0 || i_throat == lip || r_t <= 1e-9 {
-        return;
+        return None;
     }
     if r_t >= r_open[0].min(r_open[lip]) {
-        return;
+        return None;
     }
+    // (3) converge then diverge, no tolerance: the exact-area rasterizer
+    // gives a monotone open radius on each side of a real CD wall, and
+    // admitting "nearly monotone" is what would let a baffled duct back in.
+    if (0..i_throat).any(|i| r_open[i + 1] > r_open[i]) {
+        return None;
+    }
+    if (i_throat..lip).any(|i| r_open[i + 1] < r_open[i]) {
+        return None;
+    }
+    Some(NozzleProfile { r_open, lip, i_throat })
+}
+
+/// Quasi-1D isentropic init in the nozzle, ambient elsewhere, blended over 4
+/// cells at the exit plane — gated on `nozzle_profile`. When the gate fails
+/// (arbitrary drawn geometry: disk arrays, baffles, blobs), a generic initial
+/// condition instead: uniform isentropic freestream if the chamber-to-ambient
+/// expansion is supersonic, ambient at rest otherwise. Either path logs once —
+/// a wrong init here is invisible after a few thousand steps and the log line
+/// is the only record of which path ran. Never crashes on any geometry.
+pub fn quasi1d_init(u: &mut [Cons], g: &Grid, solid: &SolidField,
+                    gas: &GasModel, chamber: &Chamber, ambient: &Ambient) {
+    let gm = gas.gamma;
+    let gm64 = gm as f64;
+    let rho_a = ambient.p / ambient.t;
+    let ua = prim_to_cons([rho_a, 0.0, 0.0, ambient.p], gm);
+
+    // Ambient everywhere first; the chosen init overwrites fluid cells below.
+    for ir in 0..g.nr {
+        for iz in 0..g.nz {
+            u[g.gidx(iz as isize, ir as isize)] = ua;
+        }
+    }
+
+    let Some(profile) = nozzle_profile(g, solid) else {
+        // Generic fallback. Uniform freestream when the inlet feeds a
+        // supersonic stream — meaning the chamber-to-ambient expansion is
+        // supersonic AND the ambient actually lies on the chamber's isentrope
+        // (the external-flow rig: chamber = the stream's stagnation state,
+        // ambient = its static state, and the freestream at that Mach is the
+        // near-solution start). A rocket chamber over a low ambient also has
+        // a supersonic pressure ratio, but its ambient is NOT the chamber's
+        // stream — uniform M 3 flow through arbitrary drawn geometry would be
+        // the same blast-wave mistake the gate exists to prevent, so that
+        // case gets ambient at rest.
+        let m = isentropic_exit_mach(ambient.p as f64, chamber, gm64);
+        let on_isentrope = |m: f64| {
+            let t_isen = chamber.t0 as f64 / (1.0 + 0.5 * (gm64 - 1.0) * m * m);
+            ((ambient.t as f64) - t_isen).abs() <= 1e-3 * t_isen
+        };
+        match m {
+            Some(m) if m >= 1.0 && on_isentrope(m) => {
+                let st = isentropic_state(m, chamber, gm64);
+                let cons = prim_to_cons([st[0] as Real, st[1] as Real, 0.0,
+                                         st[2] as Real], gm);
+                for ir in 0..g.nr {
+                    for iz in 0..g.nz {
+                        if !solid.is_solid(g.idx(iz, ir)) {
+                            u[g.gidx(iz as isize, ir as isize)] = cons;
+                        }
+                    }
+                }
+                eprintln!(
+                    "cfd-core: quasi-1D init: geometry is not a nozzle \
+                     (gate: one fluid run per column + converge-then-diverge \
+                     open radius); initialized uniform freestream at M {m:.3}"
+                );
+            }
+            _ => {
+                eprintln!(
+                    "cfd-core: quasi-1D init: geometry is not a nozzle \
+                     (gate: one fluid run per column + converge-then-diverge \
+                     open radius); initialized ambient at rest"
+                );
+            }
+        }
+        return;
+    };
+    eprintln!(
+        "cfd-core: quasi-1D init: nozzle gate passed (lip column {}, throat \
+         column {}); initialized quasi-1D isentropic",
+        profile.lip, profile.i_throat
+    );
+    let NozzleProfile { r_open, lip, i_throat } = profile;
+    let r_t = r_open[i_throat];
 
     // Fill nozzle columns from the isentropic relations: subsonic upstream of
     // the throat, M = 1 analytically at it, supersonic downstream.
@@ -419,16 +601,41 @@ pub fn mach_from_area_ratio(ar: f64, gamma: f64, supersonic: bool) -> f64 {
 
 /// What separates "conservation drift" from "the user drew a hole". Test T2
 /// asserts against this, not against zero.
-#[derive(Default, Debug, Clone, Copy)]
-pub struct FlipLedger { pub mass: f64, pub energy: f64 }
-
-/// Flip bookkeeping plus BFS refill (at most 8 passes) of newly opened cells
-/// AT REST (u = v = 0 — an opened cell inheriting a Mach-3 neighbour's
-/// velocity fires a shock into the new cavity). Remaining unreached cells get
-/// ambient. Called from the top of `step()`, never inside an RK stage.
 ///
-/// The ledger records every unit of mass/energy the edit adds or removes —
-/// closures, BFS fills AND ambient fills — so that
+/// Momentum is booked as well as mass and energy (work order A2). Closing a
+/// cell deletes its momentum outright, and every refill starts at rest —
+/// without momentum lines a large edit silently injects or removes momentum
+/// with no audit trail, and the invariant that catches it
+/// (`delta(total) == ledger`) was not even defined for momentum.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct FlipLedger {
+    pub mass: f64,
+    pub energy: f64,
+    pub momentum_z: f64,
+    pub momentum_r: f64,
+}
+
+/// Flip bookkeeping plus BFS refill of newly opened cells AT REST (u = v = 0 —
+/// an opened cell inheriting a Mach-3 neighbour's velocity fires a shock into
+/// the new cavity). Called from the top of `step()`, never inside an RK stage.
+///
+/// The BFS runs **to completion** (work order A2). It was capped at 8 passes,
+/// which covers nudging a wall and nothing else — measured fractions of an
+/// erased solid block left unreached were 0% at 6x6 and 16x16, 48% at 40x40,
+/// 80% at 80x80, and erasing an obstacle is exactly what a sandbox user does.
+/// The loop terminates on its own: every pass fills at least one cell or
+/// breaks.
+///
+/// Cells the flood fill can never reach (sealed cavities with no valid fluid
+/// neighbour on any pass) take the (rho, p) of the NEAREST valid fluid cell by
+/// grid distance, at rest, found by a multi-source BFS that ignores solidity —
+/// not ambient: a sealed void inside a hot body filled with cold far-field
+/// ambient is a spurious pressure discontinuity the solver then has to
+/// swallow. Ambient remains only for the degenerate edit that leaves no valid
+/// fluid cell anywhere.
+///
+/// The ledger records every unit of mass/momentum/energy the edit adds or
+/// removes — closures and every kind of fill — so that
 /// `delta(total over fluid cells) == ledger` holds exactly in f64.
 pub fn apply_geometry_change(u: &mut [Cons], g: &Grid, old: &SolidField,
                              new: &SolidField, gas: &GasModel,
@@ -449,9 +656,11 @@ pub fn apply_geometry_change(u: &mut [Cons], g: &Grid, old: &SolidField,
             let gi = g.gidx(iz as isize, ir as isize);
             match (old.is_solid(idx), new.is_solid(idx)) {
                 (false, true) => {
-                    // fluid -> solid: its mass and energy leave the ledger.
+                    // fluid -> solid: mass, momentum and energy leave the ledger.
                     let vol = g.cell_vol(iz, ir);
                     ledger.mass -= u[gi][0] as f64 * vol;
+                    ledger.momentum_z -= u[gi][1] as f64 * vol;
+                    ledger.momentum_r -= u[gi][2] as f64 * vol;
                     ledger.energy -= u[gi][3] as f64 * vol;
                     // Frozen from now on; ambient keeps primitives finite.
                     u[gi] = ua;
@@ -463,9 +672,10 @@ pub fn apply_geometry_change(u: &mut [Cons], g: &Grid, old: &SolidField,
         }
     }
 
-    // BFS refill, at most 8 synchronous passes: mean rho and p over valid
-    // fluid 4-neighbours, START AT REST.
-    for _pass in 0..8 {
+    // BFS refill, synchronous passes TO COMPLETION: mean rho and p over valid
+    // fluid 4-neighbours, START AT REST. Terminates on its own — every pass
+    // fills at least one cell or breaks on `fills.is_empty()`.
+    loop {
         if opened.is_empty() {
             break;
         }
@@ -511,14 +721,51 @@ pub fn apply_geometry_change(u: &mut [Cons], g: &Grid, old: &SolidField,
         opened = still_open;
     }
 
-    // Cells the BFS never reached (sealed cavities): ambient.
-    for idx in opened {
-        let iz = idx % nz;
-        let ir = idx / nz;
-        u[g.gidx(iz as isize, ir as isize)] = ua;
-        let vol = g.cell_vol(iz, ir);
-        ledger.mass += rho_a as f64 * vol;
-        ledger.energy += ua[3] as f64 * vol;
+    // Cells the flood fill never reached (sealed cavities): extrapolate from
+    // the NEAREST valid fluid cell by grid distance, at rest — a multi-source
+    // BFS from every valid cell, through solid and unreached cells alike.
+    // Ambient only if the edit left no valid fluid cell anywhere.
+    if !opened.is_empty() {
+        let mut nearest: Vec<usize> = vec![usize::MAX; g.len()];
+        let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        for idx in 0..g.len() {
+            if valid[idx] {
+                nearest[idx] = idx;
+                queue.push_back(idx);
+            }
+        }
+        while let Some(idx) = queue.pop_front() {
+            let iz = idx % nz;
+            let ir = idx / nz;
+            let mut push = |jz: usize, jr: usize| {
+                let jdx = g.idx(jz, jr);
+                if nearest[jdx] == usize::MAX {
+                    nearest[jdx] = nearest[idx];
+                    queue.push_back(jdx);
+                }
+            };
+            if iz > 0 { push(iz - 1, ir); }
+            if iz + 1 < nz { push(iz + 1, ir); }
+            if ir > 0 { push(iz, ir - 1); }
+            if ir + 1 < nr { push(iz, ir + 1); }
+        }
+        for idx in opened {
+            let iz = idx % nz;
+            let ir = idx / nz;
+            let fill = match nearest[idx] {
+                usize::MAX => ua,
+                src => {
+                    let sz = src % nz;
+                    let sr = src / nz;
+                    let w = cons_to_prim(u[g.gidx(sz as isize, sr as isize)], gm);
+                    prim_to_cons([w[0], 0.0, 0.0, w[3]], gm)
+                }
+            };
+            u[g.gidx(iz as isize, ir as isize)] = fill;
+            let vol = g.cell_vol(iz, ir);
+            ledger.mass += fill[0] as f64 * vol;
+            ledger.energy += fill[3] as f64 * vol;
+        }
     }
 }
 
@@ -713,6 +960,36 @@ mod tests {
         assert!((wg[0] as f64 - rb).abs() <= 1e-5 * rb, "rho_b = {}", wg[0]);
         assert!((wg[1] as f64 - ub).abs() <= 1e-5 * ub.abs().max(1.0), "u_b = {}", wg[1]);
         assert!((wg[2] - wi[2]).abs() <= 1e-6, "v_b extrapolates v_i");
+    }
+
+    #[test]
+    fn ghosts_outflow_reversed_flow_uses_ambient_reservoir() {
+        // The A2 fix: any reversed flow at the outflow plane — subsonic OR
+        // supersonic — gets the ambient reservoir, exactly like the radial
+        // far field. Before it, u = -0.30 here produced a ghost jetting
+        // OUTWARD at M 2.5, and u = -2.0 (|u| > a) copied the interior
+        // bit-exactly, imposing nothing on four incoming characteristics.
+        let g = Grid::uniform(8, 4, 0.1, 0.05);
+        let gm = 1.4f32;
+        let amb = ambient();
+        let expect = ambient_cons(&amb, gm);
+        // Subsonic reversal (a ~ 1.06 for this state).
+        let mut u = filled_grid(&g, |_, _| [0.8, -0.30, 0.4, 0.65], gm);
+        fill_ghosts(&mut u, &g, &no_solid(&g), &gas(), &chamber(), &amb, &numerics());
+        assert_eq!(u[g.gidx(g.nz as isize, 1)], expect);
+        assert_eq!(u[g.gidx(g.nz as isize + 1, 1)], expect);
+        // Supersonic reversal: |u| >= a must NOT read as supersonic outflow.
+        let mut u = filled_grid(&g, |_, _| [1.0, -2.0, 0.1, 0.06], gm); // a ~ 0.29
+        fill_ghosts(&mut u, &g, &no_solid(&g), &gas(), &chamber(), &amb, &numerics());
+        assert_eq!(u[g.gidx(g.nz as isize, 1)], expect);
+        // Outgoing flow at exactly u = 0 still takes the subsonic outflow
+        // branch (imposes p_a), not the reservoir.
+        let wi: Prim = [1.0, 0.0, 0.2, 0.9];
+        let mut u = filled_grid(&g, |_, _| wi, gm);
+        fill_ghosts(&mut u, &g, &no_solid(&g), &gas(), &chamber(), &amb, &numerics());
+        let wg = cons_to_prim(u[g.gidx(g.nz as isize, 1)], gm);
+        assert!((wg[3] - amb.p).abs() <= 1e-6, "p_b = {}", wg[3]);
+        assert!((wg[2] - wi[2]).abs() <= 1e-6, "v_b extrapolates v_i at u = 0");
     }
 
     #[test]
@@ -976,12 +1253,126 @@ mod tests {
         assert_eq!(u[g.gidx(30, 10)], ua);
     }
 
+    #[test]
+    fn column_reflect_gate_counts_solid_runs() {
+        let g = Grid::uniform(20, 10, 0.1, 0.05);
+        // Nozzle-like: one solid run at the top of some columns.
+        let mut noz = SolidField::empty(g.clone());
+        for iz in 5..15usize {
+            for ir in 6..10usize {
+                noz.fraction[g.idx(iz, ir)] = 1.0;
+            }
+        }
+        assert!(column_reflect_supported(&g, &noz));
+        // No solid at all: supported (the fill is a no-op).
+        assert!(column_reflect_supported(&g, &SolidField::empty(g.clone())));
+        // A floating disk above the wall run: two solid runs in its columns.
+        let mut disks = noz.clone();
+        for iz in 8..11usize {
+            disks.fraction[g.idx(iz, 2)] = 1.0;
+        }
+        assert!(!column_reflect_supported(&g, &disks));
+    }
+
+    #[test]
+    fn nozzle_gate_rejects_disk_array_and_baffles() {
+        let g = Grid::uniform(60, 24, 0.1, 0.05);
+        // 3x3 array of disconnected square "disks": every disk column has two
+        // or more fluid runs. The old gate read this as a nozzle and seeded
+        // 73.1% of its fluid cells at up to M 2.07.
+        let mut disks = SolidField::empty(g.clone());
+        for bz in 0..3usize {
+            for br in 0..3usize {
+                for iz in (10 + bz * 15)..(15 + bz * 15) {
+                    for ir in (4 + br * 6)..(8 + br * 6) {
+                        disks.fraction[g.idx(iz, ir)] = 1.0;
+                    }
+                }
+            }
+        }
+        assert!(nozzle_profile(&g, &disks).is_none(), "disk array is not a nozzle");
+        // Duct with thin baffles: solid top wall plus two one-cell baffles
+        // hanging into the duct. Baffle columns have one fluid run below plus
+        // the geometry converges-then-diverges in open radius — the old gate
+        // passed it and seeded 98.4% of the duct at up to M 3.13.
+        let mut baffled = SolidField::empty(g.clone());
+        for iz in 0..g.nz {
+            baffled.fraction[g.idx(iz, g.nr - 1)] = 1.0;
+        }
+        for &iz in &[20usize, 40] {
+            for ir in 8..(g.nr - 1) {
+                baffled.fraction[g.idx(iz, ir)] = 1.0;
+            }
+        }
+        assert!(nozzle_profile(&g, &baffled).is_none(), "baffled duct is not a nozzle");
+        // A mid-duct baffle detached from both walls (two fluid runs).
+        let mut floating = SolidField::empty(g.clone());
+        for iz in 0..g.nz {
+            floating.fraction[g.idx(iz, g.nr - 1)] = 1.0;
+        }
+        for ir in 6..14usize {
+            floating.fraction[g.idx(30, ir)] = 1.0;
+        }
+        assert!(nozzle_profile(&g, &floating).is_none(),
+                "floating baffle is not a nozzle");
+    }
+
+    #[test]
+    fn nozzle_gate_accepts_the_cd_nozzle() {
+        let g = Grid::uniform(60, 24, 0.1, 0.05);
+        let solid = cd_nozzle(&g, cd_wall);
+        let p = nozzle_profile(&g, &solid).expect("CD nozzle must pass the gate");
+        assert_eq!(p.lip, 40);
+        // cd_wall's integer division keeps the wall at 8 through iz = 24, so
+        // the flat throat's last argmin — its downstream end — is 24.
+        assert_eq!(p.i_throat, 24, "last argmin of the flat throat");
+        assert!(p.r_open[p.i_throat] < p.r_open[0]);
+        assert!(p.r_open[p.i_throat] < p.r_open[p.lip]);
+    }
+
+    #[test]
+    fn quasi1d_generic_fallback_freestream_only_on_the_isentrope() {
+        let g = Grid::uniform(60, 24, 0.1, 0.05);
+        let gm = 1.4f32;
+        // Disk-array geometry so the gate fails.
+        let mut disks = SolidField::empty(g.clone());
+        for iz in 20..25usize {
+            for ir in 6..10usize {
+                disks.fraction[g.idx(iz, ir)] = 1.0;
+            }
+            for ir in 14..18usize {
+                disks.fraction[g.idx(iz, ir)] = 1.0;
+            }
+        }
+        // External-flow rig at M = 2: chamber = stagnation of the (1,1) stream,
+        // ambient = the stream's static state. Fallback = uniform freestream.
+        let m_inf = 2.0f64;
+        let t0 = 1.0 + 0.5 * 0.4 * m_inf * m_inf;
+        let chamber2 = Chamber { p0: t0.powf(1.4 / 0.4) as f32, t0: t0 as f32 };
+        let amb2 = Ambient { p: 1.0, t: 1.0 };
+        let mut u = vec![[0.0f32; 4]; g.glen()];
+        quasi1d_init(&mut u, &g, &disks, &gas(), &chamber2, &amb2);
+        let w = cons_to_prim(u[g.gidx(5, 5)], gm);
+        let u_inf = m_inf * 1.4f64.sqrt();
+        assert!((w[0] as f64 - 1.0).abs() < 1e-4, "rho {}", w[0]);
+        assert!((w[1] as f64 - u_inf).abs() < 1e-4 * u_inf, "u {}", w[1]);
+        assert!((w[3] as f64 - 1.0).abs() < 1e-4, "p {}", w[3]);
+        // Rocket chamber over a low ambient: supersonic pressure ratio but the
+        // ambient is NOT the chamber's stream (t off the isentrope) — ambient
+        // at rest, not a M 3.2 blast through the disks.
+        let amb = ambient(); // p 0.02, t 0.6; isentropic t at that p is 0.197
+        let mut u = vec![[0.0f32; 4]; g.glen()];
+        quasi1d_init(&mut u, &g, &disks, &gas(), &chamber(), &amb);
+        assert_eq!(u[g.gidx(5, 5)], ambient_cons(&amb, gm));
+        assert_eq!(u[g.gidx(50, 20)], ambient_cons(&amb, gm));
+    }
+
     // ---- geometry change --------------------------------------------------
 
-    /// f64 total mass/energy over the fluid cells of `solid`.
-    fn totals(u: &[Cons], g: &Grid, solid: &SolidField) -> (f64, f64) {
-        let mut mass = 0.0f64;
-        let mut energy = 0.0f64;
+    /// f64 totals of mass, z-momentum, r-momentum, energy over the fluid
+    /// cells of `solid`.
+    fn totals(u: &[Cons], g: &Grid, solid: &SolidField) -> (f64, f64, f64, f64) {
+        let mut t = [0.0f64; 4];
         for ir in 0..g.nr {
             for iz in 0..g.nz {
                 if solid.is_solid(g.idx(iz, ir)) {
@@ -989,11 +1380,12 @@ mod tests {
                 }
                 let c = u[g.gidx(iz as isize, ir as isize)];
                 let vol = g.cell_vol(iz, ir);
-                mass += c[0] as f64 * vol;
-                energy += c[3] as f64 * vol;
+                for k in 0..4 {
+                    t[k] += c[k] as f64 * vol;
+                }
             }
         }
-        (mass, energy)
+        (t[0], t[1], t[2], t[3])
     }
 
     fn block_solid(g: &Grid, iz0: usize, iz1: usize, ir0: usize, ir1: usize) -> SolidField {
@@ -1015,12 +1407,18 @@ mod tests {
         let mut u = filled_grid(&g, |iz, ir| {
             [1.0 + 0.01 * (ir * 10 + iz) as f32, 0.2, -0.1, 1.0 + 0.005 * iz as f32]
         }, gm);
-        let (m0, e0) = totals(&u, &g, &old);
+        let (m0, pz0, pr0, e0) = totals(&u, &g, &old);
         let mut ledger = FlipLedger::default();
         apply_geometry_change(&mut u, &g, &old, &new, &gas(), &ambient(), &mut ledger);
-        let (m1, e1) = totals(&u, &g, &new);
+        let (m1, pz1, pr1, e1) = totals(&u, &g, &new);
         assert!(ledger.mass < 0.0, "closing cells must remove mass");
+        assert!(ledger.momentum_z < 0.0, "closing cells moving in +z must remove z-momentum");
+        assert!(ledger.momentum_r > 0.0, "closing cells moving in -r must remove negative r-momentum");
         assert!(((m1 - m0) - ledger.mass).abs() <= 1e-12 * m0, "T2 invariant (mass)");
+        assert!(((pz1 - pz0) - ledger.momentum_z).abs() <= 1e-12 * pz0.abs().max(1.0),
+                "T2 invariant (z-momentum)");
+        assert!(((pr1 - pr0) - ledger.momentum_r).abs() <= 1e-12 * pr0.abs().max(1.0),
+                "T2 invariant (r-momentum)");
         assert!(((e1 - e0) - ledger.energy).abs() <= 1e-12 * e0, "T2 invariant (energy)");
     }
 
@@ -1040,12 +1438,18 @@ mod tests {
                 u[g.gidx(iz as isize, ir as isize)] = ambient_cons(&amb, gm);
             }
         }
-        let (m0, e0) = totals(&u, &g, &old);
+        let (m0, pz0, pr0, e0) = totals(&u, &g, &old);
         let mut ledger = FlipLedger::default();
         apply_geometry_change(&mut u, &g, &old, &new, &gas(), &amb, &mut ledger);
-        let (m1, e1) = totals(&u, &g, &new);
+        let (m1, pz1, pr1, e1) = totals(&u, &g, &new);
         assert!(ledger.mass > 0.0, "opening cells must add mass");
+        assert_eq!(ledger.momentum_z, 0.0, "at-rest fills book zero z-momentum");
+        assert_eq!(ledger.momentum_r, 0.0, "at-rest fills book zero r-momentum");
         assert!(((m1 - m0) - ledger.mass).abs() <= 1e-12 * m0.max(1.0), "T2 invariant (mass)");
+        assert!(((pz1 - pz0) - ledger.momentum_z).abs() <= 1e-12 * pz0.abs().max(1.0),
+                "T2 invariant (z-momentum)");
+        assert!(((pr1 - pr0) - ledger.momentum_r).abs() <= 1e-12 * pr0.abs().max(1.0),
+                "T2 invariant (r-momentum)");
         assert!(((e1 - e0) - ledger.energy).abs() <= 1e-12 * e0.max(1.0), "T2 invariant (energy)");
         // Every opened cell starts AT REST with the mean of its valid fluid
         // neighbours; corner cell (4, 2) has exactly (3, 2) and (4, 1).
@@ -1065,7 +1469,10 @@ mod tests {
     }
 
     #[test]
-    fn geometry_open_sealed_cavity_gets_ambient() {
+    fn geometry_open_sealed_cavity_extrapolates_nearest_fluid_at_rest() {
+        // A2: the sealed-cavity fallback is the NEAREST valid fluid cell's
+        // (rho, p) at rest, not ambient — filling a void inside a hot body
+        // with cold far-field ambient plants a spurious pressure jump.
         let g = Grid::uniform(10, 8, 0.1, 0.05);
         let gm = 1.4f32;
         let amb = ambient();
@@ -1075,9 +1482,58 @@ mod tests {
         let mut u = filled_grid(&g, |_, _| [0.9, 0.5, 0.1, 0.8], gm);
         let mut ledger = FlipLedger::default();
         apply_geometry_change(&mut u, &g, &old, &new, &gas(), &amb, &mut ledger);
-        assert_eq!(u[g.gidx(4, 3)], ambient_cons(&amb, gm));
+        // Every valid fluid cell holds (0.9, _, _, 0.8): the cavity must too,
+        // at rest.
+        let expect = prim_to_cons([0.9, 0.0, 0.0, 0.8], gm);
+        assert_eq!(u[g.gidx(4, 3)], expect);
         let vol = g.cell_vol(4, 3);
-        let rho_a = (amb.p / amb.t) as f64;
-        assert!((ledger.mass - rho_a * vol).abs() <= 1e-12, "cavity mass on the ledger");
+        // 0.9 is not exact in f32; compare against the f32-rounded value.
+        assert!((ledger.mass - 0.9f32 as f64 * vol).abs() <= 1e-12 * vol,
+                "cavity mass on the ledger: {} vs {}", ledger.mass, 0.9f32 as f64 * vol);
+        assert_eq!(ledger.momentum_z, 0.0);
+        assert_eq!(ledger.momentum_r, 0.0);
+    }
+
+    #[test]
+    fn geometry_open_large_block_refills_completely() {
+        // A2: the BFS was capped at 8 passes — erasing a 40x40 obstacle left
+        // 48% of it at ambient, 80x80 left 80%. It now runs to completion:
+        // every opened cell must be reached (no cell keeps the ambient the
+        // closure pass wrote into solid cells) and the T2 invariant holds.
+        let g = Grid::uniform(48, 48, 0.05, 0.05);
+        let gm = 1.4f32;
+        let amb = ambient();
+        let old = block_solid(&g, 4, 43, 4, 43); // 40x40 block
+        let new = SolidField::empty(g.clone());
+        let mut u = filled_grid(&g, |iz, ir| {
+            [1.0 + 0.001 * (ir + iz) as f32, 0.3, -0.1, 1.0 + 0.0005 * iz as f32]
+        }, gm);
+        for ir in 4..=43usize {
+            for iz in 4..=43usize {
+                u[g.gidx(iz as isize, ir as isize)] = ambient_cons(&amb, gm);
+            }
+        }
+        let (m0, pz0, pr0, e0) = totals(&u, &g, &old);
+        let mut ledger = FlipLedger::default();
+        apply_geometry_change(&mut u, &g, &old, &new, &gas(), &amb, &mut ledger);
+        let (m1, pz1, pr1, e1) = totals(&u, &g, &new);
+        // No opened cell may sit at ambient: the shallowest interior fluid
+        // pressure around the block is ~1.0, ambient is 0.02, and the BFS
+        // mean can never cross below the neighbourhood minimum.
+        for ir in 4..=43usize {
+            for iz in 4..=43usize {
+                let c = u[g.gidx(iz as isize, ir as isize)];
+                let w = cons_to_prim(c, gm);
+                assert!(w[3] > 0.5, "({iz}, {ir}) left near ambient: p = {}", w[3]);
+                assert_eq!(c[1], 0.0, "({iz}, {ir}) not at rest");
+                assert_eq!(c[2], 0.0, "({iz}, {ir}) not at rest");
+            }
+        }
+        assert!(((m1 - m0) - ledger.mass).abs() <= 1e-12 * m0.max(1.0), "T2 invariant (mass)");
+        assert!(((pz1 - pz0) - ledger.momentum_z).abs() <= 1e-12 * pz0.abs().max(1.0),
+                "T2 invariant (z-momentum)");
+        assert!(((pr1 - pr0) - ledger.momentum_r).abs() <= 1e-12 * pr0.abs().max(1.0),
+                "T2 invariant (r-momentum)");
+        assert!(((e1 - e0) - ledger.energy).abs() <= 1e-12 * e0.max(1.0), "T2 invariant (energy)");
     }
 }
