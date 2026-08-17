@@ -62,6 +62,68 @@ const AMBER: Color32 = Color32::from_rgb(235, 170, 45);
 const RED: Color32 = Color32::from_rgb(235, 90, 80);
 const GREEN: Color32 = Color32::from_rgb(90, 200, 120);
 
+/// Decimal places the ε and p₀ sliders keep.
+///
+/// **These are correctness values, not cosmetics.** An `egui::Slider` rounds
+/// the value it is given to its own decimal count on the FIRST frame it is
+/// drawn, before any user interaction — `Slider::add_contents` opens with
+/// `if clamping == Always { self.set_value(old_value) }`, and `set_value`
+/// applies `round_to_decimals(value, max_decimals)`. The rounded value is then
+/// written back through the `&mut` and the response is marked `changed()`.
+///
+/// So a slider with fewer decimals than a preset needs silently rewrites that
+/// preset the moment it appears, and every "did the user edit this?" test
+/// downstream sees a change nobody made. At one decimal that hit the V-2
+/// (ε 2.83 → 2.8), the Redstone (ε 3.61 → 3.6) and the AJ10-190 (p₀ 0.86 →
+/// 0.9 MPa): each reverted to Custom on selection and — worse — was solved at
+/// the rounded value. Two decimals covers every preset in the table, and
+/// `slider_precision_preserves_every_preset` fails the build if a new preset
+/// ever needs a third.
+const AREA_RATIO_DECIMALS: usize = 2;
+const P0_MPA_DECIMALS: usize = 2;
+
+/// Which named engine the current case is based on, and whether the user has
+/// edited away from it.
+///
+/// A preset is still applied whole — but an edit afterwards no longer erases
+/// which engine it started from. Losing the name on the first slider nudge
+/// threw away the one piece of context that makes the readouts legible ("this
+/// is the F-1, at a different ε"), and it made the accidental rewrite above
+/// invisible: a preset that silently reverted to Custom looked exactly like a
+/// preset the user had adjusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct PresetSelection {
+    /// Index into `case::PRESETS`; `None` is the custom/demo case.
+    base: Option<usize>,
+    /// The user has changed something the preset set.
+    modified: bool,
+}
+
+impl PresetSelection {
+    fn select(base: Option<usize>) -> Self {
+        PresetSelection { base, modified: false }
+    }
+
+    /// The preset this case IS, exactly — `None` once anything has been
+    /// edited. Everything that makes a claim about the named engine (the
+    /// contour-source label, the §13 rule withholding absolute thrust) must
+    /// go through this, never through `base`: a modified V-2 is not the V-2,
+    /// and the honesty surface has to keep saying so.
+    fn exact(self) -> Option<usize> {
+        if self.modified {
+            None
+        } else {
+            self.base
+        }
+    }
+
+    /// Record a user edit. A no-op on the custom case, which has no preset to
+    /// diverge from.
+    fn mark_modified(&mut self) {
+        self.modified = self.base.is_some();
+    }
+}
+
 /// Selector order = keys 1..8. Schlieren first per the brief.
 const FIELD_KEYS: [(Key, FieldKind, &str); 8] = [
     (Key::Num1, FieldKind::Schlieren, "Schlieren"),
@@ -81,9 +143,10 @@ pub struct CfdApp {
     frame_gen: u64,
 
     params: CaseParams,
-    /// Index into `case::PRESETS`; `None` is the custom/demo case. Touching
-    /// any slider or the wall editor clears it — a preset is all-or-nothing.
-    preset: Option<usize>,
+    /// The named engine this case is based on, and whether it has been edited.
+    /// A preset is still applied whole; touching a slider or the wall editor
+    /// afterwards marks it Modified rather than erasing which engine it was.
+    preset: PresetSelection,
     /// Re-lock the colorbar ranges after a rebuild: a preset or p₀ change
     /// can move the reference scales by 35×, and ranges locked to the old
     /// scales display as a solid color. Two stages — `relock_pending` is set
@@ -199,7 +262,7 @@ impl CfdApp {
             ui_cells_per_rt: params.cells_per_rt,
             ui_dz_over_dr: params.dz_over_dr,
             params,
-            preset: None,
+            preset: PresetSelection::default(),
             relock_pending: false,
             relock_armed: false,
             floors_seen: 0,
@@ -287,9 +350,11 @@ impl CfdApp {
                 self.ui_tick,
             ));
             // The shape did not move, so the solver's geometry is unchanged;
-            // what changed is the provenance, which the report reads.
+            // what changed is the provenance, which the report reads. The base
+            // preset keeps its name for context; `exact()` is what stops
+            // anything claiming this drawing IS that engine.
             self.wall_kind = None;
-            self.preset = None;
+            self.preset.mark_modified();
         }
     }
 
@@ -348,7 +413,13 @@ impl CfdApp {
             }
         }
         self.committed_wall = self.wall.editor().polyline().to_vec();
-        self.preset = None; // a hand-tuned wall is no named engine
+        // A hand-tuned wall is an EDIT, not a new engine. main's
+        // `PresetSelection` says this better than the `preset = None` that was
+        // here: the base preset stays named so the readouts keep their context,
+        // while `exact()` returns None so nothing — the contour-source label,
+        // the §13 rule withholding absolute thrust — goes on claiming this IS
+        // that engine. A modified RS-25 is not RS-25.
+        self.preset.mark_modified();
         self.wall_fallback = None;
         // Mid-run edits rasterize onto the solver's CURRENT (graded) grid —
         // that is the cheap-to-overwrite-mask property the sandbox rests on.
@@ -371,7 +442,7 @@ impl CfdApp {
     fn regenerate_contour(&mut self) {
         self.pending_regen = false;
         if self.params.area_ratio != self.ui_area_ratio {
-            self.preset = None; // partial change: no longer the named engine
+            self.preset.mark_modified();
         }
         self.params.area_ratio = self.ui_area_ratio;
         let wall = nozzle_contour(&self.params);
@@ -387,7 +458,7 @@ impl CfdApp {
     /// control rebuilds the solver and discards the field.
     fn rebuild_solver(&mut self) {
         if self.params.p0_pa != self.ui_p0_mpa * 1e6 {
-            self.preset = None; // partial change: no longer the named engine
+            self.preset.mark_modified();
         }
         self.params.p0_pa = self.ui_p0_mpa * 1e6;
         let setup = make_setup(&self.params, &self.committed_wall);
@@ -422,7 +493,7 @@ impl CfdApp {
     /// it is a mode, not an altitude.
     fn apply_preset(&mut self, preset: Option<usize>) {
         self.pending_preset = None;
-        self.preset = preset;
+        self.preset = PresetSelection::select(preset);
         let vac = self.params.vacuum;
         self.params = match preset {
             Some(i) => PRESETS[i].case(PRESETS[i].default_altitude_m(), vac),
@@ -491,6 +562,10 @@ impl CfdApp {
             return;
         }
         self.mem_confirm = false;
+        // Domain extents and mesh resolution are things a preset sets, so
+        // changing them is an edit to it like any other. (The early return
+        // above has already established that something actually changed.)
+        self.preset.mark_modified();
         self.params = cand;
         self.cost_cache = None;
         // The mesh sets the chord tolerance, so a resolution change re-sizes
@@ -988,17 +1063,17 @@ impl CfdApp {
         ui.heading("Engine");
         ui.horizontal_wrapped(|ui| {
             let r = ui
-                .selectable_label(self.preset.is_none(), "Custom")
+                .selectable_label(self.preset.base.is_none(), "Custom")
                 .on_hover_text(
-                    "The demo case (docs §6). Moving any slider while a named \
-                     engine is selected also lands here — a preset is applied \
-                     whole or not at all.",
+                    "The demo case (docs §6). A preset is still applied whole \
+                     or not at all — but editing one no longer lands here: it \
+                     stays on the engine it started from and is flagged \
+                     MODIFIED.",
                 );
-            // `is_some()` alone left this button inert after a break — the
-            // break clears the preset, so "Custom" matched the current state
-            // and did nothing, removing the demo case as an escape from
-            // sandbox mode.
-            if r.clicked() && (self.preset.is_some() || self.wall.is_freeform()) {
+            // `base.is_some()` alone leaves this inert after a break to
+            // freeform, which clears nothing on `PresetSelection` — the demo
+            // case has to stay reachable as the escape from sandbox mode.
+            if r.clicked() && (self.preset.base.is_some() || self.wall.is_freeform()) {
                 self.request_preset(None);
             }
             for i in 0..PRESETS.len() {
@@ -1008,10 +1083,21 @@ impl CfdApp {
                 } else {
                     p.name.to_string()
                 };
-                let r = ui
-                    .selectable_label(self.preset == Some(i), label)
-                    .on_hover_text(&self.preset_tips[i]);
-                if r.clicked() && self.preset != Some(i) {
+                let selected = self.preset.base == Some(i);
+                let mut tip = self.preset_tips[i].clone();
+                if selected && self.preset.modified {
+                    tip.push_str("\n\nMODIFIED — click again to restore this preset.");
+                }
+                let r = ui.selectable_label(selected, label).on_hover_text(tip);
+                // Re-clicking the selected preset is a no-op UNLESS it has
+                // been edited, in which case it is how you get back to the
+                // engine as published. Without this the only route back was
+                // via another preset and then this one.
+                // Re-clicking the selected preset is a no-op UNLESS it has
+                // been edited, in which case it is how you get back to the
+                // engine as published — and it goes through `request_preset`,
+                // because on a drawn wall that restore discards the drawing.
+                if r.clicked() && (!selected || self.preset.modified) {
                     self.request_preset(Some(i));
                 }
             }
@@ -1020,13 +1106,21 @@ impl CfdApp {
         // are: no manufacturer publishes combustion-gas properties per
         // engine, so these are propellant-class values, not measurements.
         let mw = R_UNIVERSAL_SI / self.params.r_specific_si;
-        let head = match self.preset {
+        // The base engine keeps its name after an edit — that context is the
+        // point of the Modified flag — but the name alone would now overclaim,
+        // so it is qualified in the same breath.
+        let head = match self.preset.base {
+            Some(i) if self.preset.modified => {
+                format!("{} (modified) · {}", PRESETS[i].name, PRESETS[i].propellant)
+            }
             Some(i) => format!("{} · {}", PRESETS[i].name, PRESETS[i].propellant),
             None => "custom gas".to_string(),
         };
         // What was PRODUCED, not what was asked for: on a rejected spec the
-        // wall is the fallback cone and `wall_kind` says so.
-        let source = match self.preset {
+        // wall is the fallback cone and `wall_kind` says so. Keyed on `exact`,
+        // not `base`: "p₀/ε published" is a claim about THIS nozzle, and it
+        // stops being true the moment ε is dragged.
+        let source = match self.preset.exact() {
             Some(i) => format!(" — {}", PRESETS[i].bell_source),
             None => String::new(),
         };
@@ -1053,7 +1147,7 @@ impl CfdApp {
         };
         ui.label(
             RichText::new(format!(
-                "{head} · r_t {:.0} mm · ε {:.1} · {contour_desc}",
+                "{head} · r_t {:.0} mm · ε {:.2} · {contour_desc}",
                 self.params.r_throat_m * 1e3,
                 self.params.area_ratio
             ))
@@ -1062,6 +1156,24 @@ impl CfdApp {
         );
         self.handle_readout(ui);
         self.wall_state_notices(ui);
+        // The Modified flag itself, where it cannot be missed. Amber, not
+        // weak grey: it changes what the numbers below mean.
+        if self.preset.modified {
+            if let Some(i) = self.preset.base {
+                ui.label(
+                    RichText::new("MODIFIED — edited away from the preset").small().color(AMBER),
+                )
+                .on_hover_text(format!(
+                    "This case started as {} but something the preset sets — ε, \
+                     p₀, the wall, or the domain — has been changed. The gas \
+                     model and any unedited parameters are still the preset's, \
+                     which is why it keeps the name; but this is no longer that \
+                     engine, so nothing here is presented as being about it. \
+                     Click {} again to restore it.",
+                    PRESETS[i].name, PRESETS[i].name
+                ));
+            }
+        }
         // Honesty flag: the wall on screen is not the wall that was asked for.
         // eprintln! into a windowed app's stdout is not a disclosure.
         if let Some(why) = &self.wall_fallback {
@@ -1308,7 +1420,11 @@ impl CfdApp {
         let r = ui.add(
             egui::Slider::new(&mut self.ui_area_ratio, ar_min..=ar_max)
                 .text("Area ratio ε")
-                .fixed_decimals(1),
+                // Two decimals, and NOT `fixed_decimals(1)` — see
+                // AREA_RATIO_DECIMALS. One decimal silently rewrote the V-2's
+                // 2.83 to 2.8 on the frame the preset was selected.
+                .min_decimals(1)
+                .max_decimals(AREA_RATIO_DECIMALS),
         );
         if r.drag_stopped() || (r.changed() && !r.dragged()) {
             self.request_regenerate();
@@ -1319,7 +1435,10 @@ impl CfdApp {
         let r = ui.add(
             egui::Slider::new(&mut self.ui_p0_mpa, 0.5..=p0_max)
                 .text("Chamber p₀ [MPa]")
-                .fixed_decimals(1),
+                // As above: one decimal rounded the AJ10-190's 0.86 MPa to
+                // 0.9 and rebuilt the solver at that pressure.
+                .min_decimals(1)
+                .max_decimals(P0_MPA_DECIMALS),
         );
         if r.drag_stopped() || (r.changed() && !r.dragged()) {
             self.rebuild_solver();
@@ -1437,7 +1556,12 @@ impl CfdApp {
                     // displayed for a named real engine — this model has no
                     // boundary layer, chemistry or divergence correction to
                     // defend such a number. C_f below is the honest ratio.
-                    if self.preset.is_some() {
+                    // `exact`, not `base`: the rule protects claims about a
+                    // real engine. Once the case has been edited it is no
+                    // longer that engine and thrust is shown, exactly as it
+                    // was before the Modified flag existed (an edit used to
+                    // drop the selection to Custom outright).
+                    if self.preset.exact().is_some() {
                         ui.monospace("—");
                         ui.label(
                             RichText::new(format!(
@@ -2143,6 +2267,104 @@ mod tests {
     const SIGNED: FieldKind = FieldKind::VelocityZ;
     const UNSIGNED: FieldKind = FieldKind::Mach;
 
+    /// THE REGRESSION TEST for the preset-reverts-to-Custom bug.
+    ///
+    /// An `egui::Slider` rounds the value handed to it to its own decimal
+    /// count on the first frame it is drawn, before the user has touched
+    /// anything, and marks the response `changed()` when that alters the
+    /// value. Everything downstream then believes the user made an edit: the
+    /// selection dropped to Custom, and the case was rebuilt at the ROUNDED
+    /// number — the V-2 solved at ε 2.8 instead of 2.83, the AJ10-190 at
+    /// 0.9 MPa instead of 0.86.
+    ///
+    /// This calls `emath::round_to_decimals` — the very function
+    /// `Slider::set_value` calls — rather than reimplementing the rounding,
+    /// so it cannot drift from egui's behaviour while still passing. If a new
+    /// preset needs a decimal the slider does not keep, this fails here
+    /// instead of silently mis-solving in the GUI.
+    #[test]
+    fn slider_precision_preserves_every_preset() {
+        use egui::emath::round_to_decimals;
+        for p in PRESETS.iter() {
+            for (what, value, decimals) in [
+                ("area ratio", p.area_ratio, AREA_RATIO_DECIMALS),
+                ("p0 [MPa]", p.p0_pa / 1e6, P0_MPA_DECIMALS),
+            ] {
+                let rounded = round_to_decimals(value, decimals);
+                assert_eq!(
+                    rounded, value,
+                    "{}: the {what} slider keeps {decimals} decimals and would rewrite \
+                     {value} to {rounded} on the first frame — the preset would revert to \
+                     Custom AND be solved at the rounded value. Raise the slider's decimals \
+                     (do not round the preset).",
+                    p.name
+                );
+            }
+        }
+    }
+
+    /// The precision guard has to be able to fail, or it is only asserting
+    /// that today's presets happen to be round numbers. One decimal is what
+    /// the sliders used to carry, and it is exactly what broke the V-2, the
+    /// Redstone and the AJ10-190.
+    #[test]
+    fn one_decimal_would_have_caught_the_reverting_presets() {
+        use egui::emath::round_to_decimals;
+        let mut mangled: Vec<&str> = Vec::new();
+        for p in PRESETS.iter() {
+            if round_to_decimals(p.area_ratio, 1) != p.area_ratio
+                || round_to_decimals(p.p0_pa / 1e6, 1) != p.p0_pa / 1e6
+            {
+                mangled.push(p.name);
+            }
+        }
+        // Exactly three, and the two the bug was reported against are two of
+        // them. The AJ10-190 is the one that predates this work order — its
+        // 0.86 MPa has been rounding to 0.9 for as long as the p₀ slider has
+        // existed. Note what is NOT here: the Thor's 4.10 MPa is the same f64
+        // as 4.1 and was never affected, so "has two decimals written down"
+        // is not the same question as "loses precision at one".
+        assert_eq!(
+            mangled,
+            ["AJ10-190", "V-2 (A-4) Model 39", "Redstone NAA 75-110-A-7"],
+            "these are the presets a one-decimal slider silently rewrites"
+        );
+    }
+
+    #[test]
+    fn a_preset_edit_keeps_the_engine_and_raises_the_modified_flag() {
+        // Selecting a preset is pristine: it IS that engine.
+        let mut s = PresetSelection::select(Some(3));
+        assert_eq!(s.base, Some(3));
+        assert!(!s.modified);
+        assert_eq!(s.exact(), Some(3), "an untouched preset is exactly itself");
+
+        // An edit keeps the name but stops the case claiming to BE it.
+        s.mark_modified();
+        assert_eq!(s.base, Some(3), "the engine it started from is not lost");
+        assert!(s.modified);
+        assert_eq!(
+            s.exact(),
+            None,
+            "a modified preset must not be presented as the named engine"
+        );
+        // Marking twice is idempotent.
+        s.mark_modified();
+        assert_eq!(s, PresetSelection { base: Some(3), modified: true });
+
+        // Re-selecting the same preset restores it — the route back that the
+        // old drop-to-Custom behaviour left the user without.
+        assert_eq!(PresetSelection::select(Some(3)).exact(), Some(3));
+
+        // The custom case has no preset to diverge from, so editing it is not
+        // a "modification" of anything and must never render the flag.
+        let mut custom = PresetSelection::select(None);
+        custom.mark_modified();
+        assert_eq!(custom, PresetSelection::default());
+        assert!(!custom.modified);
+        assert_eq!(custom.exact(), None);
+    }
+
     #[test]
     fn lock_range_applies_the_style_guide_rules() {
         // Schlieren is pinned regardless of what the frame reports.
@@ -2480,8 +2702,10 @@ mod wall_state_tests {
             assert!(!a.wall.is_freeform(), "handle {i} raised the badge");
             assert!(a.wall_kind.is_some(), "handle {i} blanked the contour kind");
         }
-        // The preset name is cleared, though — a hand-tuned wall is no engine.
-        assert_eq!(a.preset, None);
+        // The name survives for context, but `exact()` — which every claim
+        // about the named engine goes through — does not.
+        assert!(a.preset.modified || a.preset.base.is_none());
+        assert_eq!(a.preset.exact(), None, "a hand-tuned wall is not that engine");
 
         a.break_to_freeform();
         assert!(a.wall.is_freeform());
