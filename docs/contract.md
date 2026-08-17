@@ -489,21 +489,138 @@ impl WallProfile {
     pub fn validate(&self) -> Result<()>;
 }
 
+/// THE CURVE. `NozzleSpec` plus the one shape parameter that has no home on it.
+/// chamber_len_rt lives HERE and not on NozzleSpec because nine test files across
+/// three crates build NozzleSpec as a struct literal with no ..rest.
+pub struct NozzleCurve { pub spec: NozzleSpec, pub chamber_len_rt: f64 }   // CHAMBER_LEN_RT = 2.0
+impl NozzleCurve {
+    pub fn new(spec: NozzleSpec) -> Self;          // the 2 r_t chamber straight
+    pub fn validate(&self) -> Result<()>;
+    /// Stricter than validate(): the SHAPE must also close and stay monotone.
+    /// This is what the handle drag clamp bisects against.
+    pub fn feasible(&self) -> Result<()>;
+    pub fn pieces(&self) -> Result<Vec<Piece>>;    // Line | ThroatArc | Bezier, r_t
+    pub fn bell(&self) -> Result<BellGeometry>;    // N, Q, E; Err for a cone
+    pub fn control_polygon(&self) -> Option<[[f64; 2]; 3]>;   // dashed N-Q-E, r_t
+    pub fn throat_z_rt(&self) -> f64;
+    pub fn divergent_len_rt(&self) -> Result<f64>;
+    pub fn length_m(&self) -> Result<f64>;
+    pub fn length_fraction(&self) -> f64;          // of the H&H 15 deg reference cone
+    /// ANALYTIC queries — no tessellation bias. Anything that reports a wall
+    /// angle reads these, never a chord slope of the polyline.
+    pub fn radius_at(&self, z_m: f64) -> Option<f64>;
+    pub fn tangent_at(&self, z_m: f64) -> Option<[f64; 2]>;   // unit, downstream
+    pub fn divergent_angles_deg(&self) -> Result<(f64, f64)>; // (theta_n, theta_e)
+    pub fn exit_angle_deg(&self) -> Result<f64>;
+    pub fn max_wall_angle_deg(&self) -> Result<f64>;
+    /// Adaptive tessellation, sized to the MESH. Chord tolerance is RADIAL
+    /// (the rasterizer integrates area under the polyline, so an area error is
+    /// the integral of |dr| dz).
+    pub fn tessellate(&self, t: &Tessellation) -> Result<WallProfile>;
+    /// The pre-curve fixed-sample loops, frozen bit-identical. cfd-core's
+    /// ladder and diagnostics call this through generate_contour; guarded by
+    /// cfd-geom/tests/golden_contour.rs. Do not change its output without
+    /// re-running the full ladder.
+    pub fn tessellate_fixed(&self, samples: usize) -> Result<WallProfile>;
+    // Handles — see the handle model below.
+    pub fn handles(&self) -> Result<Vec<Handle>>;
+    pub fn drag_handle(&self, id: HandleId, folded_rt: [f64; 2]) -> DragOutcome;
+}
+
+/// N, Q, E of a bell's diverging section, r_t, z FROM THE THROAT. Q is DERIVED —
+/// the intersection of the two tangent lines — and has zero remaining freedom.
+pub struct BellGeometry { pub n: [f64;2], pub q: [f64;2], pub e: [f64;2],
+                          pub theta_n_deg: f64, pub theta_e_deg: f64 }
+impl BellGeometry {
+    /// Both §10 guards live here: theta_n > theta_e, and N_z < Q_z < E_z with a
+    /// message naming which direction is infeasible ("too long" / "too short").
+    pub fn solve(r2: f64, re: f64, l_n: f64, tn_deg: f64, te_deg: f64) -> Result<Self>;
+}
+
+pub enum Piece {
+    Line { a: [f64;2], b: [f64;2] },
+    /// z = z_t + sign*R*sin(phi), r = 1 + R*(1-cos(phi)); parameterized by WALL
+    /// ANGLE, which is what makes tangency automatic.
+    ThroatArc { z_t: f64, radius: f64, sign: f64, phi0: f64, phi1: f64 },
+    Bezier { n: [f64;2], q: [f64;2], e: [f64;2] },
+}
+impl Piece {
+    pub fn point_at(&self, t: f64) -> [f64; 2];
+    pub fn start(&self) -> [f64; 2];
+    pub fn end(&self) -> [f64; 2];
+    pub fn turn(&self) -> f64;                         // total wall-angle change, rad
+    pub fn is_straight(&self) -> bool;
+    pub fn min_segments(&self) -> usize;               // 1 straight, 2 curved
+    pub fn segments(&self, tol_rt: f64, max_turn_deg: f64) -> usize;
+    pub fn radius_at(&self, z_rt: f64) -> Option<f64>;
+    pub fn tangent_at(&self, z_rt: f64) -> [f64; 2];
+}
+
+pub struct Tessellation { pub chord_tol_m: f64, pub max_turn_deg: f64, pub max_points: usize }
+impl Tessellation {
+    pub const MAX_TURN_DEG: f64 = 2.0;
+    pub const MAX_POINTS: usize = 4096;
+    pub const TOL_FRACTION: f64 = 0.01;
+    pub fn from_cell_size(dz_m: f64, dr_m: f64) -> Self;   // tol = 1% of min(dz, dr)
+}
+
+// ---- the handle model. NO PIXELS: anchors in r_t, tangent DIRECTIONS; cfd-ui
+// places the dot at a fixed pixel offset. All world coordinates in and out are
+// in the FOLDED frame (r >= 0) — the canvas mirrors about the axis, and an
+// angle computed from cursor-minus-anchor on the mirrored copy INVERTS.
+pub enum HandleId { ChamberRadius, ChamberEnd, ConvergeAngle, ThroatArcUp,
+                    ThroatArcDown, ThetaN, ThetaE, ExitLip, ControlPoint }
+impl HandleId { pub fn label(self) -> &'static str; }
+pub enum HandleKind { Point, Tangent { dir: [f64; 2] }, Derived }
+pub struct Handle { pub id: HandleId, pub kind: HandleKind, pub anchor: [f64; 2],
+                    pub value: f64, pub unit: &'static str, pub pickable: bool }
+/// Always a VALID curve. `clamped` carries the generator's own rejection message
+/// when the drag stopped short — the guard is a per-handle bisection clamp, NOT
+/// an error, because an error drops the app to the fallback cone and the user's
+/// nozzle vanishes mid-drag.
+pub struct DragOutcome { pub curve: NozzleCurve, pub clamped: Option<String> }
+// Nine handles for a bell (eight pickable + the derived Q), six for a cone.
+// ExitLip carries TWO degrees of freedom: area ratio radially, and axially the
+// bell length fraction or the cone half-angle (bisected — L_n(alpha) has no
+// closed-form inverse). drag_handle refuses to bisect from a curve that is
+// already infeasible, and reports why rather than returning it.
+// A ThetaN or ThetaE drag converts ParabolicBell -> DirectBell: a hand-set wall
+// angle is no longer a (area ratio, bell percent) table lookup.
+
+/// Fixed-sample entry point. `NozzleCurve::tessellate_fixed` under a different
+/// name, kept for cfd-core's ladder and diagnostics.
 pub fn generate_contour(spec: &NozzleSpec, samples: usize) -> Result<WallProfile>;
 pub fn rao_angles(area_ratio: f64, bell_percent: f64) -> (f64, f64);
 
 /// EXACT sub-cell area fractions. Point sampling is unacceptable.
 pub fn rasterize(p: &WallProfile, g: &Grid, refs: &RefScales) -> Result<SolidField>;
 
-/// Editor data model. No egui dependency.
-pub struct Editor { /* control points, selection, hit radius */ }
-impl Editor {
-    pub fn from_profile(p: &WallProfile) -> Self;
-    pub fn to_profile(&self) -> Result<WallProfile>;
+/// FREEFORM (drawn) wall editor. No egui dependency. The merge of the old
+/// cfd_geom::Editor (which had the validation gate but no idea the domain had
+/// edges) and cfd_ui::StubEditor (which had the domain clamp and endpoint
+/// protection but no gate) — neither was a superset, so the bounds the app used
+/// to hard-code are now INJECTED and the two are one type. Units are the
+/// caller's; cfd-ui passes r_t.
+pub struct FreeformBounds { pub lz: f64, pub lr: f64, pub r_min: f64,
+                            pub r_margin: f64, pub z_gap: f64 }
+impl FreeformBounds {
+    pub const R_MIN: f64 = 0.15;      // keep the wall off the axis
+    pub const R_MARGIN: f64 = 1.5;    // keep it clear of the radial sponge
+    pub const Z_GAP: f64 = 1e-3;
+    pub fn for_domain(lz: f64, lr: f64) -> Self;
+}
+pub struct FreeformEditor { /* points, selection, bounds */ }
+impl FreeformEditor {
+    pub fn new(points: Vec<[f64; 2]>, bounds: FreeformBounds) -> Self;
+    pub fn points(&self) -> &[[f64; 2]];
+    pub fn selection(&self) -> Option<usize>;
+    pub fn bounds(&self) -> FreeformBounds;
+    pub fn set_bounds(&mut self, bounds: FreeformBounds);
     pub fn hit_test(&self, world: [f64; 2], tol: f64) -> Option<usize>;
     pub fn drag(&mut self, i: usize, world: [f64; 2]);
-    pub fn insert(&mut self, world: [f64; 2]);
-    pub fn remove(&mut self, i: usize);
+    pub fn insert(&mut self, world: [f64; 2]) -> usize;
+    pub fn remove(&mut self, i: usize) -> bool;   // endpoints protected, min 3 points
+    pub fn to_profile(&self) -> Result<WallProfile>;   // gate + throat = argmin r
 }
 ```
 
