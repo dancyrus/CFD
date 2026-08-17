@@ -1,6 +1,6 @@
 {
-  "commit": "31c47bc0381cad0c054b0e580e4e045f94e961ec",
-  "timestamp": "2026-08-17T02:04:17Z",
+  "commit": "260b6c59d6603270c805349c148f9dad85c36676",
+  "timestamp": "2026-08-17T02:34:58Z",
   "machine": "intel-xeon-4c",
   "tests": [
     {"id":"throat-derivation-round-trip","name":"shipped r_t vs re-deriving it from published thrust and the preset's own gas","expected":"<= 0.5%","actual":0.12398082653133358,"units":"worst |deviation| % (WAC Corporal 38ALDW-1500)","pass":true},
@@ -16,14 +16,14 @@
     {"id":"frozen-cstar-rust-vs-python","name":"cstar_ideal (Rust) vs cstar_frozen (tools/propellant_cea.py) over all eight cases","expected":"< 1e-5","actual":0.0000003926163597567367,"units":"max relative difference","pass":true}
   ],
   "benchmarks": [
-    {"case":"V-2 (A-4) Model 39 (eps 2.83, p0 1.572 MPa, 0 km)","setting":"15° cone, preset domain, 20 cells/r_t","cells":19740,"steps_per_sec":288.4989261469891,"seconds_to_steady":18.2181889354},
-    {"case":"WAC Corporal 38ALDW-1500 (eps 5, p0 2.068 MPa, 0 km)","setting":"15° cone, preset domain, 20 cells/r_t","cells":24924,"steps_per_sec":233.01198532377924,"seconds_to_steady":25.2809789438},
-    {"case":"Redstone NAA 75-110-A-7 (eps 3.61, p0 2.193 MPa, 0 km)","setting":"15° cone, preset domain, 20 cells/r_t","cells":21244,"steps_per_sec":288.66990861756835,"seconds_to_steady":20.019866022400002},
-    {"case":"Thor LR79-NA-7 (MB-1) (eps 8, p0 4.100 MPa, 0 km)","setting":"80% Rao bell, preset domain, 20 cells/r_t","cells":32058,"steps_per_sec":202.04760620643532,"seconds_to_steady":35.482101997},
-    {"case":"Titan I LR87-AJ-3 (1 of 2) (eps 8, p0 4.000 MPa, 0 km)","setting":"80% Rao bell, preset domain, 20 cells/r_t","cells":32058,"steps_per_sec":205.86453972474766,"seconds_to_steady":35.388948939},
-    {"case":"Titan I LR91-AJ-3 (eps 25, p0 4.500 MPa, 12 km)","setting":"75% Rao bell, preset domain, 20 cells/r_t","cells":64025,"steps_per_sec":106.41627220889457,"seconds_to_steady":95.4961385034},
-    {"case":"Atlas LR89-5 booster (1 of 2) (eps 8, p0 3.999 MPa, 0 km)","setting":"80% Rao bell, preset domain, 20 cells/r_t","cells":32058,"steps_per_sec":192.38463565479336,"seconds_to_steady":36.8121403392},
-    {"case":"Atlas LR105-5 sustainer (eps 25, p0 4.799 MPa, 10 km)","setting":"80% Rao bell, preset domain, 20 cells/r_t","cells":65325,"steps_per_sec":104.9844984026048,"seconds_to_steady":96.68506924059999}
+    {"case":"V-2 (A-4) Model 39 (eps 2.83, p0 1.572 MPa, 0 km)","setting":"15° cone, preset domain, 20 cells/r_t","cells":19740,"steps_per_sec":292.0867841429898,"seconds_to_steady":18.0558488924},
+    {"case":"WAC Corporal 38ALDW-1500 (eps 5, p0 2.068 MPa, 0 km)","setting":"15° cone, preset domain, 20 cells/r_t","cells":24924,"steps_per_sec":240.55470444574837,"seconds_to_steady":25.3732818694},
+    {"case":"Redstone NAA 75-110-A-7 (eps 3.61, p0 2.193 MPa, 0 km)","setting":"15° cone, preset domain, 20 cells/r_t","cells":21244,"steps_per_sec":264.33124052351354,"seconds_to_steady":21.003915470800003},
+    {"case":"Thor LR79-NA-7 (MB-1) (eps 8, p0 4.100 MPa, 0 km)","setting":"80% Rao bell, preset domain, 20 cells/r_t","cells":32058,"steps_per_sec":188.1176829068833,"seconds_to_steady":35.7049889088},
+    {"case":"Titan I LR87-AJ-3 (1 of 2) (eps 8, p0 4.000 MPa, 0 km)","setting":"80% Rao bell, preset domain, 20 cells/r_t","cells":32058,"steps_per_sec":197.82737243534734,"seconds_to_steady":35.984897088400004},
+    {"case":"Titan I LR91-AJ-3 (eps 25, p0 4.500 MPa, 12 km)","setting":"75% Rao bell, preset domain, 20 cells/r_t","cells":64025,"steps_per_sec":108.87052763633946,"seconds_to_steady":94.5019884658},
+    {"case":"Atlas LR89-5 booster (1 of 2) (eps 8, p0 3.999 MPa, 0 km)","setting":"80% Rao bell, preset domain, 20 cells/r_t","cells":32058,"steps_per_sec":192.7252968935126,"seconds_to_steady":35.92745319},
+    {"case":"Atlas LR105-5 sustainer (eps 25, p0 4.799 MPa, 10 km)","setting":"80% Rao bell, preset domain, 20 cells/r_t","cells":65325,"steps_per_sec":111.32832970322674,"seconds_to_steady":94.07893229620001}
   ],
   "notes": [
     "V-2 (A-4) Model 39: shipped r_t 193.60 mm; re-deriving it here from the published thrust 244.7 kN at sea level with this preset's own gamma gives 193.64 mm (+0.02%). lambda 0.9830, eta_Cf 0.9877, Cf_ideal 1.3608. Implied mass flow at 95% c* efficiency is 119.21 kg/s -- RECORDED, NOT ASSERTED: the AEHS mass-flow column is the unreliable one (its LR89-5 row implies Isp 356 s against its own 248-282 column), which is precisely why the throat radii come from thrust rather than from mass flow.",
