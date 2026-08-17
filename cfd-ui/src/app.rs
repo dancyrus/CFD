@@ -80,7 +80,7 @@ const GREEN: Color32 = Color32::from_rgb(90, 200, 120);
 /// `slider_precision_preserves_every_preset` fails the build if a new preset
 /// ever needs a third.
 const AREA_RATIO_DECIMALS: usize = 2;
-const P0_MPA_DECIMALS: usize = 2;
+const P0_MPA_DECIMALS: usize = 3;
 
 /// Which named engine the current case is based on, and whether the user has
 /// edited away from it.
@@ -1193,6 +1193,12 @@ impl CfdApp {
         // bell is the end row's angles stretched to this exit radius. Merlin
         // Vac (ε = 165) lives above; the ε slider bottoms out at 2.0, below.
         // Measured-angle bells never touch the table, so they never flag.
+        // `rao_clamp_warning` fires at BOTH ends of the digitised table, and
+        // the low end is not hypothetical: the slider's bottom stop is below
+        // ε = 4, so any of the five historical bells can be dragged into the
+        // clamped region. Keeping the condition in `case` is what lets
+        // `rao_table_clamps_and_flags_symmetrically_at_both_ends` test the
+        // real one instead of a copy.
         if let Some((end, side)) = case::rao_clamp_warning(self.wall_kind, self.params.area_ratio) {
             ui.label(
                 RichText::new(format!(
@@ -2117,12 +2123,24 @@ fn preset_tooltip(p: &case::EnginePreset) -> String {
     // which class and what it implies, so the ideal c* is visible next to the
     // solver's measured mass flow instead of only in a results file.
     if let Some(class) = p.propellant_class {
+        let g = p.gas();
         s.push_str(&format!(
-            "\nγ/T₀/MW: {} equilibrium chamber (CEA, frozen γ) at this \
-             engine's O/F and p₀ — ideal c* {:.0} m/s.",
+            "\nγ/T₀/MW: {} equilibrium chamber (frozen γ) at this engine's \
+             O/F and p₀ — c* {:.0} m/s shifting-equilibrium, {:.0} m/s frozen. \
+             The throat radius was sized against the shifting figure; this \
+             solver reproduces the frozen one.",
             class.label(),
-            p.gas().cstar_ideal_m_s
+            g.cstar_shifting_m_s,
+            g.cstar_frozen_m_s
         ));
+    }
+    // Provenance, one line each, only where there is something to say. The six
+    // presets that predate this labelling carry empty strings and print
+    // nothing, which keeps their tooltips byte-identical.
+    for (what, src) in [("r_t", p.throat_source), ("p₀/ε", p.operating_source)] {
+        if !src.is_empty() {
+            s.push_str(&format!("\n{what}: {src}"));
+        }
     }
     if p.default_altitude_km > 0.0 {
         s.push_str(&format!(
@@ -2303,32 +2321,46 @@ mod tests {
         }
     }
 
-    /// The precision guard has to be able to fail, or it is only asserting
-    /// that today's presets happen to be round numbers. One decimal is what
-    /// the sliders used to carry, and it is exactly what broke the V-2, the
-    /// Redstone and the AJ10-190.
+    /// The precision guard has to be able to FAIL, or it is only asserting
+    /// that today's presets happen to be round numbers.
+    ///
+    /// Stated as minimality rather than as a fixed list of casualties: one
+    /// decimal fewer must break at least one preset. That keeps the guard live
+    /// as the table changes — and it did change. The historical presets landed
+    /// with three-decimal chamber pressures (1.572, 2.068, 2.193, 3.999,
+    /// 4.799 MPa) and the two-decimal slider that had been correct the day
+    /// before started silently rounding five of them; the sufficiency test
+    /// above caught it before it shipped, which is the whole point of having
+    /// written it.
     #[test]
-    fn one_decimal_would_have_caught_the_reverting_presets() {
+    fn slider_precision_is_minimal_so_the_guard_can_fail() {
         use egui::emath::round_to_decimals;
-        let mut mangled: Vec<&str> = Vec::new();
-        for p in PRESETS.iter() {
-            if round_to_decimals(p.area_ratio, 1) != p.area_ratio
-                || round_to_decimals(p.p0_pa / 1e6, 1) != p.p0_pa / 1e6
-            {
-                mangled.push(p.name);
-            }
+        for (what, decimals, get) in [
+            (
+                "area ratio",
+                AREA_RATIO_DECIMALS,
+                (|p: &case::EnginePreset| p.area_ratio) as fn(&case::EnginePreset) -> f64,
+            ),
+            ("p0 [MPa]", P0_MPA_DECIMALS, |p: &case::EnginePreset| p.p0_pa / 1e6),
+        ] {
+            let mangled: Vec<&str> = PRESETS
+                .iter()
+                .filter(|p| round_to_decimals(get(p), decimals - 1) != get(p))
+                .map(|p| p.name)
+                .collect();
+            assert!(
+                !mangled.is_empty(),
+                "the {what} slider keeps {decimals} decimals but {} would do: no preset needs \
+                 the last one, so this guard would pass even if the rounding bug came back. \
+                 Lower {what}'s decimal count, or add the preset that justifies it.",
+                decimals - 1
+            );
+            println!(
+                "{what}: {decimals} decimals is minimal — at {} these would be rewritten: {:?}",
+                decimals - 1,
+                mangled
+            );
         }
-        // Exactly three, and the two the bug was reported against are two of
-        // them. The AJ10-190 is the one that predates this work order — its
-        // 0.86 MPa has been rounding to 0.9 for as long as the p₀ slider has
-        // existed. Note what is NOT here: the Thor's 4.10 MPa is the same f64
-        // as 4.1 and was never affected, so "has two decimals written down"
-        // is not the same question as "loses precision at one".
-        assert_eq!(
-            mangled,
-            ["AJ10-190", "V-2 (A-4) Model 39", "Redstone NAA 75-110-A-7"],
-            "these are the presets a one-decimal slider silently rewrites"
-        );
     }
 
     #[test]
