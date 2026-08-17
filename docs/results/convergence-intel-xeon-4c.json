@@ -1,6 +1,6 @@
 {
-  "commit": "9909ac19a5b007e08bfecaf7b6640cc2bd2d7c3f",
-  "timestamp": "2026-08-17T02:10:40Z",
+  "commit": "645dfdc3e8fa36997f2a52b486b28665c9d628b3",
+  "timestamp": "2026-08-17T02:30:02Z",
   "machine": "intel-xeon-4c",
   "tests": [
     {"id":"C1-mean-plateau","name":"demo case, steps until converged: trailing-mean plateau (shipped criterion)","expected":"fires within 8000 steps","actual":4461,"units":"steps","pass":true},
