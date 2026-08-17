@@ -42,16 +42,6 @@ pub const CELLS_PER_RT_RANGE: (f64, f64) = (8.0, 160.0);
 pub const DZ_OVER_DR_RANGE: (f64, f64) = (1.0, 8.0);
 pub const LZ_RANGE: (f64, f64) = (20.0, 600.0);
 pub const LR_RANGE: (f64, f64) = (5.0, 100.0);
-/// Bottom stop of the area-ratio slider. Named because it is load-bearing for
-/// the Rao disclosure: it sits BELOW the digitised table's ε = 4 start, so any
-/// bell preset can be dragged into the clamped region and the app has to say
-/// so — the mirror of the ε > 100 case Merlin Vac already exercises. The top
-/// stop is not a constant; it stretches to hold whatever preset is selected.
-pub const AREA_RATIO_SLIDER_MIN: f64 = 2.0;
-/// The digitised Rao table's area-ratio range (`cfd_geom::rao_angles` clamps to
-/// it at BOTH ends rather than extrapolating). Outside it the bell angles are
-/// an end row stretched to the requested exit radius, which the UI discloses.
-pub const RAO_TABLE_EPS: std::ops::RangeInclusive<f64> = 4.0..=100.0;
 
 /// Altitude ceiling, docs/physics-reference.md §5: 58 km is where the
 /// thinnest ambient still clears the pressure floor for the highest-pressure
@@ -149,18 +139,21 @@ impl ContourKind {
 /// The §10 parametric family shared by both contours: 30° converging cone,
 /// contraction ratio 4, 1.5 r_t upstream arc, 0.382 r_t downstream arc, and
 /// the 15° cone half-angle the demo case and the bell's length reference use.
+/// Default cone half-angle: the §10 demo case's 15°. A per-case FIELD, not a
+/// constant, for the same reason as the four below — the cone's exit-lip handle
+/// carries the area ratio radially and this angle axially, so a const here
+/// meant every cone lip drag was silently reverted the moment it was committed.
 pub const CONE_HALF_ANGLE_DEG: f64 = 15.0;
-const CONTRACTION_RATIO: f64 = 4.0;
-const CONVERGE_HALF_ANGLE_DEG: f64 = 30.0;
-const THROAT_ARC_UP: f64 = 1.5;
+/// Defaults of the four §10 family parameters that used to be hard-coded
+/// consts and are now per-case fields — the parametric editor puts a handle on
+/// every one of them, so they cannot be constants any more.
+pub const CONTRACTION_RATIO: f64 = 4.0;
+pub const CONVERGE_HALF_ANGLE_DEG: f64 = 30.0;
+pub const THROAT_ARC_UP: f64 = 1.5;
+pub const CHAMBER_LEN_RT: f64 = cfd_geom::CHAMBER_LEN_RT;
 /// Downstream throat arc of the §10 family. Per-case since the direct-angle
 /// path exists: measured hardware comes with its own arc (Raptor 2, 0.300 r_t).
 pub const THROAT_ARC_DOWN: f64 = 0.382;
-/// Polyline density for the generated wall. At the coarsest preset grid the
-/// longest divergent section (Merlin Vac, ε = 165) spans ~230 axial cells;
-/// 256 samples keeps the piecewise-linear wall below the cell scale
-/// everywhere while the exact-fraction rasterizer stays cheap.
-const CONTOUR_SAMPLES: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CaseParams {
@@ -178,11 +171,23 @@ pub struct CaseParams {
     /// Downstream throat-arc radius in r_t. The §10 family value is 0.382;
     /// measured geometry brings its own (Raptor 2: 0.300).
     pub throat_arc_down: f64,
-    /// Divergent half-angle of a `Conical` contour, degrees. Per-case because
-    /// the app used to hard-code 15° and the contour audit found no source for
-    /// that number; handbook practice runs 12–18°. `CONE_HALF_ANGLE_DEG` is
-    /// still the default, and three of the historical presets genuinely are
-    /// 15° — but three data points are not a constant.
+    /// The rest of the §10 converging family, per-case since the parametric
+    /// editor puts a drag handle on each: chamber radius (as a contraction
+    /// ratio), converging half-angle, upstream throat arc, and the chamber
+    /// straight length in r_t.
+    pub contraction_ratio: f64,
+    pub converge_half_angle_deg: f64,
+    pub throat_arc_up: f64,
+    pub chamber_len_rt: f64,
+    /// Cone half-angle, for `ContourKind::Conical`. Ignored by the bells, which
+    /// carry their own wall angles.
+    ///
+    /// Per-case rather than a constant because the app used to hard-code 15°
+    /// and the contour audit found no source for that number; handbook
+    /// practice runs 12–18°. `CONE_HALF_ANGLE_DEG` is still the default, and
+    /// three of the historical presets genuinely are 15° — but three data
+    /// points are not a justification for a constant. The editor also drags
+    /// this directly (see `apply_curve`).
     pub cone_half_angle_deg: f64,
     pub altitude_m: f64,
     /// Labelled vacuum mode: back pressure fixed at `VACUUM_P_FRAC * p0`,
@@ -215,6 +220,10 @@ impl Default for CaseParams {
             contour_kind: ContourKind::Conical,
             bell_percent: 0.8,
             throat_arc_down: THROAT_ARC_DOWN,
+            contraction_ratio: CONTRACTION_RATIO,
+            converge_half_angle_deg: CONVERGE_HALF_ANGLE_DEG,
+            throat_arc_up: THROAT_ARC_UP,
+            chamber_len_rt: CHAMBER_LEN_RT,
             cone_half_angle_deg: CONE_HALF_ANGLE_DEG,
             altitude_m: 0.0,
             vacuum: false,
@@ -1018,6 +1027,13 @@ impl EnginePreset {
             contour_kind: self.contour_kind,
             bell_percent: self.bell_percent,
             throat_arc_down: self.throat_arc_down,
+            // Every shipped engine uses the §10 converging family; only the
+            // divergent section, the downstream arc and the cone half-angle
+            // are per-engine.
+            contraction_ratio: CONTRACTION_RATIO,
+            converge_half_angle_deg: CONVERGE_HALF_ANGLE_DEG,
+            throat_arc_up: THROAT_ARC_UP,
+            chamber_len_rt: CHAMBER_LEN_RT,
             cone_half_angle_deg: self.cone_half_angle_deg,
             altitude_m,
             vacuum,
@@ -1115,16 +1131,44 @@ pub fn separation_altitude_m(p: &CaseParams) -> Option<f64> {
     Some(0.5 * (lo + hi))
 }
 
+/// The Rao-table clamp disclosure: the digitised table runs ε = 4..100 and
+/// `rao_angles` CLAMPS at both ends rather than extrapolating, so outside that
+/// range the bell is the end row's angles stretched to this exit radius.
+/// Returns `(table end, wording)` when it applies.
+///
+/// Keyed on the PRODUCED contour kind, which is what makes a hand-tuned bell go
+/// quiet: a theta_n or theta_e drag converts the wall to `MeasuredBell`, whose
+/// angles came from the user and never touched the table, so a warning about
+/// table extrapolation would be describing a lookup that did not happen.
+pub fn rao_clamp_warning(kind: Option<ContourKind>, area_ratio: f64) -> Option<(f64, &'static str)> {
+    if kind != Some(ContourKind::ParabolicBell) || (4.0..=100.0).contains(&area_ratio) {
+        return None;
+    }
+    Some(if area_ratio > 100.0 {
+        (100.0, "ends at")
+    } else {
+        (4.0, "starts at")
+    })
+}
+
 /// A generated wall together with what it ACTUALLY is. The kind is not the
-/// request: when `generate_contour` rejects a spec the points are the fallback
-/// cone, and `kind` says `Conical` so the status line cannot go on claiming a
-/// bell over a cone. `fallback` carries the rejection message for the UI —
-/// `eprintln!` is invisible in a windowed app.
+/// request: when the curve rejects a spec the points are the fallback cone, and
+/// `kind` says `Conical` so the status line cannot go on claiming a bell over a
+/// cone. `fallback` carries the rejection message for the UI — `eprintln!` is
+/// invisible in a windowed app.
+///
+/// `curve` is the parametric wall the points were tessellated FROM, and it is
+/// the thing the editor edits and the report reads its angles off. `None` on
+/// the fallback path, where the points are the legacy sparse cone and no curve
+/// produced them. Carrying it here is what stops the polyline from having to
+/// stand in for the geometry: nothing downstream needs to infer a wall angle
+/// from a chord slope any more.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GeneratedWall {
     pub points: Vec<[f64; 2]>,
     pub kind: ContourKind,
     pub fallback: Option<String>,
+    pub curve: Option<cfd_geom::NozzleCurve>,
 }
 
 /// The `NozzleSpec` this case asks `cfd_geom` for. Split out of
@@ -1153,37 +1197,106 @@ pub fn nozzle_spec(p: &CaseParams) -> NozzleSpec {
     NozzleSpec {
         throat_radius_m: p.r_throat_m,
         area_ratio: p.area_ratio,
-        contraction_ratio: CONTRACTION_RATIO,
-        converge_half_angle_deg: CONVERGE_HALF_ANGLE_DEG,
-        throat_arc_up: THROAT_ARC_UP,
+        contraction_ratio: p.contraction_ratio,
+        converge_half_angle_deg: p.converge_half_angle_deg,
+        throat_arc_up: p.throat_arc_up,
         throat_arc_down: p.throat_arc_down,
         contour,
     }
 }
 
-/// The wall contour for this case as a polyline (z, r) in r_t units, from
-/// `cfd_geom::generate_contour` — the §10 15° cone, the Rao parabolic bell, or
-/// a measured-angle bell per `contour_kind`. `cfd_geom` speaks SI metres, so
-/// the spec is built with `r_throat_m` and the result divided back out.
+/// The parametric wall CURVE for this case: the spec above plus the one shape
+/// parameter that has no home on `NozzleSpec` (nine test files build that as a
+/// struct literal with no `..rest`).
+pub fn nozzle_curve(p: &CaseParams) -> cfd_geom::NozzleCurve {
+    cfd_geom::NozzleCurve {
+        spec: nozzle_spec(p),
+        chamber_len_rt: p.chamber_len_rt,
+    }
+}
+
+/// Pull an edited curve's shape back into the case — the inverse of
+/// [`nozzle_curve`], run when a handle drag is committed.
 ///
-/// Never panics: `generate_contour` validates its spec and a rejected one
-/// (hand-set params outside the bell table, degenerate area ratio) falls back
-/// to the legacy 15° cone, which is total. The vanished bell is visible; a
-/// crashed app is not — but only if the caller reports `kind`, not the request.
+/// The one asymmetry is the contour kind: `cfd_geom::ContourKind::DirectBell`
+/// comes back as `ContourKind::MeasuredBell`, which is how a theta_n or theta_e
+/// drag takes a Rao-table bell off the table. `bell_percent` keeps carrying the
+/// LENGTH in both cases.
+pub fn apply_curve(p: &mut CaseParams, c: &cfd_geom::NozzleCurve) {
+    p.r_throat_m = c.spec.throat_radius_m;
+    p.area_ratio = c.spec.area_ratio;
+    p.contraction_ratio = c.spec.contraction_ratio;
+    p.converge_half_angle_deg = c.spec.converge_half_angle_deg;
+    p.throat_arc_up = c.spec.throat_arc_up;
+    p.throat_arc_down = c.spec.throat_arc_down;
+    p.chamber_len_rt = c.chamber_len_rt;
+    match c.spec.contour {
+        // The cone's half-angle is a DEGREE OF FREEDOM — its exit-lip handle
+        // sets the area ratio radially and this angle axially — so it has to
+        // come back out. Dropping it here made every cone lip drag snap back to
+        // 15° on release, and a lip dragged toward the axis committed an area
+        // ratio whose exit sits inside a 15° throat arc, which the generator
+        // then rejects: the wall fell back to the cone with zero handles.
+        cfd_geom::ContourKind::Conical { half_angle_deg } => {
+            p.contour_kind = ContourKind::Conical;
+            p.cone_half_angle_deg = half_angle_deg;
+        }
+        cfd_geom::ContourKind::ParabolicBell { bell_percent } => {
+            p.contour_kind = ContourKind::ParabolicBell;
+            p.bell_percent = bell_percent;
+        }
+        cfd_geom::ContourKind::DirectBell {
+            theta_n_deg,
+            theta_e_deg,
+            length_fraction,
+        } => {
+            p.contour_kind = ContourKind::MeasuredBell {
+                theta_n_deg,
+                theta_e_deg,
+            };
+            p.bell_percent = length_fraction;
+        }
+    }
+}
+
+/// How finely this case's wall is tessellated: chord tolerance 1% of the base
+/// cell spacing, 2° per segment, capped at 4096 points.
+///
+/// The polyline exists only to be rasterized, and the rasterizer computes exact
+/// sub-cell area fractions from it, so its density is a property of the MESH,
+/// not a constant. The 256-sample constant it replaces was sized for the
+/// coarsest preset and paid for on every other one — and, far worse, it was
+/// simultaneously the editor's control-point set, which is what made wall
+/// editing unusable.
+pub fn tessellation(p: &CaseParams) -> cfd_geom::Tessellation {
+    let dr_m = p.r_throat_m / p.cells_per_rt;
+    cfd_geom::Tessellation::from_cell_size(p.dz_over_dr * dr_m, dr_m)
+}
+
+/// The wall contour for this case as a polyline (z, r) in r_t units,
+/// tessellated from [`nozzle_curve`] at this case's mesh resolution.
+///
+/// Never panics: the curve validates its spec and a rejected one (hand-set
+/// params outside the bell table, degenerate area ratio) falls back to the
+/// legacy 15° cone, which is total. The vanished bell is visible; a crashed app
+/// is not — but only if the caller reports `kind`, not the request.
 pub fn nozzle_contour(p: &CaseParams) -> GeneratedWall {
-    match cfd_geom::generate_contour(&nozzle_spec(p), CONTOUR_SAMPLES) {
+    let curve = nozzle_curve(p);
+    match curve.tessellate(&tessellation(p)) {
         Ok(profile) => {
             let inv = 1.0 / p.r_throat_m;
             GeneratedWall {
                 points: profile.points.iter().map(|q| [q[0] * inv, q[1] * inv]).collect(),
                 kind: p.contour_kind,
                 fallback: None,
+                curve: Some(curve),
             }
         }
         Err(e) => GeneratedWall {
-            points: fallback_cone(p.area_ratio, p.cone_half_angle_deg),
+            points: fallback_cone(p.area_ratio),
             kind: ContourKind::Conical,
             fallback: Some(e.to_string()),
+            curve: None,
         },
     }
 }
@@ -1197,8 +1310,13 @@ pub fn nozzle_contour(p: &CaseParams) -> GeneratedWall {
 /// in `cfd_geom::generate_contour`; it survives as (a) the infallible
 /// fallback for a rejected `NozzleSpec`, and (b) the independent reference
 /// the cone-equivalence test compares the new path against.
-fn fallback_cone(area_ratio: f64, half_angle_deg: f64) -> Vec<[f64; 2]> {
-    let alpha = half_angle_deg.to_radians();
+pub(crate) fn fallback_cone(area_ratio: f64) -> Vec<[f64; 2]> {
+    // Fixed at 15°, deliberately: this is the LEGACY reference cone, both the
+    // infallible fallback for a rejected spec and the independent polyline the
+    // cone-equivalence test checks the generator against. Threading
+    // `cone_half_angle_deg` in here would make the reference follow the thing
+    // it is supposed to be checking. Every shipped cone preset is 15° anyway.
+    let alpha = 15f64.to_radians();
     let beta = 30f64.to_radians();
     let (r1, r2, r_c) = (1.5, 0.382, 2.0);
     let r_e = area_ratio.max(1.1).sqrt();
@@ -1233,7 +1351,7 @@ fn fallback_cone(area_ratio: f64, half_angle_deg: f64) -> Vec<[f64; 2]> {
 /// reference that does not go through `cfd_geom`.
 #[cfg(test)]
 pub fn conical_contour(area_ratio: f64) -> Vec<[f64; 2]> {
-    fallback_cone(area_ratio, CONE_HALF_ANGLE_DEG)
+    fallback_cone(area_ratio)
 }
 
 /// Wall radius at axial station z by linear interpolation, `None` outside the
@@ -1801,6 +1919,13 @@ mod contour_swap {
 
     const SUITE: &str = "contour";
 
+    /// **Chord readers.** These measure the POLYLINE, not the wall, and they
+    /// carry a tessellation bias of up to the turn cap (2°) by construction.
+    /// Nothing that claims to be a wall angle may be read through them — that
+    /// is `NozzleCurve::divergent_angles_deg`, which is exact. They survive
+    /// only inside `tessellation_reproduces_the_curve_angles`, whose whole
+    /// subject is the size of that bias.
+    ///
     /// Wall slope of the polyline's last segment, as an angle in degrees.
     fn exit_angle_deg(pts: &[[f64; 2]]) -> f64 {
         let n = pts.len();
@@ -1833,12 +1958,18 @@ mod contour_swap {
     }
 
     /// The gate for everything else: the new path with `Conical` must BE the
-    /// old cone. Every vertex of the sparse legacy polyline is either an
-    /// exact sample point of the dense generated one (arc endpoints and
-    /// midpoints land on the shared φ-grid) or lies on one of its straight
-    /// segments, so linear interpolation on the new polyline must reproduce
-    /// the old vertices to float roundoff. 1e-9 r_t is ~5 decades above
-    /// roundoff and ~7 below a cell.
+    /// old cone.
+    ///
+    /// **Asserted against the analytic curve, not the polyline.** The original
+    /// version of this test interpolated the generated POLYLINE at each legacy
+    /// vertex and demanded agreement to 1e-9 r_t, which only ever worked
+    /// because both walls sampled their arcs on the same φ-grid — the legacy
+    /// cone's vertices sit at φ = β, β/2, 0, α/2, α, and the 256-sample
+    /// generator's `n_arc = 32` grid happens to contain all of them, so "1e-9"
+    /// was measuring a coincidence of sample grids rather than the shape.
+    /// Adaptive tessellation picks its own grid and the coincidence evaporates.
+    /// `NozzleCurve::radius_at` is the shape itself, so the tight tolerance
+    /// means what it always claimed to mean.
     #[test]
     fn cone_equivalence_new_path_vs_legacy() {
         let mut worst = 0.0f64;
@@ -1857,27 +1988,33 @@ mod contour_swap {
                 contour_kind: ContourKind::Conical,
                 ..CaseParams::default()
             };
-            let new = nozzle_contour(&p).points;
+            let wall = nozzle_contour(&p);
+            let new = &wall.points;
+            let curve = wall.curve.expect("the cone must generate a curve");
             let old = conical_contour(eps);
             // Same span in z…
             worst = worst.max((new[0][0] - old[0][0]).abs());
             let (ne, oe) = (new.last().unwrap(), old.last().unwrap());
             worst = worst.max((ne[0] - oe[0]).abs()).max((ne[1] - oe[1]).abs());
-            // …and every legacy vertex on the new wall. The legacy exit z can
-            // land an ulp past the new polyline's (algebraically identical)
-            // exit z, where wall_radius returns None — clamp into the new
-            // span before sampling. Nothing is hidden: the endpoint z's were
-            // compared against the same tolerance above.
-            let (z_lo, z_hi) = (new[0][0], new.last().unwrap()[0]);
+            // …and every legacy vertex ON THE CURVE. The legacy exit z can land
+            // an ulp past the curve's (algebraically identical) exit z, where
+            // `radius_at` returns None — clamp into the curve's span before
+            // sampling. Nothing is hidden: the endpoint z's were compared
+            // against the same tolerance above.
+            let (z_lo, z_hi) = (0.0, curve.length_m().unwrap() / rt);
             for q in &old {
-                let r = wall_radius(&new, q[0].clamp(z_lo, z_hi))
-                    .expect("legacy vertex outside new wall");
+                let r = curve
+                    .radius_at(q[0].clamp(z_lo, z_hi) * rt)
+                    .expect("legacy vertex outside the curve")
+                    / rt;
                 worst = worst.max((r - q[1]).abs());
             }
         }
         cfd_results::record_test(SUITE, cfd_results::TestResult {
             id: "cone-equivalence".into(),
-            name: "generate_contour(Conical) vs legacy cone at eps 2, 8 and every preset".into(),
+            name: "NozzleCurve(Conical).radius_at vs legacy cone vertices at eps 2, 8 and every \
+                   preset"
+                .into(),
             expected: "<= 1e-9".into(),
             actual: worst.into(),
             units: "max |dr| (r_t)".into(),
@@ -1894,9 +2031,12 @@ mod contour_swap {
     fn rs25_bell_matches_published_geometry() {
         let pre = PRESETS.iter().find(|p| p.name == "RS-25").unwrap();
         let c = pre.case(0.0, false);
-        let pts = nozzle_contour(&c).points;
-        let z_t = pts[throat_index(&pts)][0];
-        let len_dia = (pts.last().unwrap()[0] - z_t) / 2.0; // r_t -> throat diameters
+        // Read off the CURVE. The divergent length and the exit wall angle are
+        // exact properties of the contour; measuring them off a chord of
+        // whatever sample grid the tessellator picked adds a bias of up to the
+        // 2° turn cap to a comparison whose whole point is a 1° tolerance.
+        let curve = nozzle_contour(&c).curve.expect("RS-25 must generate a curve");
+        let len_dia = curve.divergent_len_rt().unwrap() / 2.0; // r_t -> throat diameters
         let published_dia = 121.0 / 10.88; // 11.12
         let len_err = (len_dia / published_dia - 1.0).abs();
         cfd_results::record_test(SUITE, cfd_results::TestResult {
@@ -1907,7 +2047,7 @@ mod contour_swap {
             units: "throat diameters".into(),
             pass: len_err <= 0.02,
         });
-        let exit_deg = exit_angle_deg(&pts);
+        let exit_deg = curve.exit_angle_deg().unwrap();
         cfd_results::record_test(SUITE, cfd_results::TestResult {
             id: "rs25-bell-exit-angle".into(),
             name: "RS-25 80% bell exit wall angle vs published ~7 deg".into(),
@@ -1930,15 +2070,24 @@ mod contour_swap {
     /// Both angles are asserted now: Raptor 2 no longer goes through the Rao
     /// table. `rao_table_cannot_represent_raptor2` below is the standing
     /// record of why it must not.
+    ///
+    /// **Read off the curve.** The chord version of this test was passing on
+    /// 0.18° of headroom against its 0.5° tolerance — the tessellation bias
+    /// (0.30° at the default mesh) was consuming most of the budget meant for
+    /// the physics claim, so a mesh change could have failed a comparison with
+    /// published geometry for reasons that have nothing to do with the wall.
+    /// `tessellation_reproduces_the_curve_angles` measures that bias on
+    /// purpose, separately, against the turn cap that bounds it.
     #[test]
     fn raptor2_bell_angles_vs_published() {
         let pre = PRESETS.iter().find(|p| p.name == "Raptor 2").unwrap();
         let wall = nozzle_contour(&pre.case(0.0, false));
         assert_eq!(wall.fallback, None, "Raptor 2 fell back to the cone");
-        let (tn, te) = (
-            max_wall_angle_deg(&wall.points),
-            exit_angle_deg(&wall.points),
-        );
+        let (tn, te) = wall
+            .curve
+            .expect("Raptor 2 must generate a curve")
+            .divergent_angles_deg()
+            .unwrap();
         for (id, name, actual, want) in [
             ("raptor2-theta-n", "Raptor 2 measured-geometry theta_n vs FAA AR 2019-001b 32.0 deg", tn, 32.0),
             ("raptor2-theta-e", "Raptor 2 measured-geometry theta_e vs FAA AR 2019-001b 6.0 deg", te, 6.0),
@@ -2010,6 +2159,113 @@ mod contour_swap {
         );
     }
 
+    /// The other half of `cfd-geom`'s bit-identity golden test.
+    ///
+    /// That test freezes a copy of the pre-curve contour generator and asserts
+    /// the curve reproduces it exactly for the demo spec and all six preset
+    /// specs. `cfd-geom` cannot depend on `cfd-ui`, so its preset rows are a
+    /// hand-mirrored table; this test is the mirror check. If a preset's
+    /// geometry changes, this fails and points at
+    /// `cfd-geom/tests/golden_contour.rs::golden_specs`, which is the file that
+    /// then has to be updated — instead of the golden test silently going on
+    /// guarding a nozzle nobody runs.
+    #[test]
+    fn preset_specs_match_the_geom_golden_table() {
+        // (name, r_throat_m, area_ratio, throat_arc_down, bell length, angles)
+        type Row = (&'static str, f64, f64, f64, f64, Option<(f64, f64)>);
+        const MIRROR: [Row; 6] = [
+            ("Merlin 1D", 0.131, 16.0, 0.382, 0.78, None),
+            ("F-1", 0.465, 16.0, 0.382, 0.75, None),
+            ("Raptor 2", 0.115, 34.3, 0.300, 0.76, Some((32.0, 6.0))),
+            ("AJ10-190", 0.073, 55.0, 0.382, 0.78, None),
+            ("RS-25", 0.138, 69.0, 0.382, 0.80, None),
+            ("Merlin Vac", 0.128, 165.0, 0.382, 0.75, None),
+        ];
+        // Look the six up BY NAME rather than zipping by index: the preset
+        // list has grown (the eight historical engines) and will grow again,
+        // and a positional mirror would have failed on arrival for a reason
+        // that has nothing to do with the geometry it guards.
+        for row in MIRROR.iter() {
+            let (name, rt, eps, arc, bell, angles) = *row;
+            let p = PRESETS
+                .iter()
+                .find(|q| q.name == name)
+                .unwrap_or_else(|| panic!("{name} left PRESETS; update golden_specs"));
+            let msg = "cfd-geom/tests/golden_contour.rs::golden_specs must be updated too";
+            assert_eq!(rt, p.r_throat_m, "{name}: throat radius — {msg}");
+            assert_eq!(eps, p.area_ratio, "{name}: area ratio — {msg}");
+            assert_eq!(arc, p.throat_arc_down, "{name}: throat arc — {msg}");
+            assert_eq!(bell, p.bell_percent, "{name}: bell length — {msg}");
+            let want = match angles {
+                Some((tn, te)) => ContourKind::MeasuredBell {
+                    theta_n_deg: tn,
+                    theta_e_deg: te,
+                },
+                None => ContourKind::ParabolicBell,
+            };
+            assert_eq!(want, p.contour_kind, "{name}: contour kind — {msg}");
+        }
+        // Every OTHER preset must be a SHAPE the golden table already
+        // exercises, so "the demo spec and all six preset specs" stays an
+        // accurate description of what bit-identity is proven over. A genuinely
+        // new contour shape has to be added to the table deliberately; a new
+        // engine that reuses an existing shape does not.
+        for p in PRESETS.iter().filter(|p| !MIRROR.iter().any(|m| m.0 == p.name)) {
+            assert!(
+                matches!(
+                    p.contour_kind,
+                    ContourKind::Conical | ContourKind::ParabolicBell
+                ),
+                "{}: {:?} is a shape cfd-geom's golden table does not cover — add it",
+                p.name,
+                p.contour_kind
+            );
+        }
+        // The demo row of the golden table, likewise.
+        let d = CaseParams::default();
+        assert_eq!(
+            (d.r_throat_m, d.area_ratio, d.throat_arc_down, d.contour_kind),
+            (0.05, 8.0, 0.382, ContourKind::Conical),
+            "the demo case moved; update golden_specs"
+        );
+        // The three family constants the golden table hard-codes into EVERY
+        // row. Without these three lines the mirror is not a mirror: changing
+        // the contraction ratio here would leave the golden test happily
+        // guarding a nozzle the app never builds.
+        assert_eq!(CONE_HALF_ANGLE_DEG, 15.0);
+        assert_eq!(CONTRACTION_RATIO, 4.0);
+        assert_eq!(CONVERGE_HALF_ANGLE_DEG, 30.0);
+        assert_eq!(THROAT_ARC_UP, 1.5);
+        assert_eq!(cfd_geom::CHAMBER_LEN_RT, 2.0);
+        // …and the mapping from the UI's kind to cfd_geom's, which the golden
+        // table also encodes (MeasuredBell -> DirectBell, bell_percent carried
+        // across as length_fraction). Asserted on the real conversion, so it
+        // cannot drift from the table silently.
+        for pre in &PRESETS {
+            let got = nozzle_curve(&pre.case(0.0, false)).spec;
+            let want = match pre.contour_kind {
+                ContourKind::Conical => cfd_geom::ContourKind::Conical {
+                    half_angle_deg: CONE_HALF_ANGLE_DEG,
+                },
+                ContourKind::ParabolicBell => cfd_geom::ContourKind::ParabolicBell {
+                    bell_percent: pre.bell_percent,
+                },
+                ContourKind::MeasuredBell {
+                    theta_n_deg,
+                    theta_e_deg,
+                } => cfd_geom::ContourKind::DirectBell {
+                    theta_n_deg,
+                    theta_e_deg,
+                    length_fraction: pre.bell_percent,
+                },
+            };
+            assert_eq!(got.contour, want, "{}: contour mapping", pre.name);
+            assert_eq!(got.contraction_ratio, CONTRACTION_RATIO);
+            assert_eq!(got.converge_half_angle_deg, CONVERGE_HALF_ANGLE_DEG);
+            assert_eq!(got.throat_arc_up, THROAT_ARC_UP);
+        }
+    }
+
     /// Every BELL preset's production wall is the bell (not the silent
     /// fallback cone): the generator reports the bell kind it was asked for,
     /// the wall is strictly shorter than the 15° cone at the same area ratio,
@@ -2049,13 +2305,212 @@ mod contour_swap {
                 "{}: wall is not shorter than the cone — fallback engaged?",
                 pre.name
             );
-            let exit_deg = exit_angle_deg(&bell);
+            let exit_deg = wall
+                .curve
+                .expect("a preset bell must generate a curve")
+                .exit_angle_deg()
+                .unwrap();
             assert!(
                 exit_deg < 12.0,
                 "{}: exit angle {exit_deg:.1} deg is not a bell",
                 pre.name
             );
         }
+    }
+
+    /// The tessellation bias, measured on purpose rather than inherited by the
+    /// published-geometry tests: the polyline's chord angles must reproduce the
+    /// curve's exact angles to within the turn cap, at every mesh resolution
+    /// the sidebar can produce. This is the assertion that used to be hidden
+    /// inside `raptor2_bell_angles_vs_published`'s 0.5° tolerance.
+    #[test]
+    fn tessellation_reproduces_the_curve_angles() {
+        let mut worst = 0.0f64;
+        for pre in &PRESETS {
+            for cells_per_rt in [8.0, 14.0, 20.0, 40.0, 160.0] {
+                let c = CaseParams {
+                    cells_per_rt,
+                    ..pre.case(0.0, false)
+                };
+                let wall = nozzle_contour(&c);
+                let curve = wall.curve.expect("preset must generate a curve");
+                let (tn, te) = curve.divergent_angles_deg().unwrap();
+                let cap = tessellation(&c).max_turn_deg;
+                let (tn_c, te_c) = (
+                    max_wall_angle_deg(&wall.points),
+                    exit_angle_deg(&wall.points),
+                );
+                let at = format!("{} @ {cells_per_rt} cells/r_t", pre.name);
+                assert!(
+                    (tn_c - tn).abs() <= cap,
+                    "{at}: chord theta_n {tn_c:.3} vs curve {tn:.3} deg (cap {cap})"
+                );
+                assert!(
+                    (te_c - te).abs() <= cap,
+                    "{at}: chord theta_e {te_c:.3} vs curve {te:.3} deg (cap {cap})"
+                );
+                worst = worst.max((tn_c - tn).abs()).max((te_c - te).abs());
+            }
+        }
+        cfd_results::record_test(SUITE, cfd_results::TestResult {
+            id: "tessellation-angle-bias".into(),
+            name: "worst chord-vs-curve wall angle over every preset at 8-160 cells/r_t".into(),
+            expected: format!("<= {:.1} (turn cap)", cfd_geom::Tessellation::MAX_TURN_DEG)
+                .as_str()
+                .into(),
+            actual: worst.into(),
+            units: "deg".into(),
+            pass: worst <= cfd_geom::Tessellation::MAX_TURN_DEG,
+        });
+    }
+
+    /// **THE STEP 2 GATE.** Two claims, both measured:
+    ///
+    /// 1. The tessellation has CONVERGED at the default settings — halving them
+    ///    moves the rasterized throat area by under 0.1%. Throat area, not
+    ///    vertex positions, because that is the quantity every downstream
+    ///    number is built on: mass flow, c*, C_f.
+    /// 2. The polyline is much cheaper than the 256-sample constant it
+    ///    replaces, at the same or better fidelity.
+    ///
+    /// **The two knobs are recorded separately.** Halving both at once is the
+    /// stronger test and it is what the gate asserts, but a single combined
+    /// number attributes the movement to whichever knob the reader assumes.
+    /// They are not comparable: at the default settings the throat arcs are
+    /// TURN-CAP bound and the Bezier is CHORD bound, so halving the turn cap
+    /// alone accounts for essentially all of the movement (Merlin Vac 0.0235%)
+    /// while halving the chord tolerance alone moves it ~17x less (0.0014%
+    /// worst, and exactly zero for Merlin Vac, whose throat arcs do not move).
+    #[test]
+    fn halving_the_tessellation_settings_does_not_move_the_throat_area() {
+        /// Rasterized open (fluid) area of the narrowest column, in r_t².
+        fn throat_area(p: &CaseParams, pts: &[[f64; 2]]) -> f64 {
+            let g = base_grid(p);
+            let s = rasterize_wall(pts, &g);
+            let z_end = pts.last().unwrap()[0];
+            let mut best = f64::INFINITY;
+            for iz in 0..g.nz {
+                if (g.z_center(iz) as f64) > z_end {
+                    break;
+                }
+                // Exact sub-cell fractions, summed as the shell area 2 pi r dr
+                // over the OPEN part of the column — f64, as every reduction
+                // in this build must be.
+                let mut a = 0.0f64;
+                for ir in 0..g.nr {
+                    let open = 1.0 - s.fraction[g.idx(iz, ir)] as f64;
+                    a += open * g.r_center(ir) as f64 * g.dr(ir) as f64;
+                }
+                best = best.min(2.0 * std::f64::consts::PI * a);
+            }
+            best
+        }
+
+        let (mut worst_both, mut worst_tol, mut worst_turn) = (0.0f64, 0.0f64, 0.0f64);
+        let mut counts = Vec::new();
+        for pre in &PRESETS {
+            let c = pre.case(0.0, false);
+            let curve = nozzle_curve(&c);
+            let base = tessellation(&c);
+            let refine = |tol: f64, turn: f64| cfd_geom::Tessellation {
+                chord_tol_m: base.chord_tol_m * tol,
+                max_turn_deg: base.max_turn_deg * turn,
+                ..base
+            };
+            let inv = 1.0 / c.r_throat_m;
+            let pts = |t: &cfd_geom::Tessellation| -> Vec<[f64; 2]> {
+                curve
+                    .tessellate(t)
+                    .unwrap()
+                    .points
+                    .iter()
+                    .map(|q| [q[0] * inv, q[1] * inv])
+                    .collect()
+            };
+            let pa = pts(&base);
+            let aa = throat_area(&c, &pa);
+            let rel = |t: &cfd_geom::Tessellation| (throat_area(&c, &pts(t)) / aa - 1.0).abs();
+            let (r_both, r_tol, r_turn) = (
+                rel(&refine(0.5, 0.5)),
+                rel(&refine(0.5, 1.0)),
+                rel(&refine(1.0, 0.5)),
+            );
+            println!(
+                "{}: {} -> {} points | throat area {aa:.6} r_t^2 | moved {:.4}% (both), \
+                 {:.4}% (tolerance only), {:.4}% (turn cap only)",
+                pre.name,
+                pa.len(),
+                pts(&refine(0.5, 0.5)).len(),
+                100.0 * r_both,
+                100.0 * r_tol,
+                100.0 * r_turn
+            );
+            counts.push((pre.name, pa.len()));
+            worst_both = worst_both.max(r_both);
+            worst_tol = worst_tol.max(r_tol);
+            worst_turn = worst_turn.max(r_turn);
+            assert!(
+                pa.len() < 256,
+                "{}: {} points at its own resolution is no cheaper than the \
+                 256-sample constant",
+                pre.name,
+                pa.len()
+            );
+        }
+        let worst_rel = worst_both;
+        for (id, name, v) in [
+            (
+                "tessellation-throat-area-convergence",
+                "rasterized throat area change on halving BOTH tessellation settings \
+                 (chord tolerance and turn cap), worst of every preset",
+                worst_both,
+            ),
+            (
+                "tessellation-throat-area-convergence-tolerance-only",
+                "…on halving the chord tolerance alone (the Bezier refines, the \
+                 turn-cap-bound throat arcs do not)",
+                worst_tol,
+            ),
+            (
+                "tessellation-throat-area-convergence-turn-cap-only",
+                "…on halving the turn cap alone (the throat arcs refine; this is \
+                 where essentially all of the combined movement comes from)",
+                worst_turn,
+            ),
+        ] {
+            cfd_results::record_test(SUITE, cfd_results::TestResult {
+                id: id.into(),
+                name: name.into(),
+                expected: "< 0.1%".into(),
+                actual: (100.0 * v).into(),
+                units: "% of throat area".into(),
+                pass: v < 1e-3,
+            });
+        }
+        cfd_results::record_note(
+            SUITE,
+            "tessellation-point-counts",
+            &format!(
+                "Adaptive tessellation at 1% of the base cell spacing, 2 deg turn cap, replacing \
+                 the fixed 256 samples, at each preset's OWN resolution: {}. The turn cap \
+                 sets the count on the throat arcs and the chord tolerance sets it on the \
+                 Bezier. The comparison against 256 belongs to the default resolutions only: \
+                 the mesh sets the tolerance, so a user who raises the resolution to the \
+                 160 cells/r_t top of the range correctly gets a FINER wall than the old \
+                 constant (Merlin Vac 268 points, RS-25 215) — that is the adaptive rule \
+                 working, not a regression.",
+                counts
+                    .iter()
+                    .map(|(n, k)| format!("{n} {k}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+        assert!(
+            worst_rel < 1e-3,
+            "throat area moved {:.4}% on halving the tolerance",
+            100.0 * worst_rel
+        );
     }
 }
 
@@ -2164,8 +2619,13 @@ mod historical_presets {
                     panic!("{}: no historical preset uses measured angles", pre.name)
                 }
             }
-            let profile = cfd_geom::generate_contour(&spec, CONTOUR_SAMPLES)
-                .unwrap_or_else(|e| panic!("{}: generate_contour rejected the spec: {e}", pre.name));
+            // Through the ADAPTIVE path — the wall the app actually builds.
+            // The fixed 256-sample `generate_contour` is now only `cfd-core`'s
+            // entry point; validating a polyline the app never produces would
+            // leave the real one unchecked.
+            let profile = nozzle_curve(&c)
+                .tessellate(&tessellation(&c))
+                .unwrap_or_else(|e| panic!("{}: the curve rejected the spec: {e}", pre.name));
             profile
                 .validate()
                 .unwrap_or_else(|e| panic!("{}: invalid profile: {e}", pre.name));
@@ -2500,25 +2960,24 @@ mod historical_presets {
     }
 
     /// 5. The Rao table is digitised over ε = 4–100 and `rao_angles` CLAMPS at
-    ///    both ends rather than extrapolating. The area-ratio slider bottoms
-    ///    out at ε = 2, so a user can drag any of the five historical bells
-    ///    into the clamped region below the table — and that has to be
+    ///    both ends rather than extrapolating. The area-ratio slider's bottom
+    ///    stop is ε = 2, so a user can drag any of the five historical bells
+    ///    into the clamped region BELOW the table — and that has to be
     ///    disclosed exactly as the ε > 100 case is, not silently.
     ///
-    ///    This asserts the SYMMETRY of the clamp and of the condition the UI
-    ///    flags it on. It is a characterisation test: the app's condition is
-    ///    `!(4.0..=100.0).contains(&ε)`, which already covers both ends, and
-    ///    this pins that it keeps doing so — the failure mode being guarded is
-    ///    a future edit that special-cases only the high end, which is the
-    ///    natural way to write it if you are only thinking about Merlin Vac.
+    ///    Asserted against `rao_clamp_warning`, the function the sidebar
+    ///    actually calls, rather than against a copy of its condition: a test
+    ///    that restates the range proves only that the test agrees with
+    ///    itself. The failure being guarded is a future edit that special-cases
+    ///    the high end alone, which is the natural way to write it if you are
+    ///    only thinking about Merlin Vac at ε = 165.
     #[test]
     fn rao_table_clamps_and_flags_symmetrically_at_both_ends() {
-        /// The digitised range, as the UI's disclosure condition uses it.
-        const TABLE: std::ops::RangeInclusive<f64> = 4.0..=100.0;
-        let flagged = |eps: f64| !TABLE.contains(&eps);
+        let bell = Some(ContourKind::ParabolicBell);
 
         for bp in [0.75, 0.80] {
-            // Below the table: every ε clamps to the ε = 4 row, and is flagged.
+            // Below the table: every ε clamps to the ε = 4 row, and every one
+            // is flagged, naming the end it clamped to.
             let at_low_end = cfd_geom::rao_angles(4.0, bp);
             for eps in [2.0, 2.5, 3.0, 3.9, 3.999] {
                 assert_eq!(
@@ -2526,10 +2985,14 @@ mod historical_presets {
                     at_low_end,
                     "eps {eps} does not clamp to the eps = 4 row"
                 );
-                assert!(flagged(eps), "eps {eps} is clamped but not flagged");
+                assert_eq!(
+                    rao_clamp_warning(bell, eps),
+                    Some((4.0, "starts at")),
+                    "eps {eps} is clamped but not flagged"
+                );
             }
             // Above it: the mirror image, which is the case that already had
-            // the disclosure.
+            // the disclosure because Merlin Vac exercises it.
             let at_high_end = cfd_geom::rao_angles(100.0, bp);
             for eps in [100.001, 120.0, 165.0, 400.0] {
                 assert_eq!(
@@ -2537,11 +3000,15 @@ mod historical_presets {
                     at_high_end,
                     "eps {eps} does not clamp to the eps = 100 row"
                 );
-                assert!(flagged(eps), "eps {eps} is clamped but not flagged");
+                assert_eq!(
+                    rao_clamp_warning(bell, eps),
+                    Some((100.0, "ends at")),
+                    "eps {eps} is clamped but not flagged"
+                );
             }
             // Inside the table nothing is clamped and nothing is flagged.
             for eps in [4.0, 8.0, 25.0, 100.0] {
-                assert!(!flagged(eps), "eps {eps} is inside the table but flagged");
+                assert_eq!(rao_clamp_warning(bell, eps), None, "eps {eps} flagged inside the table");
             }
             // The endpoints are genuinely distinct, so "clamps to the end row"
             // is a real constraint rather than a tautology about a flat table.
@@ -2551,23 +3018,29 @@ mod historical_presets {
                  would pass on any input"
             );
         }
+        // Only table bells can inherit the clamp: a cone never consults the
+        // table, and a measured-angle bell bypasses it by construction.
+        for kind in [None, Some(ContourKind::Conical),
+                     Some(ContourKind::MeasuredBell { theta_n_deg: 32.0, theta_e_deg: 6.0 })] {
+            for eps in [2.0, 8.0, 400.0] {
+                assert_eq!(rao_clamp_warning(kind, eps), None, "{kind:?} at eps {eps}");
+            }
+        }
 
-        // Every shipped bell can actually be dragged into the low-clamped
-        // region: the slider's floor is below 4, so this is reachable, not
-        // hypothetical. (Merlin Vac is the engine that made the HIGH end
-        // reachable; the historical bells are what make the low end matter.)
-        let draggable: Vec<&str> = PRESETS
+        // The low clamp is reachable for every shipped bell — the slider's
+        // floor is below ε = 4 — and the wall still GENERATES there rather
+        // than falling back. That matters: a fallback would return a cone,
+        // `wall_kind` would stop being ParabolicBell, and the disclosure this
+        // test is about would never fire. (Merlin Vac is what made the high
+        // end reachable; the historical bells are what make the low end
+        // matter.)
+        let bells: Vec<&str> = PRESETS
             .iter()
             .filter(|p| p.contour_kind == ContourKind::ParabolicBell)
             .map(|p| p.name)
             .collect();
-        assert!(
-            !draggable.is_empty() && AREA_RATIO_SLIDER_MIN < *TABLE.start(),
-            "no bell preset can reach the low clamp; this test is guarding nothing"
-        );
-        // …and the wall still generates there rather than falling back, which
-        // is what makes a silent clamp possible in the first place.
-        for name in &draggable {
+        assert!(bells.len() >= 5, "expected the five historical bells: {bells:?}");
+        for name in &bells {
             let pre = PRESETS.iter().find(|p| p.name == *name).unwrap();
             let mut c = pre.case(0.0, false);
             c.area_ratio = 3.0;
@@ -2578,16 +3051,17 @@ mod historical_presets {
                  be reached, and the status line would say cone instead"
             );
             assert_eq!(w.kind, ContourKind::ParabolicBell);
+            assert_eq!(rao_clamp_warning(Some(w.kind), c.area_ratio), Some((4.0, "starts at")));
         }
         cfd_results::record_note(SUITE, "rao-low-end-clamp", &format!(
-            "The Rao table covers eps = 4-100 and rao_angles clamps at BOTH ends; the area-ratio \
-             slider bottoms out at {AREA_RATIO_SLIDER_MIN}, so all {} bell presets can be dragged \
-             below the table. The UI's disclosure condition is !(4.0..=100.0).contains(eps), \
-             which already fires at both ends — verified here rather than assumed, because the \
-             natural way to write that check while thinking only about Merlin Vac (eps 165) is \
-             to test the high end alone. Below eps 4 the angles are the eps = 4 row \
-             (theta_n {:.2}, theta_e {:.2} at 80%) stretched to the requested exit radius.",
-            draggable.len(),
+            "The Rao table covers eps = 4-100 and rao_angles clamps at BOTH ends; the \
+             area-ratio slider bottoms out at 2, so all {} bell presets can be dragged below \
+             the table. rao_clamp_warning fires at both ends -- verified against the function \
+             the sidebar calls rather than a restatement of its condition, because the natural \
+             way to write that check while thinking only about Merlin Vac (eps 165) is to test \
+             the high end alone. Below eps 4 the angles are the eps = 4 row (theta_n {:.2}, \
+             theta_e {:.2} at 80%) stretched to the requested exit radius.",
+            bells.len(),
             cfd_geom::rao_angles(4.0, 0.8).0,
             cfd_geom::rao_angles(4.0, 0.8).1));
     }

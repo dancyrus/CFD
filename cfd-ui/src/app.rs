@@ -11,14 +11,14 @@ use eframe::egui::{
 
 use cfd_contract::{FieldKind, SolverCommand};
 
-use crate::canvas::{colorbar, fmt_value, range_drag, Canvas, RangeEdit, RangeInvalid, BG};
+use crate::canvas::{colorbar, fmt_value, range_drag, Canvas, RangeEdit, RangeInvalid, ACCENT, BG};
 use crate::case::{
-    self, ambient_nd, atmosphere, ideal_cf, make_setup, nozzle_contour, rasterize_wall,
-    separation_altitude_m, separation_threshold, CaseParams, ContourKind, DomainPreset, ALT_MAX_M,
-    PRESETS, R_UNIVERSAL_SI, VACUUM_P_FRAC,
+    self as case, ambient_nd, apply_curve, atmosphere, ideal_cf, make_setup, nozzle_contour,
+    rasterize_wall, separation_altitude_m, separation_threshold, CaseParams, ContourKind,
+    DomainPreset, ALT_MAX_M, PRESETS, R_UNIVERSAL_SI, VACUUM_P_FRAC,
 };
 use crate::colormap::{Preset, PresetKind};
-use crate::editor::{EditorBackend, StubEditor};
+use crate::editor::WallState;
 use crate::worker::{UiCommand, UiFrame};
 
 /// Per-field state attached to `CfdApp::locked`.
@@ -45,6 +45,8 @@ struct RangeState {
 const CMAP_KEY: &str = "cfd.cmap.presets";
 
 const TURBO_STEPS: [u32; 3] = [1, 4, 16];
+/// Repaints a transient status message stays up for (~2 s at 60 Hz).
+const TOAST_TICKS: u64 = 120;
 /// Step of a rebuilt solver at which the deferred colorbar re-lock fires.
 const RELOCK_STEP: u64 = 30;
 /// Floor-activation quarantine (docs/physics-reference.md §13): the report
@@ -178,8 +180,15 @@ pub struct CfdApp {
     smooth: bool,
 
     canvas: Canvas,
-    editor: StubEditor,
+    /// Parametric (handles on a curve) or Freeform (every point a handle).
+    /// The break between them is one-way; see `WallState`.
+    wall: WallState,
     editor_on: bool,
+    /// The handle under the pointer or being dragged, and the live clamp
+    /// message when a drag has reached a constraint. Both feed the sidebar's
+    /// handle readout — the number the user is actually setting.
+    active_handle: Option<usize>,
+    handle_clamp: Option<String>,
     committed_wall: Vec<[f64; 2]>,
     /// The contour kind the generator ACTUALLY produced for `committed_wall`,
     /// and the rejection message when it fell back to the cone. Never the
@@ -189,10 +198,15 @@ pub struct CfdApp {
     /// contour family and no wall angles to name.
     wall_kind: Option<ContourKind>,
     wall_fallback: Option<String>,
-    /// True once the user has edited the wall by hand — flips the whole
-    /// report into "sandbox — qualitative only".
-    geometry_custom: bool,
     space_panned: bool,
+    /// Transient status message (the break notice). `ui_tick` at which it was
+    /// raised; it fades after `TOAST_TICKS`.
+    toast: Option<(String, u64)>,
+    /// A preset (or `None` for the demo case) waiting on the user's confirmation
+    /// that discarding their drawing is intended.
+    pending_preset: Option<Option<usize>>,
+    /// Same, for the area-ratio slider's parametric regeneration.
+    pending_regen: bool,
     hover_text: String,
     // Domain-size staging (work order: configurable-domain): the four sidebar
     // fields, committed on release / focus loss like the sliders. `params`
@@ -235,8 +249,7 @@ impl CfdApp {
             cmap[k as usize] = Preset::default_for(k);
         }
         cmap = restore_presets(storage.and_then(|s| eframe::get_value(s, CMAP_KEY)), cmap);
-        let mut editor = StubEditor::new(wall.points.clone());
-        editor.set_domain(params.lz_rt, params.lr_rt);
+        let wall_state = WallState::parametric(&params);
         CfdApp {
             out,
             tx,
@@ -262,19 +275,86 @@ impl CfdApp {
             range_state: [RangeState::default(); 8],
             smooth: false,
             canvas: Canvas::new(),
-            editor,
+            wall: wall_state,
             editor_on: false,
+            active_handle: None,
+            handle_clamp: None,
             committed_wall: wall.points,
             wall_kind: Some(wall.kind),
             wall_fallback: wall.fallback,
-            geometry_custom: false,
             space_panned: false,
+            toast: None,
+            pending_preset: None,
+            pending_regen: false,
             hover_text: String::new(),
             cost_cache: None,
             ui_tick: 0,
             mem_confirm: false,
             preset_tips: PRESETS.iter().map(preset_tooltip).collect(),
             watermark,
+        }
+    }
+
+    /// Regenerate the parametric wall from the case, DISCARDING a drawing if
+    /// there is one. This is the only way out of freeform and it is
+    /// destructive, so every caller must be behind the confirmation in
+    /// `wall_state_notices` — today that is `apply_preset` and
+    /// `regenerate_contour`, both reached through `request_*`.
+    ///
+    /// `commit_domain` used to call this too, which meant a click on the
+    /// Preview/Standard/Large shortcut — or any nudge of the resolution, the
+    /// aspect or either domain extent — silently deleted the user's drawing
+    /// from both the UI and the solver, with no dialog, and left `wall_kind`
+    /// saying "hand-drawn wall" over a regenerated parametric contour. It uses
+    /// `resize_wall` below instead.
+    fn reset_wall(&mut self) {
+        match &mut self.wall {
+            WallState::Parametric(e) => e.reset(&self.params),
+            _ => self.wall = WallState::parametric(&self.params),
+        }
+        self.wall
+            .editor_mut()
+            .set_domain(self.params.lz_rt, self.params.lr_rt);
+    }
+
+    /// Re-fit the wall to a changed domain or mesh WITHOUT changing which
+    /// representation it is in.
+    ///
+    /// A parametric wall is re-tessellated, because the chord tolerance is 1%
+    /// of the base cell spacing and the mesh just moved. A drawing is left
+    /// alone — its points are mesh-independent — and only its bounds are
+    /// updated, so a domain change costs the user nothing.
+    fn resize_wall(&mut self) {
+        match &mut self.wall {
+            WallState::Parametric(e) => {
+                e.reset(&self.params);
+                self.wall_kind = Some(self.params.contour_kind);
+            }
+            // Still a drawing, still sandboxed: `wall_kind` stays None.
+            WallState::Freeform(_) => {}
+        }
+        self.wall
+            .editor_mut()
+            .set_domain(self.params.lz_rt, self.params.lr_rt);
+        self.committed_wall = self.wall.editor().polyline().to_vec();
+    }
+
+    /// The ONE-WAY break: a point edit on a parametric wall converts it to a
+    /// drawing, keeping the shape exactly. Raises the toast that says so.
+    fn break_to_freeform(&mut self) {
+        if self.wall.break_to_freeform(self.params.lz_rt, self.params.lr_rt) {
+            self.toast = Some((
+                "Wall converted to a drawing — the parametric handles are gone. \
+                 Pick an engine or move the area-ratio slider to regenerate."
+                    .into(),
+                self.ui_tick,
+            ));
+            // The shape did not move, so the solver's geometry is unchanged;
+            // what changed is the provenance, which the report reads. The base
+            // preset keeps its name for context; `exact()` is what stops
+            // anything claiming this drawing IS that engine.
+            self.wall_kind = None;
+            self.preset.mark_modified();
         }
     }
 
@@ -287,18 +367,59 @@ impl CfdApp {
         self.cmd(SolverCommand::Pause(p));
     }
 
+    /// Commit a parametric handle drag.
+    ///
+    /// **Provenance.** A handle edit is still a member of the §10 contour
+    /// family — it is a bell with different numbers, not a drawing — so it
+    /// KEEPS the engineering report and it SETS the contour kind rather than
+    /// blanking it. What it clears is the preset NAME: an RS-25 with a
+    /// hand-tuned theta_n is no longer RS-25. Only the freeform editor raises
+    /// "SANDBOX — drawn geometry", because only a drawing is outside every
+    /// contour family the acceptance tests cover.
     fn commit_editor_geometry(&mut self) {
-        self.committed_wall = self.editor.points().to_vec();
-        self.geometry_custom = true;
-        // A hand-drawn wall is an edit, not a new engine: the base preset
-        // stays named so the readouts keep their context, but nothing may go
-        // on claiming this IS that engine.
+        // The validation gate runs BEFORE `committed_wall` is touched. It used
+        // to run after, so a rejected drawing was already in `committed_wall`
+        // while the toast said "edit not applied" — and the next rebuild
+        // (`make_setup(&params, &committed_wall)`) would have pushed it to the
+        // solver with no validation at all.
+        match &self.wall {
+            WallState::Parametric(e) => {
+                // Pull the edited curve back into the case, so the sidebar, the
+                // report and the next regeneration all agree with the wall on
+                // screen. The contour kind is SET, not blanked: a theta drag
+                // lands as MeasuredBell and the status line reads its live
+                // angles. A hand-tuned bell also stops being a table bell, so
+                // the Rao-clamp warning (which only fires for ParabolicBell)
+                // correctly goes quiet.
+                let c = *e.curve();
+                apply_curve(&mut self.params, &c);
+                self.ui_area_ratio = self.params.area_ratio;
+                self.wall_kind = Some(self.params.contour_kind);
+            }
+            // A drawing is outside every contour family, so it has no wall
+            // angles to name and no engineering report to keep. It does still
+            // face the validation gate — `FreeformEditor`'s own invariants
+            // should make this unreachable, and a gate that only runs when the
+            // invariants hold is not a gate.
+            WallState::Freeform(e) => {
+                if let Err(why) = e.validate() {
+                    self.toast = Some((
+                        format!("wall rejected, edit not applied: {why}"),
+                        self.ui_tick,
+                    ));
+                    return;
+                }
+                self.wall_kind = None;
+            }
+        }
+        self.committed_wall = self.wall.editor().polyline().to_vec();
+        // A hand-tuned wall is an EDIT, not a new engine. main's
+        // `PresetSelection` says this better than the `preset = None` that was
+        // here: the base preset stays named so the readouts keep their context,
+        // while `exact()` returns None so nothing — the contour-source label,
+        // the §13 rule withholding absolute thrust — goes on claiming this IS
+        // that engine. A modified RS-25 is not RS-25.
         self.preset.mark_modified();
-        // …and no contour family either. This is the fourth writer of
-        // `committed_wall`; leaving the generator's provenance behind here
-        // would put "measured bell · θ_n 32.0°" over a wall the user dragged
-        // by hand, which is the same lie as naming a bell over a fallback cone.
-        self.wall_kind = None;
         self.wall_fallback = None;
         // Mid-run edits rasterize onto the solver's CURRENT (graded) grid —
         // that is the cheap-to-overwrite-mask property the sandbox rests on.
@@ -310,17 +431,25 @@ impl CfdApp {
 
     /// Parametric regeneration from the area-ratio slider: replaces any hand
     /// edits and clears sandbox mode.
+    fn request_regenerate(&mut self) {
+        if self.wall.is_freeform() {
+            self.pending_regen = true;
+        } else {
+            self.regenerate_contour();
+        }
+    }
+
     fn regenerate_contour(&mut self) {
+        self.pending_regen = false;
         if self.params.area_ratio != self.ui_area_ratio {
             self.preset.mark_modified();
         }
         self.params.area_ratio = self.ui_area_ratio;
         let wall = nozzle_contour(&self.params);
-        self.editor.set_points(wall.points.clone());
+        self.reset_wall();
         self.committed_wall = wall.points;
         self.wall_kind = Some(wall.kind);
         self.wall_fallback = wall.fallback;
-        self.geometry_custom = false;
         let solid = rasterize_wall(&self.committed_wall, &self.latest.snapshot.grid);
         self.cmd(SolverCommand::SetGeometry(Arc::new(solid)));
     }
@@ -335,6 +464,17 @@ impl CfdApp {
         let setup = make_setup(&self.params, &self.committed_wall);
         let _ = self.tx.send(UiCommand::Rebuild(Box::new(setup)));
         self.relock_pending = true;
+    }
+
+    /// Ask before discarding a drawing. Regenerating is the only escape from
+    /// freeform, and it is destructive — there is no fit-a-curve step to get
+    /// the drawing back.
+    fn request_preset(&mut self, preset: Option<usize>) {
+        if self.wall.is_freeform() {
+            self.pending_preset = Some(preset);
+        } else {
+            self.apply_preset(preset);
+        }
     }
 
     /// Apply a preset whole — geometry, area ratio, chamber pressure, gas
@@ -352,6 +492,7 @@ impl CfdApp {
     /// engine that honestly runs on the pad. Vacuum mode still carries over;
     /// it is a mode, not an altitude.
     fn apply_preset(&mut self, preset: Option<usize>) {
+        self.pending_preset = None;
         self.preset = PresetSelection::select(preset);
         let vac = self.params.vacuum;
         self.params = match preset {
@@ -366,12 +507,11 @@ impl CfdApp {
         self.ui_p0_mpa = self.params.p0_pa / 1e6;
         self.sync_domain_fields();
         let wall = nozzle_contour(&self.params);
-        self.editor.set_domain(self.params.lz_rt, self.params.lr_rt);
-        self.editor.set_points(wall.points.clone());
+        self.wall.editor_mut().set_domain(self.params.lz_rt, self.params.lr_rt);
+        self.reset_wall();
         self.committed_wall = wall.points;
         self.wall_kind = Some(wall.kind);
         self.wall_fallback = wall.fallback;
-        self.geometry_custom = false;
         let setup = make_setup(&self.params, &self.committed_wall);
         let _ = self.tx.send(UiCommand::Rebuild(Box::new(setup)));
         self.relock_pending = true;
@@ -428,7 +568,10 @@ impl CfdApp {
         self.preset.mark_modified();
         self.params = cand;
         self.cost_cache = None;
-        self.editor.set_domain(self.params.lz_rt, self.params.lr_rt);
+        // The mesh sets the chord tolerance, so a resolution change re-sizes
+        // the polyline the solver gets — but it must not change WHAT the wall
+        // is. A drawing survives a domain change untouched.
+        self.resize_wall();
         let setup = make_setup(&self.params, &self.committed_wall);
         let _ = self.tx.send(UiCommand::Rebuild(Box::new(setup)));
         self.relock_pending = true;
@@ -927,8 +1070,11 @@ impl CfdApp {
                      stays on the engine it started from and is flagged \
                      MODIFIED.",
                 );
-            if r.clicked() && self.preset.base.is_some() {
-                self.apply_preset(None);
+            // `base.is_some()` alone leaves this inert after a break to
+            // freeform, which clears nothing on `PresetSelection` — the demo
+            // case has to stay reachable as the escape from sandbox mode.
+            if r.clicked() && (self.preset.base.is_some() || self.wall.is_freeform()) {
+                self.request_preset(None);
             }
             for i in 0..PRESETS.len() {
                 let p = &PRESETS[i];
@@ -947,8 +1093,12 @@ impl CfdApp {
                 // been edited, in which case it is how you get back to the
                 // engine as published. Without this the only route back was
                 // via another preset and then this one.
+                // Re-clicking the selected preset is a no-op UNLESS it has
+                // been edited, in which case it is how you get back to the
+                // engine as published — and it goes through `request_preset`,
+                // because on a drawn wall that restore discards the drawing.
                 if r.clicked() && (!selected || self.preset.modified) {
-                    self.apply_preset(Some(i));
+                    self.request_preset(Some(i));
                 }
             }
         });
@@ -976,7 +1126,13 @@ impl CfdApp {
         };
         let contour_desc = match self.wall_kind {
             None => "hand-drawn wall".to_string(),
-            Some(ContourKind::Conical) => "15° cone".to_string(),
+            // The half-angle is a live parameter now (the cone's exit-lip
+            // handle sets it), so it cannot be the hard-coded 15 it used to be
+            // — the label would go on claiming 15° over a wall the user had
+            // dragged to 20.
+            Some(ContourKind::Conical) => {
+                format!("{:.1}° cone", self.params.cone_half_angle_deg)
+            }
             Some(ContourKind::ParabolicBell) => {
                 format!("{:.0}% bell{source}", self.params.bell_percent * 100.0)
             }
@@ -998,6 +1154,8 @@ impl CfdApp {
             .weak()
             .small(),
         );
+        self.handle_readout(ui);
+        self.wall_state_notices(ui);
         // The Modified flag itself, where it cannot be missed. Amber, not
         // weak grey: it changes what the numbers below mean.
         if self.preset.modified {
@@ -1035,19 +1193,13 @@ impl CfdApp {
         // bell is the end row's angles stretched to this exit radius. Merlin
         // Vac (ε = 165) lives above; the ε slider bottoms out at 2.0, below.
         // Measured-angle bells never touch the table, so they never flag.
-        // Fires at BOTH ends of the digitised table, and the low end is not
-        // hypothetical: the slider's bottom stop is below ε = 4, so any of the
-        // bell presets can be dragged into the clamped region. Sharing the
-        // range constant with `rao_table_clamps_and_flags_symmetrically_at_both_ends`
-        // is what keeps the disclosure and the clamp from drifting apart.
-        if self.wall_kind == Some(ContourKind::ParabolicBell)
-            && !case::RAO_TABLE_EPS.contains(&self.params.area_ratio)
-        {
-            let (end, side) = if self.params.area_ratio > *case::RAO_TABLE_EPS.end() {
-                (*case::RAO_TABLE_EPS.end(), "ends at")
-            } else {
-                (*case::RAO_TABLE_EPS.start(), "starts at")
-            };
+        // `rao_clamp_warning` fires at BOTH ends of the digitised table, and
+        // the low end is not hypothetical: the slider's bottom stop is below
+        // ε = 4, so any of the five historical bells can be dragged into the
+        // clamped region. Keeping the condition in `case` is what lets
+        // `rao_table_clamps_and_flags_symmetrically_at_both_ends` test the
+        // real one instead of a copy.
+        if let Some((end, side)) = case::rao_clamp_warning(self.wall_kind, self.params.area_ratio) {
             ui.label(
                 RichText::new(format!(
                     "bell angles clamped: Rao table {side} ε = {end:.0} (this nozzle is ε {:.1})",
@@ -1093,6 +1245,124 @@ impl CfdApp {
             .small(),
         );
         self.domain_section(ui);
+    }
+
+    /// The live value of the handle under the pointer, and the clamp reason
+    /// when a drag has run into a constraint.
+    ///
+    /// This is where the numbers a drag is setting become visible. Without it
+    /// the parametric editor is a shape that moves; with it, it is an
+    /// instrument — dragging theta_n reads "theta_n 34.2°" while you drag.
+    fn handle_readout(&mut self, ui: &mut egui::Ui) {
+        if !self.editor_on {
+            return;
+        }
+        let handles = self.wall.editor().handles();
+        if self.wall.is_freeform() {
+            ui.label(
+                RichText::new(format!(
+                    "drawn wall · {} points · drag to move, Ctrl+click to insert, \
+                     right-click to remove",
+                    handles.len()
+                ))
+                .small()
+                .color(ACCENT),
+            );
+            return;
+        }
+        if handles.is_empty() {
+            // Only reachable behind the "contour rejected" flag below, which
+            // carries the generator's reason. Saying nothing here would leave
+            // an editor with no grabbable anything and no explanation.
+            ui.label(
+                RichText::new(
+                    "no handles — this contour was rejected; move the area-ratio \
+                     slider or pick an engine to regenerate",
+                )
+                .small()
+                .color(AMBER),
+            );
+            return;
+        }
+        let text = match self.active_handle.and_then(|i| handles.get(i)) {
+            Some(h) => format!("{} {:.3} {}", h.label, h.value, h.unit),
+            None => {
+                let n = handles.len();
+                let drag = handles.iter().filter(|h| h.pickable).count();
+                if n == drag {
+                    format!("wall editor · {n} handles · drag to shape")
+                } else {
+                    // The derived ones are drawn but not pickable, and saying
+                    // so is the difference between "one handle is broken" and
+                    // "one marker is an annotation".
+                    format!("wall editor · {n} handles, {drag} draggable · Q is derived")
+                }
+            }
+        };
+        ui.label(RichText::new(text).small().color(ACCENT))
+            .on_hover_text(
+                "A parametric wall is edited through its degrees of freedom, not \
+                 through the tessellated polyline the solver eats. The hollow \
+                 diamond is the Bézier control point Q: it is DERIVED from the two \
+                 wall angles and the two endpoints, has no remaining freedom, and \
+                 is deliberately not draggable — moving it would break the tangency \
+                 at N that makes θ_n a wall angle rather than a decoration.",
+            );
+        if let Some(why) = &self.handle_clamp {
+            ui.label(
+                RichText::new("handle clamped — the wall cannot go further this way")
+                    .small()
+                    .color(AMBER),
+            )
+            .on_hover_text(why.clone());
+        }
+    }
+
+    /// The break toast and the two "this discards your drawing" confirmations.
+    fn wall_state_notices(&mut self, ui: &mut egui::Ui) {
+        if let Some((msg, at)) = self.toast.clone() {
+            if self.ui_tick.saturating_sub(at) > TOAST_TICKS {
+                self.toast = None;
+            } else {
+                ui.label(RichText::new(msg).small().color(AMBER));
+            }
+        }
+        // Regenerating is the ONLY way back to a parametric wall, and it throws
+        // the drawing away. There is no fit-a-curve-to-a-polyline step to undo
+        // it with, so it asks.
+        let pending = self.pending_preset.is_some() || self.pending_regen;
+        if pending {
+            let what = match self.pending_preset {
+                Some(Some(i)) => PRESETS[i].name,
+                Some(None) => "the demo case",
+                None => "the new area ratio",
+            };
+            warning_box(
+                ui,
+                AMBER,
+                "DISCARD THE DRAWING?",
+                &format!(
+                    "Regenerating from {what} replaces the wall you drew with a \
+                     parametric contour. The drawing cannot be recovered — \
+                     converting a polyline back into a curve is a fit, not an \
+                     inverse, and a fit would silently change your shape."
+                ),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Discard and regenerate").clicked() {
+                    match self.pending_preset.take() {
+                        Some(p) => self.apply_preset(p),
+                        None => self.regenerate_contour(),
+                    }
+                }
+                if ui.button("Keep the drawing").clicked() {
+                    self.pending_preset = None;
+                    self.pending_regen = false;
+                    // Put the slider back where the wall actually is.
+                    self.ui_area_ratio = self.params.area_ratio;
+                }
+            });
+        }
     }
 
     fn operating_point(&mut self, ui: &mut egui::Ui) {
@@ -1146,11 +1416,15 @@ impl CfdApp {
         ui.add_space(6.0);
 
         // ---- Area ratio (regenerates the parametric contour on release).
-        // The range stretches to hold a selected preset (up to ε = 165);
-        // egui would otherwise clamp the staged value back into 2..16.
+        // The range stretches to hold whatever ε is actually set — up to 165
+        // for a preset, and DOWN below 2 for an exit lip the user dragged
+        // toward the axis. egui clamps the staged value into the slider's
+        // range, so a fixed 2.0 floor would silently walk a dragged ε back up
+        // to 2 and then regenerate a wall the user never asked for.
         let ar_max = self.ui_area_ratio.max(16.0);
+        let ar_min = self.ui_area_ratio.min(2.0);
         let r = ui.add(
-            egui::Slider::new(&mut self.ui_area_ratio, case::AREA_RATIO_SLIDER_MIN..=ar_max)
+            egui::Slider::new(&mut self.ui_area_ratio, ar_min..=ar_max)
                 .text("Area ratio ε")
                 // Two decimals, and NOT `fixed_decimals(1)` — see
                 // AREA_RATIO_DECIMALS. One decimal silently rewrote the V-2's
@@ -1159,7 +1433,7 @@ impl CfdApp {
                 .max_decimals(AREA_RATIO_DECIMALS),
         );
         if r.drag_stopped() || (r.changed() && !r.dragged()) {
-            self.regenerate_contour();
+            self.request_regenerate();
         }
 
         // ---- Chamber pressure (a field-discarding control).
@@ -1223,7 +1497,12 @@ impl CfdApp {
             );
         }
 
-        if self.geometry_custom {
+        // The sandbox badge belongs to DRAWN geometry and nothing else. A
+        // parametric handle edit is still a member of the §10 contour family —
+        // the same construction, different numbers — and the acceptance tests
+        // cover that family, so it keeps its engineering report and shows its
+        // live angles. Only breaking to freeform crosses the line.
+        if self.wall.is_freeform() {
             ui.colored_label(
                 AMBER,
                 RichText::new("SANDBOX — drawn geometry, qualitative only").small(),
@@ -1599,13 +1878,20 @@ impl eframe::App for CfdApp {
                     self.cmap[self.field as usize],
                     self.locked[self.field as usize],
                     self.smooth,
-                    &mut self.editor,
+                    self.wall.editor_mut(),
                     self.editor_on,
                     &self.committed_wall,
                     self.watermark, // ANALYTIC PREVIEW watermark: mock builds only
                 );
                 if output.space_panned {
                     self.space_panned = true;
+                }
+                self.active_handle = output.active_handle;
+                self.handle_clamp = output.clamp;
+                if output.wants_point_edit {
+                    // Ctrl+click or right-click on a parametric wall: the
+                    // editor refused, so this is the break.
+                    self.break_to_freeform();
                 }
                 if output.commit_geometry {
                     self.commit_editor_geometry();
@@ -2364,5 +2650,162 @@ mod tests {
         }
         assert_eq!(locked, (0.0, 12.0));
         assert!(!st.stale);
+    }
+}
+
+#[cfg(test)]
+mod wall_state_tests {
+    use super::*;
+    use crate::worker::{make_frame, FRESH_INFO};
+    use cfd_contract::Solver;
+
+    /// A `CfdApp` with no window, on the cheap Preview demo case.
+    ///
+    /// The app's state machine had NO test coverage before this — every step-4
+    /// test exercised `WallState` in isolation, which is why `commit_domain`
+    /// could quietly convert a drawing back to a parametric wall and nothing
+    /// failed. The transitions live on `CfdApp`, so they have to be tested on
+    /// `CfdApp`.
+    fn app() -> CfdApp {
+        std::env::set_var("CFD_SOLVER", "mock");
+        let (lz_rt, lr_rt, cells_per_rt, dz_over_dr) = DomainPreset::Preview.values();
+        let params = CaseParams { lz_rt, lr_rt, cells_per_rt, dz_over_dr, ..CaseParams::default() };
+        let wall = nozzle_contour(&params);
+        let setup = make_setup(&params, &wall.points);
+        let solver = cfd_core::MockSolver::new(setup).unwrap();
+        let initial = make_frame(&solver, FRESH_INFO);
+        let (_in, out) = triple_buffer::triple_buffer(&initial);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::mem::forget(rx); // nothing drains it; the app only sends
+        CfdApp::new(out, tx, initial, params, wall, false, None)
+    }
+
+    /// **A domain or resolution change must not destroy a drawing.**
+    ///
+    /// `commit_domain` used to call `reset_wall`, whose `_` arm replaces a
+    /// freeform wall with a fresh parametric one. Six controls reach it — the
+    /// resolution and aspect fields, both domain extents, and the three
+    /// shortcut buttons — so one click on "Preview" while in sandbox mode
+    /// deleted the user's drawing from the UI and the solver, with no
+    /// confirmation, and left `wall_kind` still saying "hand-drawn wall" over
+    /// the regenerated contour.
+    #[test]
+    fn a_domain_change_does_not_discard_a_drawing() {
+        let mut a = app();
+        assert!(!a.wall.is_freeform());
+        a.break_to_freeform();
+        assert!(a.wall.is_freeform() && a.wall_kind.is_none());
+        let drawn = a.wall.editor().polyline().to_vec();
+
+        // Every control that reaches commit_domain.
+        let controls: [(&str, fn(&mut CfdApp)); 4] = [
+            ("resolution", |s| s.ui_cells_per_rt = 40.0),
+            ("aspect", |s| s.ui_dz_over_dr = 2.0),
+            ("length", |s| s.ui_lz_rt = 60.0),
+            ("radius", |s| s.ui_lr_rt = 12.0),
+        ];
+        for (label, f) in controls {
+            f(&mut a);
+            a.commit_domain(false);
+            assert!(a.wall.is_freeform(), "{label}: the drawing was discarded");
+            assert_eq!(a.wall_kind, None, "{label}: provenance went stale");
+            assert_eq!(
+                a.wall.editor().polyline(),
+                a.committed_wall,
+                "{label}: the committed wall drifted from the editor's"
+            );
+        }
+        // The shape survived (points may be pulled inside a shrunken domain,
+        // but the wall is still the drawing, not a regenerated contour).
+        assert_eq!(a.wall.editor().polyline().len(), drawn.len());
+        assert!(a.wall.is_freeform());
+    }
+
+    /// A handle drag keeps the report; only a break raises the sandbox badge.
+    /// And the badge cannot be cleared except by an explicit regeneration.
+    #[test]
+    fn only_a_break_raises_the_sandbox_badge() {
+        let mut a = app();
+        // Drag every handle and commit: never freeform, always a contour kind.
+        for i in 0..a.wall.editor().handles().len() {
+            let anchor = a.wall.editor().handles()[i].anchor;
+            a.wall.editor_mut().drag(i, [anchor[0] + 0.2, anchor[1] + 0.2]);
+            a.commit_editor_geometry();
+            assert!(!a.wall.is_freeform(), "handle {i} raised the badge");
+            assert!(a.wall_kind.is_some(), "handle {i} blanked the contour kind");
+        }
+        // The name survives for context, but `exact()` — which every claim
+        // about the named engine goes through — does not.
+        assert!(a.preset.modified || a.preset.base.is_none());
+        assert_eq!(a.preset.exact(), None, "a hand-tuned wall is not that engine");
+
+        a.break_to_freeform();
+        assert!(a.wall.is_freeform());
+        // A chamber-pressure rebuild must not clear it either.
+        a.ui_p0_mpa = 6.0;
+        a.rebuild_solver();
+        assert!(a.wall.is_freeform(), "a p0 rebuild cleared the sandbox badge");
+    }
+
+    /// Regenerating is the only way out of freeform, and it always asks first.
+    #[test]
+    fn every_escape_from_freeform_asks_first() {
+        for escape in ["preset", "custom", "area ratio"] {
+            let mut a = app();
+            a.break_to_freeform();
+            match escape {
+                "preset" => a.request_preset(Some(0)),
+                "custom" => a.request_preset(None),
+                _ => {
+                    a.ui_area_ratio = 12.0;
+                    a.request_regenerate();
+                }
+            }
+            assert!(
+                a.wall.is_freeform(),
+                "{escape}: regenerated without asking"
+            );
+            assert!(
+                a.pending_preset.is_some() || a.pending_regen,
+                "{escape}: no confirmation was raised — and 'Custom' used to be \
+                 inert here, because the break clears the preset and the button \
+                 only fired when one was set"
+            );
+            // Confirming does regenerate, and lands back on a parametric wall.
+            match a.pending_preset.take() {
+                Some(p) => a.apply_preset(p),
+                None => a.regenerate_contour(),
+            }
+            assert!(!a.wall.is_freeform(), "{escape}: did not restore parametric");
+            assert!(a.wall_kind.is_some(), "{escape}: provenance not restored");
+            assert!(!a.wall.editor().handles().is_empty());
+        }
+    }
+
+    /// A rejected drawn wall must not reach `committed_wall`, which is what the
+    /// next rebuild ships to the solver with no validation of its own.
+    #[test]
+    fn a_rejected_drawing_never_reaches_the_committed_wall() {
+        let mut a = app();
+        a.break_to_freeform();
+        let good = a.committed_wall.clone();
+        // Collapse the wall onto a single station: `to_profile` rejects it.
+        // (The editor's own invariants make this unreachable by dragging, which
+        // is precisely why the gate has to be checked rather than assumed.)
+        if let WallState::Freeform(w) = &mut a.wall {
+            *w = crate::editor::FreeformWall::new(
+                vec![[1.0, 2.0], [1.0, 2.0], [1.0, 2.0]],
+                a.params.lz_rt,
+                a.params.lr_rt,
+            );
+            assert!(w.validate().is_err(), "this fixture must be rejected");
+        }
+        a.commit_editor_geometry();
+        assert_eq!(
+            a.committed_wall, good,
+            "a rejected wall reached committed_wall, which the next p0 rebuild \
+             would have shipped to the solver unvalidated"
+        );
+        assert!(a.toast.is_some(), "the rejection must be surfaced");
     }
 }

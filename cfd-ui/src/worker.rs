@@ -57,7 +57,7 @@ const STEP_BUDGET: Duration = Duration::from_millis(12);
 /// Steps per second at 1x. One step per 16 ms rendered frame.
 const BASE_STEP_RATE: f64 = 60.0;
 
-const FRESH_INFO: StepInfo = StepInfo {
+pub const FRESH_INFO: StepInfo = StepInfo {
     step: 0,
     time: 0.0,
     dt: 0.0,

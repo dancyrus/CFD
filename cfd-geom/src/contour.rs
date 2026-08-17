@@ -4,223 +4,33 @@
 //! metres at the end. z = 0 is the chamber head; the throat sits at
 //! z_t = chamber + converging cone + upstream arc, and is always an exact sample
 //! point of the returned polyline.
+//!
+//! The geometry itself now lives on [`NozzleCurve`](crate::NozzleCurve) — this
+//! module is the fixed-sample-count entry point that `cfd-core`'s acceptance
+//! ladder and diagnostics call, kept bit-identical on purpose.
 
-use crate::rao::rao_angles;
-use crate::{ContourKind, NozzleSpec, WallProfile};
-use cfd_contract::{CfdError, Result};
-
-/// Chamber straight length, in units of r_t (session brief §1).
-const CHAMBER_LEN_RT: f64 = 2.0;
-
-/// Downstream throat-arc radius of Huzel–Huang's REFERENCE 15° cone, in r_t.
-///
-/// This is a fixed property of the definition of "N% bell" — H&H measure bell
-/// length against a 15° conical nozzle of the same throat area and area ratio
-/// **with a 1.5 R_t downstream throat arc** — not a property of the nozzle
-/// being generated. It happens to equal the family's `throat_arc_up`, but it
-/// is deliberately NOT read from the spec: an engine with a tighter throat arc
-/// (Raptor 2, 0.300 R_t) must still be measured against the same reference, or
-/// "80% bell" means a different length for every spec.
-const L_C15_REF_ARC_RT: f64 = 1.5;
-
-/// Append a point, dropping an exact-duplicate z (shared piece endpoints get
-/// pushed twice).
-fn push(pts: &mut Vec<[f64; 2]>, p: [f64; 2]) {
-    if pts.last().is_none_or(|q| p[0] - q[0] > 1e-12) {
-        pts.push(p);
-    }
-}
-
-/// Huzel–Huang reference length: the 15° cone this family measures bell
-/// percent against, in r_t, measured from the throat.
-fn l_c15(area_ratio: f64) -> f64 {
-    let s15 = 15.0f64.to_radians();
-    ((area_ratio.sqrt() - 1.0) + L_C15_REF_ARC_RT * (1.0 / s15.cos() - 1.0)) / s15.tan()
-}
-
-/// The diverging bell: downstream throat arc to wall angle `tn_deg`, then a
-/// quadratic Bézier to the exit lip at axial distance `l_n` from the throat
-/// meeting it at `te_deg`. Shared by the Rao-table and direct-angle paths —
-/// they differ only in where the two angles and the length come from.
-#[allow(clippy::too_many_arguments)]
-fn push_bell(
-    pts: &mut Vec<[f64; 2]>,
-    z_t: f64,
-    r2: f64,
-    re: f64,
-    l_n: f64,
-    tn_deg: f64,
-    te_deg: f64,
-    n_arc_dn: usize,
-    n_div: usize,
-) -> Result<()> {
-    let (tn, te) = (tn_deg.to_radians(), te_deg.to_radians());
-    if tn <= te {
-        // Cannot happen with the shipped table; guards division by zero in the
-        // Bézier control point below.
-        return Err(CfdError::Geometry(format!(
-            "theta_n ({tn_deg}) must exceed theta_e ({te_deg})"
-        )));
-    }
-    // Bézier endpoints (z relative to throat) and control point.
-    let nz = r2 * tn.sin();
-    let nr = 1.0 + r2 * (1.0 - tn.cos());
-    let (ez, er) = (l_n, re);
-    let (m1, m2) = (tn.tan(), te.tan());
-    let c1 = nr - m1 * nz;
-    let c2 = er - m2 * ez;
-    let qz = (c2 - c1) / (m1 - m2);
-    let qr = (m1 * c2 - m2 * c1) / (m1 - m2);
-    if !(nz < qz && qz < ez) {
-        // Which side failed says which way to move, and this message is now
-        // user-visible (the app shows it when it falls back to the cone).
-        // Q_z past the exit: the bell is too SHORT for the area ratio. Q_z
-        // behind the throat-arc tangency: too LONG. Telling someone to
-        // lengthen an already-overlong nozzle sends them the wrong way.
-        let which = if qz <= nz { "too long" } else { "too short" };
-        return Err(CfdError::Geometry(format!(
-            "bell control point out of order (N_z={nz:.4}, Q_z={qz:.4}, E_z={ez:.4}): \
-             length {l_n:.4} r_t is {which} for area ratio {:.4} at theta_n {tn_deg} / \
-             theta_e {te_deg}",
-            re * re
-        )));
-    }
-    // Downstream arc, wall angle 0 -> theta_n; ends exactly at N.
-    for k in 1..=n_arc_dn {
-        let phi = tn * k as f64 / n_arc_dn as f64;
-        push(pts, [z_t + r2 * phi.sin(), 1.0 + r2 * (1.0 - phi.cos())]);
-    }
-    // Quadratic Bézier N -> E. t is NOT proportional to z; the polyline just
-    // needs monotone z, which N_z < Q_z < E_z guarantees.
-    for k in 1..=n_div {
-        let t = k as f64 / n_div as f64;
-        let a = (1.0 - t) * (1.0 - t);
-        let b = 2.0 * t * (1.0 - t);
-        let c = t * t;
-        push(
-            pts,
-            [z_t + a * nz + b * qz + c * ez, a * nr + b * qr + c * er],
-        );
-    }
-    Ok(())
-}
+use crate::curve::NozzleCurve;
+use crate::{NozzleSpec, WallProfile};
+use cfd_contract::Result;
 
 /// Generate the full wall contour as a polyline with roughly `samples` points
 /// (clamped to at least 64). The throat is exactly a vertex; `throat_index`
 /// points at it.
+///
+/// A thin wrapper over [`NozzleCurve::tessellate_fixed`] on the standard 2 r_t
+/// chamber straight — bit-identical output to the pre-curve generator, which is
+/// what keeps `cfd-core`'s recorded ladder results comparable across this
+/// change. Callers that want the wall sized to their mesh use
+/// [`NozzleCurve::tessellate`] instead.
 pub fn generate_contour(spec: &NozzleSpec, samples: usize) -> Result<WallProfile> {
-    spec.validate()?;
-
-    let rt = spec.throat_radius_m;
-    let eps = spec.area_ratio;
-    let re = eps.sqrt(); // exit radius, r_t units
-    let rc = spec.contraction_ratio.sqrt(); // chamber radius, r_t units
-    let beta = spec.converge_half_angle_deg.to_radians();
-    let r1 = spec.throat_arc_up;
-    let r2 = spec.throat_arc_down;
-
-    // Upstream arc tangency (converging side), parameterized by wall angle phi:
-    //   z(phi) = z_t - r1*sin(phi),  r(phi) = 1 + r1*(1 - cos(phi)),  phi in [0, beta]
-    let ra_up = 1.0 + r1 * (1.0 - beta.cos());
-    let z_t = CHAMBER_LEN_RT + (rc - ra_up) / beta.tan() + r1 * beta.sin();
-
-    let n = samples.max(64);
-    let n_arc_up = (n / 8).max(8);
-    let n_arc_dn = (n / 8).max(8);
-    let n_div = n.saturating_sub(n_arc_up + n_arc_dn + 4).max(16);
-
-    let mut pts: Vec<[f64; 2]> = Vec::with_capacity(n + 8);
-
-    // 1. Chamber straight.
-    push(&mut pts, [0.0, rc]);
-    push(&mut pts, [CHAMBER_LEN_RT, rc]);
-    // 2. Converging cone (a straight segment; two endpoints are exact).
-    push(&mut pts, [z_t - r1 * beta.sin(), ra_up]);
-    // 3. Upstream throat arc, wall angle beta -> 0. Ends exactly at (z_t, 1).
-    for k in 1..=n_arc_up {
-        let phi = beta * (1.0 - k as f64 / n_arc_up as f64);
-        push(
-            &mut pts,
-            [z_t - r1 * phi.sin(), 1.0 + r1 * (1.0 - phi.cos())],
-        );
-    }
-    let throat_index = pts.len() - 1;
-
-    // 4. Diverging section.
-    match spec.contour {
-        ContourKind::Conical { half_angle_deg } => {
-            let alpha = half_angle_deg.to_radians();
-            // Exact closed form for the cone length measured from the throat
-            // (identity verified symbolically; residual 4.2e-15 over 20k draws).
-            let l_n = ((re - 1.0) + r2 * (1.0 / alpha.cos() - 1.0)) / alpha.tan();
-            // Downstream arc, wall angle 0 -> alpha; tangency is automatic.
-            for k in 1..=n_arc_dn {
-                let phi = alpha * k as f64 / n_arc_dn as f64;
-                push(
-                    &mut pts,
-                    [z_t + r2 * phi.sin(), 1.0 + r2 * (1.0 - phi.cos())],
-                );
-            }
-            // Straight cone to the exit lip.
-            push(&mut pts, [z_t + l_n, re]);
-        }
-        // Huzel–Huang reference length, INCLUDING the throat-arc term, which
-        // that reference cone takes at 1.5 R_t (`L_C15_REF_ARC_RT`) — NOT at
-        // this nozzle's own downstream arc. The Aspirespace / bell_nozzle.py
-        // form drops the term entirely; the two differ by an ε-dependent
-        // amount (H&H longer by 2.89% at ε = 8, 1.32% at ε = 25, 0.72% at
-        // ε = 69, 0.45% at ε = 165), which makes "80% bell" ambiguous unqualified.
-        // This is the pinned definition (physics-reference §10).
-        ContourKind::ParabolicBell { bell_percent } => {
-            let (tn_deg, te_deg) = rao_angles(eps, bell_percent);
-            push_bell(
-                &mut pts,
-                z_t,
-                r2,
-                re,
-                bell_percent * l_c15(eps),
-                tn_deg,
-                te_deg,
-                n_arc_dn,
-                n_div,
-            )?;
-        }
-        // Measured geometry: the wall angles are inputs, not table lookups.
-        ContourKind::DirectBell {
-            theta_n_deg,
-            theta_e_deg,
-            length_fraction,
-        } => {
-            push_bell(
-                &mut pts,
-                z_t,
-                r2,
-                re,
-                length_fraction * l_c15(eps),
-                theta_n_deg,
-                theta_e_deg,
-                n_arc_dn,
-                n_div,
-            )?;
-        }
-    }
-
-    // Scale to metres.
-    for p in &mut pts {
-        p[0] *= rt;
-        p[1] *= rt;
-    }
-    let profile = WallProfile {
-        points: pts,
-        throat_index,
-    };
-    profile.validate()?;
-    Ok(profile)
+    NozzleCurve::new(*spec).tessellate_fixed(samples)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::curve::l_c15;
+    use crate::rao::rao_angles;
     use crate::ContourKind;
 
     fn spec(contour: ContourKind, eps: f64) -> NozzleSpec {
